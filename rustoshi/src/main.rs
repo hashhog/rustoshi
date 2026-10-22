@@ -1212,14 +1212,17 @@ const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 fn block_getdata_reply(
     inv_type: InvType,
     block: rustoshi_primitives::Block,
-    block_height: Option<u32>,
+    block_index: Option<&BlockIndexEntry>,
     tip_height: u32,
+    tip_time: Option<u32>,
+    now: u64,
     nonce: u64,
 ) -> NetworkMessage {
+    let _ = (tip_time, now);
     if inv_type == InvType::MsgCmpctBlock {
         // Core: pindex->nHeight >= ActiveChain().Height() - MAX_CMPCTBLOCK_DEPTH
         // (signed arithmetic, hence saturating_sub).
-        if let Some(h) = block_height {
+        if let Some(h) = block_index.map(|e| e.height) {
             if h >= tip_height.saturating_sub(MAX_CMPCTBLOCK_DEPTH) {
                 let cb = rustoshi_network::CmpctBlock::from_block(&block, nonce);
                 return NetworkMessage::CmpctBlock(cb.serialize());
@@ -8090,16 +8093,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                         item.hash, peer_id.0
                                                     );
                                                     let reply = if item.inv_type == InvType::MsgCmpctBlock {
-                                                        let tip_height = rpc_state.read().await.best_height;
-                                                        let block_height = block_store
-                                                            .get_height(&item.hash)
+                                                        let (tip_height, tip_hash) = {
+                                                            let rpc = rpc_state.read().await;
+                                                            (rpc.best_height, rpc.best_hash)
+                                                        };
+                                                        let block_index = block_store
+                                                            .get_block_index(&item.hash)
                                                             .ok()
                                                             .flatten();
+                                                        let tip_time = block_store
+                                                            .get_block_index(&tip_hash)
+                                                            .ok()
+                                                            .flatten()
+                                                            .map(|e| e.timestamp);
+                                                        let now = std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .map(|d| d.as_secs())
+                                                            .unwrap_or(0);
                                                         block_getdata_reply(
                                                             item.inv_type,
                                                             block,
-                                                            block_height,
+                                                            block_index.as_ref(),
                                                             tip_height,
+                                                            tip_time,
+                                                            now,
                                                             rand::random::<u64>(),
                                                         )
                                                     } else {
@@ -9948,12 +9965,8 @@ mod tests {
         assert!(blocktxn_within_depth(5, 5));
     }
 
-    /// Compact-block serving: getdata(MSG_CMPCT_BLOCK) within MAX_CMPCTBLOCK_DEPTH
-    /// is answered with a cmpctblock (Core ProcessGetBlockData); deeper, or for
-    /// MSG_BLOCK/MSG_WITNESS_BLOCK, with the full block.
-    #[test]
-    fn test_getdata_cmpctblock_serve() {
-        use rustoshi_network::CmpctBlock;
+    /// Three-transaction block used by the compact-block serving tests.
+    fn cmpct_test_block() -> rustoshi_primitives::Block {
         use rustoshi_primitives::{Block, BlockHeader, Hash256, OutPoint, Transaction, TxIn, TxOut};
         let mk = |n: u8| Transaction {
             version: 2,
@@ -9966,7 +9979,7 @@ mod tests {
             outputs: vec![TxOut { value: 1000, script_pubkey: vec![0x51] }],
             lock_time: 0,
         };
-        let block = Block {
+        Block {
             header: BlockHeader {
                 version: 1,
                 prev_block_hash: Hash256([0; 32]),
@@ -9976,11 +9989,47 @@ mod tests {
                 nonce: 3,
             },
             transactions: vec![mk(1), mk(2), mk(3)],
-        };
+        }
+    }
+
+    /// Index entry at `height` carrying the given status flags.
+    fn cmpct_test_index(height: u32, flags: &[u32]) -> BlockIndexEntry {
+        let mut status = BlockStatus::new();
+        for f in flags {
+            status.set(*f);
+        }
+        BlockIndexEntry {
+            height,
+            status,
+            n_tx: 3,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 3,
+            version: 1,
+            prev_hash: rustoshi_primitives::Hash256::ZERO,
+            chain_work: [0; 32],
+        }
+    }
+
+    /// Wall clock used by the compact-block tests; the tip is one block old.
+    const CMPCT_NOW: u64 = 1_800_000_000;
+    const CMPCT_FRESH_TIP: Option<u32> = Some(CMPCT_NOW as u32 - 600);
+
+    /// Compact-block serving: getdata(MSG_CMPCT_BLOCK) within MAX_CMPCTBLOCK_DEPTH
+    /// is answered with a cmpctblock (Core ProcessGetBlockData); deeper, or for
+    /// MSG_BLOCK/MSG_WITNESS_BLOCK, with the full block.
+    #[test]
+    fn test_getdata_cmpctblock_serve() {
+        use rustoshi_network::CmpctBlock;
+        let block = cmpct_test_block();
+        let valid = [BlockStatus::VALID_SCRIPTS, BlockStatus::HAVE_DATA];
         let tip = 100u32;
         // Within depth, MSG_CMPCT_BLOCK -> cmpctblock with coinbase prefilled.
         for h in [tip, tip - MAX_CMPCTBLOCK_DEPTH] {
-            match block_getdata_reply(InvType::MsgCmpctBlock, block.clone(), Some(h), tip, 42) {
+            let idx = cmpct_test_index(h, &valid);
+            match block_getdata_reply(
+                InvType::MsgCmpctBlock, block.clone(), Some(&idx), tip, CMPCT_FRESH_TIP, CMPCT_NOW, 42,
+            ) {
                 NetworkMessage::CmpctBlock(data) => {
                     let cb = CmpctBlock::decode(&mut std::io::Cursor::new(&data)).unwrap();
                     assert_eq!(cb.block_hash(), block.header.block_hash());
@@ -9992,19 +10041,90 @@ mod tests {
                 _ => panic!("expected cmpctblock at height {h}"),
             }
         }
-        // One deeper than the window, or unknown height -> full block.
-        for h in [Some(tip - MAX_CMPCTBLOCK_DEPTH - 1), Some(0), None] {
+        // One deeper than the window, or no index entry -> full block.
+        let deep = cmpct_test_index(tip - MAX_CMPCTBLOCK_DEPTH - 1, &valid);
+        let genesis = cmpct_test_index(0, &valid);
+        for idx in [Some(&deep), Some(&genesis), None] {
             assert!(matches!(
-                block_getdata_reply(InvType::MsgCmpctBlock, block.clone(), h, tip, 42),
+                block_getdata_reply(
+                    InvType::MsgCmpctBlock, block.clone(), idx, tip, CMPCT_FRESH_TIP, CMPCT_NOW, 42,
+                ),
                 NetworkMessage::Block(_)
             ));
         }
         // Plain block requests are never compacted.
+        let at_tip = cmpct_test_index(tip, &valid);
         for t in [InvType::MsgBlock, InvType::MsgWitnessBlock] {
             assert!(matches!(
-                block_getdata_reply(t, block.clone(), Some(tip), tip, 42),
+                block_getdata_reply(t, block.clone(), Some(&at_tip), tip, CMPCT_FRESH_TIP, CMPCT_NOW, 42),
                 NetworkMessage::Block(_)
             ));
+        }
+    }
+
+    /// Core's ProcessGetBlockData only reaches the cmpctblock arm for a block
+    /// that BlockRequestAllowed passes (on the active chain, or
+    /// BLOCK_VALID_SCRIPTS) and that has BLOCK_HAVE_DATA. A block whose
+    /// connect failed (`persist_failed_connect` stores it with HAVE_DATA |
+    /// FAILED_VALIDITY at best_height + 1, inside the depth window), a
+    /// descendant of one (FAILED_CHILD), and a side-branch block stored with
+    /// HAVE_DATA but never script-validated must not be compacted.
+    #[test]
+    fn test_getdata_cmpctblock_not_for_unvalidated_block() {
+        let block = cmpct_test_block();
+        let tip = 100u32;
+        let cases = [
+            ("failed connect", cmpct_test_index(tip + 1, &[BlockStatus::HAVE_DATA, BlockStatus::FAILED_VALIDITY])),
+            (
+                "failed with stale VALID_SCRIPTS",
+                cmpct_test_index(
+                    tip,
+                    &[BlockStatus::VALID_SCRIPTS, BlockStatus::HAVE_DATA, BlockStatus::FAILED_VALIDITY],
+                ),
+            ),
+            (
+                "failed child",
+                cmpct_test_index(tip, &[BlockStatus::VALID_SCRIPTS, BlockStatus::HAVE_DATA, BlockStatus::FAILED_CHILD]),
+            ),
+            ("side branch, tree only", cmpct_test_index(tip, &[BlockStatus::VALID_TREE, BlockStatus::HAVE_DATA])),
+            ("side branch, chain only", cmpct_test_index(tip, &[BlockStatus::VALID_CHAIN, BlockStatus::HAVE_DATA])),
+            ("header only", cmpct_test_index(tip, &[BlockStatus::VALID_SCRIPTS])),
+        ];
+        for (name, idx) in cases {
+            let reply = block_getdata_reply(
+                InvType::MsgCmpctBlock, block.clone(), Some(&idx), tip, CMPCT_FRESH_TIP, CMPCT_NOW, 42,
+            );
+            assert!(
+                !matches!(reply, NetworkMessage::CmpctBlock(_)),
+                "{name}: block that is not fully validated was served as cmpctblock"
+            );
+        }
+    }
+
+    /// Core gates the cmpctblock arm on CanDirectFetch(): the active tip's time
+    /// must be later than now - 20 * nPowTargetSpacing. With a stale tip a block
+    /// inside MAX_CMPCTBLOCK_DEPTH is answered with the full block.
+    #[test]
+    fn test_getdata_cmpctblock_requires_fresh_tip() {
+        let block = cmpct_test_block();
+        let tip = 100u32;
+        let idx = cmpct_test_index(tip, &[BlockStatus::VALID_SCRIPTS, BlockStatus::HAVE_DATA]);
+        let window = 20 * rustoshi_consensus::params::TARGET_BLOCK_TIME as u64;
+        let reply = |tip_time: Option<u32>| {
+            block_getdata_reply(InvType::MsgCmpctBlock, block.clone(), Some(&idx), tip, tip_time, CMPCT_NOW, 42)
+        };
+        // Strictly newer than now - window: direct fetch, cmpctblock.
+        assert!(matches!(reply(Some((CMPCT_NOW - window + 1) as u32)), NetworkMessage::CmpctBlock(_)));
+        // Exactly at the boundary (Core compares with `>`), older, or unknown: full block.
+        for (name, t) in [
+            ("boundary", Some((CMPCT_NOW - window) as u32)),
+            ("a day old", Some((CMPCT_NOW - 86_400) as u32)),
+            ("unknown", None),
+        ] {
+            assert!(
+                matches!(reply(t), NetworkMessage::Block(_)),
+                "{name} tip: expected full block, CanDirectFetch() is false"
+            );
         }
     }
 
