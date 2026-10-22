@@ -2249,3 +2249,40 @@ async fn testmempoolaccept_fees_use_eight_decimal_amount_format() {
     let want = format!("\"effective-feerate\":{}.{:08}", rate / 100_000_000, rate % 100_000_000);
     assert!(raw.contains(&want), "effective-feerate: want {want} in {raw}");
 }
+
+/// Core `testmempoolaccept` on ONE tx is `ProcessTransaction(test_accept)`, which
+/// allows replacement; only the multi-tx `AcceptMultipleTransactions` path sets
+/// `m_allow_replacement=false`. A lone rule-3 conflict (pays less absolute fee than
+/// the tx it replaces) is therefore `insufficient fee`, never
+/// `bip125-replacement-disallowed`.
+#[tokio::test]
+async fn testmempoolaccept_single_tx_rule3_conflict_is_insufficient_fee() {
+    let r = replacement_pkg(20_000, 5_000, 5_000, false).await;
+    let first = result(
+        call(&r.state, "submitpackage", serde_json::json!([[hex_tx(&r.original)]])).await,
+    );
+    assert_eq!(first["package_msg"], "success", "{first}");
+    let rows = result(
+        call(&r.state, "testmempoolaccept", serde_json::json!([[hex_tx(&r.parent)]])).await,
+    );
+    let row = &rows[0];
+    assert_eq!(row["allowed"], false, "{rows}");
+    assert_eq!(row["reject-reason"], "insufficient fee", "{rows}");
+}
+
+/// A lone conflict that does pay for the replacement is allowed by the dry run.
+#[tokio::test]
+async fn testmempoolaccept_single_tx_valid_replacement_is_allowed() {
+    let r = replacement_pkg(10_000, 50_000, 5_000, false).await;
+    let first = result(
+        call(&r.state, "submitpackage", serde_json::json!([[hex_tx(&r.original)]])).await,
+    );
+    assert_eq!(first["package_msg"], "success", "{first}");
+    let rows = result(
+        call(&r.state, "testmempoolaccept", serde_json::json!([[hex_tx(&r.parent)]])).await,
+    );
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    // A dry run must not evict the original.
+    let ids = mempool(&r.state).await;
+    assert!(ids.contains(&r.original.txid().to_hex()), "{ids:?}");
+}
