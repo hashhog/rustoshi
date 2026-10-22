@@ -35,7 +35,7 @@ use rustoshi_network::{
     asmap as asmap_mod, resolve_blocks_in_flight_per_peer, BlockDownloader, CFCheckptMessage,
     CFHeadersMessage, CFilterMessage, GetHeadersMessage, HeaderSync, InvType, InvVector,
     MisbehaviorReason, NetGroupManager, NetworkMessage, PeerEvent, PeerManager, PeerManagerConfig,
-    CFCHECKPT_INTERVAL, MAX_GETCFHEADERS_SIZE, MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
+    CFCHECKPT_INTERVAL, DEFAULT_MAX_PEER_CONNECTIONS, MAX_GETCFHEADERS_SIZE, MAX_GETCFILTERS_SIZE, NODE_COMPACT_FILTERS,
     PROTOCOL_VERSION,
 };
 use rustoshi_primitives::{Encodable, Hash256, OutPoint};
@@ -149,8 +149,13 @@ struct Cli {
     #[arg(long, default_value_t = 300)]
     maxmempool: u64,
 
-    /// Maximum number of outbound connections
-    #[arg(long, default_value = "8")]
+    /// Maintain at most <n> automatic connections to peers (Bitcoin Core
+    /// `-maxconnections`, default 125). This is the budget for ALL automatic
+    /// connections, not an outbound count: the outbound targets are
+    /// min(8, n) full-relay plus min(2, n - full-relay) block-relay-only
+    /// (see `PeerManagerConfig::outbound_limits_for_max_connections`).
+    /// `0` runs the node fully offline.
+    #[arg(long, default_value_t = DEFAULT_MAX_PEER_CONNECTIONS)]
     maxconnections: usize,
 
     /// Connect ONLY to the specified peer(s) (`<ip:port>`), repeatable.
@@ -4755,9 +4760,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Configure peer manager
+    let (max_outbound_full_relay, max_outbound_block_relay) =
+        PeerManagerConfig::outbound_limits_for_max_connections(cli.maxconnections);
     let peer_config = PeerManagerConfig {
-        max_outbound_full_relay: cli.maxconnections.saturating_sub(2),
-        max_outbound_block_relay: 2, // Block-relay-only anchors for eclipse resistance
+        // Core net.h:1107-1108. This used to be `maxconnections - 2` full-relay
+        // with maxconnections defaulting to 8, so the block-relay-only pair ate
+        // two full-relay slots and mainnet held only 6 full-relay outbound.
+        max_outbound_full_relay,
+        max_outbound_block_relay,
         // Phase B: maxconnections=0 is a fully offline node — no DNS seeds,
         // no outbound peers — that advances only via submitblock.
         offline: cli.maxconnections == 0,
@@ -10373,7 +10383,8 @@ mod tests {
         assert!(cli.rpcpassword.is_none());
         assert!(cli.listen);
         assert!(cli.port.is_none());
-        assert_eq!(cli.maxconnections, 8);
+        // Core DEFAULT_MAX_PEER_CONNECTIONS (net.h:81).
+        assert_eq!(cli.maxconnections, 125);
         assert!(cli.connect.is_empty());
         assert!(!cli.txindex);
         assert_eq!(cli.loglevel, "info");
@@ -10419,6 +10430,33 @@ mod tests {
         .unwrap();
         assert_eq!(cli.rpcuser, Some("alice".to_string()));
         assert_eq!(cli.rpcpassword, Some("secret123".to_string()));
+    }
+
+    /// The default CLI must target Core's 8 full-relay outbound peers PLUS the
+    /// 2 block-relay-only peers (net.h:1107-1108). Before this fix the default
+    /// was `--maxconnections=8` read as "total outbound", giving 6 + 2: mainnet
+    /// sampled 4-6 full-relay outbound and never 8.
+    #[test]
+    fn test_default_cli_targets_8_full_relay_plus_2_block_relay_outbound() {
+        let cli = Cli::try_parse_from(["rustoshi"]).unwrap();
+        assert_eq!(
+            PeerManagerConfig::outbound_limits_for_max_connections(cli.maxconnections),
+            (8, 2)
+        );
+    }
+
+    /// `-maxconnections` below the outbound targets shrinks block-relay-only
+    /// first and full-relay only below 8 (Core net.h:1107-1108); 0 is offline.
+    #[test]
+    fn test_outbound_limits_follow_core_for_small_maxconnections() {
+        let f = PeerManagerConfig::outbound_limits_for_max_connections;
+        assert_eq!(f(0), (0, 0));
+        assert_eq!(f(1), (1, 0));
+        assert_eq!(f(8), (8, 0));
+        assert_eq!(f(9), (8, 1));
+        assert_eq!(f(10), (8, 2));
+        assert_eq!(f(16), (8, 2));
+        assert_eq!(f(DEFAULT_MAX_PEER_CONNECTIONS), (8, 2));
     }
 
     #[test]

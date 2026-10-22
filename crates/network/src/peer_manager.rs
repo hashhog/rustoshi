@@ -54,6 +54,16 @@ use tokio::time::{Duration, Instant};
 /// Maximum number of block-relay-only anchor connections to persist.
 pub const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
 
+/// Core `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` (net.h:71).
+pub const MAX_OUTBOUND_FULL_RELAY_CONNECTIONS: usize = 8;
+
+/// Core `MAX_BLOCK_RELAY_ONLY_CONNECTIONS` (net.h:75).
+pub const MAX_BLOCK_RELAY_ONLY_CONNECTIONS: usize = 2;
+
+/// Core `DEFAULT_MAX_PEER_CONNECTIONS` (net.h:81): the `-maxconnections`
+/// default, a budget for ALL automatic connections (inbound + outbound).
+pub const DEFAULT_MAX_PEER_CONNECTIONS: usize = 125;
+
 /// Whether BIP-157 P2P handlers are registered in the message-dispatch path.
 ///
 /// FIX-71 gate flag (W121 BUG-7 / W99 G22): this is the third precondition for
@@ -238,6 +248,23 @@ impl PeerManagerConfig {
     /// Total maximum outbound connections.
     pub fn max_outbound(&self) -> usize {
         self.max_outbound_full_relay + self.max_outbound_block_relay
+    }
+
+    /// Outbound targets `(full_relay, block_relay_only)` for a
+    /// `-maxconnections` budget, mirroring Core net.h:1107-1108:
+    ///
+    /// ```text
+    /// m_max_outbound_full_relay  = min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, n)
+    /// m_max_outbound_block_relay = min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS, n - full_relay)
+    /// ```
+    ///
+    /// `-maxconnections` is the total automatic-connection budget, not an
+    /// outbound count, so the full-relay target is never reduced to make room
+    /// for the block-relay-only peers: at the default of 125 this is 8 + 2.
+    pub fn outbound_limits_for_max_connections(max_connections: usize) -> (usize, usize) {
+        let full_relay = max_connections.min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS);
+        let block_relay = (max_connections - full_relay).min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS);
+        (full_relay, block_relay)
     }
 
     /// Build a `ProxyConfig` from these fields, suitable for passing into
