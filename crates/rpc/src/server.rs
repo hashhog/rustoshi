@@ -14786,7 +14786,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         };
 
         // Core testmempoolaccept (rpc/mempool.cpp):
-        //   one tx  → ProcessTransaction(test_accept)
+        //   one tx  → ProcessTransaction(test_accept), replacement allowed
         //   several → AcceptMultipleTransactions with package_feerates=false
         //             and allow_replacement=false (PackageTestAccept).
         // PreChecks run on every tx before any success is recorded. A precheck
@@ -14875,7 +14875,12 @@ impl RustoshiRpcServer for RpcServerImpl {
                     );
                     ("missing-ephemeral-spends".to_string(), Some(detail))
                 }
-                other => (other.reject_token(), Some(other.reject_debug())),
+                // ReplacementChecks failures carry Core's debug message
+                // (rule 5 cluster count, PaysForRBF amounts on the modified fee).
+                other => (
+                    other.reject_token(),
+                    Some(other.replacement_reject_debug(&tx.txid(), shown_fee)),
+                ),
             };
             let mut obj = serde_json::json!({
                 "txid": tx.txid().to_hex(),
@@ -14917,7 +14922,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let mut temp: HashMap<OutPoint, (u64, Vec<u8>)> = HashMap::new();
         let pre_opts = AtmpOptions {
             test_accept: true,
-            allow_replacement: false,
+            allow_replacement: txs.len() == 1,
             skip_script_checks: true,
             force_script_checks: false,
             require_standard: state.mempool.require_standard(),
@@ -14996,7 +15001,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         temp.clear();
         let script_opts = AtmpOptions {
             test_accept: true,
-            allow_replacement: false,
+            allow_replacement: txs.len() == 1,
             skip_script_checks: false,
             force_script_checks: true,
             require_standard: state.mempool.require_standard(),
