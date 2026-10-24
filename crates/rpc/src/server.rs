@@ -3867,6 +3867,23 @@ impl RpcServerImpl {
         Ok(i as i32)
     }
 
+    /// Core `ParseVerbosity(arg, default, allow_bool)` (rpc/util.cpp:83).
+    fn core_parse_verbosity(
+        v: Option<&serde_json::Value>,
+        default: u8,
+    ) -> Result<u8, ErrorObjectOwned> {
+        match v {
+            None | Some(serde_json::Value::Null) => Ok(default),
+            Some(v) => {
+                let n = Self::core_get_i32(v)?;
+                // Beyond the meaningful range Core still converts, then treats
+                // it as the top verbosity; clamp AFTER the conversion so the
+                // ordering stays Core's.
+                Ok(n.clamp(0, 3) as u8)
+            }
+        }
+    }
+
     /// `getInt<uint32_t>()` — `from_chars` accepts NO SIGN for an unsigned
     /// destination, so a negative value fails the CONVERSION with the same -1
     /// as one above 2^32-1. This is why `gettxout <txid> -1` is -1 and not a
@@ -7484,16 +7501,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let block_hash = Self::parse_hash(&hash)?;
         // getInt<int> before the block lookup: an out-of-int32 verbosity was
         // refused at DESERIALIZATION with -32602 where Core answers -1.
-        let verbosity: u8 = match verbosity {
-            None | Some(serde_json::Value::Null) => 1,
-            Some(ref v) => {
-                let n = Self::core_get_i32(v)?;
-                // Beyond the meaningful range Core still converts, then treats
-                // it as the top verbosity; clamp AFTER the conversion so the
-                // ordering stays Core's.
-                n.clamp(0, 3) as u8
-            }
-        };
+        let verbosity: u8 = Self::core_parse_verbosity(verbosity.as_ref(), 1)?;
 
         // Helper to wrap a serialized JSON string as a RawValue.
         let raw = |s: String| {
@@ -21584,6 +21592,18 @@ mod tests {
     // convert (a bound off by one in the tight direction would reject half the
     // legal vout range), and that a converting-but-illegal value still reaches
     // the handler's own domain error rather than the conversion error.
+
+    #[test]
+    fn test_core_parse_verbosity_accepts_bool() {
+        let p = |v: serde_json::Value| RpcServerImpl::core_parse_verbosity(Some(&v), 1).unwrap();
+        assert_eq!(p(serde_json::json!(true)), 1);
+        assert_eq!(p(serde_json::json!(false)), 0);
+        assert_eq!(p(serde_json::json!(2)), 2);
+        assert_eq!(p(serde_json::json!(99)), 3);
+        assert_eq!(RpcServerImpl::core_parse_verbosity(None, 1).unwrap(), 1);
+        // a string is still a type error
+        assert!(RpcServerImpl::core_parse_verbosity(Some(&serde_json::json!("1")), 1).is_err());
+    }
 
     #[test]
     fn test_core_get_i32_rejects_out_of_int32() {
