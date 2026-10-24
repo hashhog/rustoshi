@@ -25775,6 +25775,118 @@ mod tests {
         );
     }
 
+    /// Core InvalidateBlock calls MaybeUpdateMempoolForReorg after EACH
+    /// DisconnectTip, so the txs of the block at height h are re-accepted with
+    /// the tip at h-1 (core-regtest warden_d/d-invalidate: entry heights
+    /// 101/102/103 after invalidating 102). Pre-fix every tx was re-added at
+    /// the final tip: P, CX and DX all had entry height 1.
+    ///
+    /// Chain G(0) - A(1) - B(2)[P <- U] - C(3)[CX <- P:0] - D(4)[DX <- CX:0].
+    #[tokio::test]
+    async fn disconnect_to_readds_each_block_at_its_parent_height() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB2);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xB2);
+
+        let u = OutPoint { txid: Hash256::from_bytes([0x78; 32]), vout: 0 };
+        let u_coin = SCoin { height: 1, is_coinbase: false, value: 1_000_000, script_pubkey: p2wsh_true_spk() };
+        store.put_utxo(&u, &u_coin).unwrap();
+
+        let tx_p = spend_p2wsh_true(u.clone(), 990_000);
+        let p0 = OutPoint { txid: tx_p.txid(), vout: 0 };
+        let (hash_b, work_b) = synth_append_with_txs(
+            &store, 2, hash_a, work_a, 0xB2, vec![tx_p.clone()], vec![(u.clone(), u_coin)],
+        );
+        let tx_cx = spend_p2wsh_true(p0.clone(), 980_000);
+        let cx0 = OutPoint { txid: tx_cx.txid(), vout: 0 };
+        let p0_coin = SCoin { height: 2, is_coinbase: false, value: 990_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_c, work_c) = synth_append_with_txs(
+            &store, 3, hash_b, work_b, 0xB2, vec![tx_cx.clone()], vec![(p0, p0_coin)],
+        );
+        let tx_dx = spend_p2wsh_true(cx0.clone(), 970_000);
+        let cx0_coin = SCoin { height: 3, is_coinbase: false, value: 980_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_d, _) = synth_append_with_txs(
+            &store, 4, hash_c, work_c, 0xB2, vec![tx_dx.clone()], vec![(cx0, cx0_coin)],
+        );
+        rpc_state.best_hash = hash_d;
+        rpc_state.best_height = 4;
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+        assert_eq!(rpc_state.best_height, 1);
+
+        let height_of = |txid: &Hash256| rpc_state.mempool.get(txid).map(|e| e.entry_height);
+        assert_eq!(height_of(&tx_p.txid()), Some(1), "P (block 2) re-added at tip 1");
+        assert_eq!(height_of(&tx_cx.txid()), Some(2), "CX (block 3) re-added at tip 2");
+        assert_eq!(height_of(&tx_dx.txid()), Some(3), "DX (block 4) re-added at tip 3");
+
+        // Re-added tip-down, each child is linked under its parent.
+        let mut desc_p = rpc_state.mempool.get_descendants_of(&tx_p.txid());
+        desc_p.sort();
+        let mut want = vec![tx_cx.txid(), tx_dx.txid()];
+        want.sort();
+        assert_eq!(desc_p, want, "P's descendants are CX and DX");
+        assert_eq!(rpc_state.mempool.get(&tx_dx.txid()).unwrap().ancestor_count, 3);
+        assert_eq!(rpc_state.mempool.get(&tx_p.txid()).unwrap().descendant_count, 3);
+        assert_eq!(rpc_state.mempool.tip_height, 1, "mempool tip is the final tip");
+    }
+
+    /// Re-adding block h at the intermediate tip h-1 evaluates BIP68 against
+    /// coins whose heights the committed disconnect already dropped from the
+    /// height index. A time-based relative lock of 0 on a coin confirmed at
+    /// height 3 asks for the MTP at height 2; without the intermediate-tip
+    /// MTPs that lookup fails closed and CX would be dropped, where Core
+    /// (and the pre-fix single batch at the final tip) keeps it.
+    ///
+    /// Chain G(0) - A(1) - B(2) - C(3)[P <- U] - D(4)[CX <- P:0, seq time|0].
+    #[tokio::test]
+    async fn disconnect_to_readd_resolves_bip68_coin_times_at_intermediate_tip() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB3);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xB3);
+        let (hash_b, _, work_b) = synth_append_with_work(&store, 2, hash_a, work_a, 0xB3);
+
+        let u = OutPoint { txid: Hash256::from_bytes([0x79; 32]), vout: 0 };
+        let u_coin = SCoin { height: 1, is_coinbase: false, value: 1_000_000, script_pubkey: p2wsh_true_spk() };
+        store.put_utxo(&u, &u_coin).unwrap();
+
+        let tx_p = spend_p2wsh_true(u.clone(), 990_000);
+        let p0 = OutPoint { txid: tx_p.txid(), vout: 0 };
+        let (hash_c, work_c) = synth_append_with_txs(
+            &store, 3, hash_b, work_b, 0xB3, vec![tx_p.clone()], vec![(u.clone(), u_coin)],
+        );
+        let mut tx_cx = spend_p2wsh_true(p0.clone(), 980_000);
+        // BIP68 time-based relative lock (type flag, 0 units).
+        tx_cx.inputs[0].sequence = 0x0040_0000;
+        let p0_coin = SCoin { height: 3, is_coinbase: false, value: 990_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_d, _) = synth_append_with_txs(
+            &store, 4, hash_c, work_c, 0xB3, vec![tx_cx.clone()], vec![(p0, p0_coin)],
+        );
+        rpc_state.best_hash = hash_d;
+        rpc_state.best_height = 4;
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+
+        let height_of = |txid: &Hash256| rpc_state.mempool.get(txid).map(|e| e.entry_height);
+        assert_eq!(height_of(&tx_cx.txid()), Some(3), "CX (block 4) re-added at tip 3");
+        assert_eq!(height_of(&tx_p.txid()), Some(2), "P (block 3) re-added at tip 2");
+    }
+
     /// Confirmed parent with `n` outputs and one in-mempool child per output.
     /// `child_fees` is ascending. `op_return_len` pads every child (0 = none).
     /// Disconnecting the parent's block is what `invalidateblock` does.
