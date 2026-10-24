@@ -428,6 +428,16 @@ fn sigop_heavy_package_rbf(
     parent_sigop_outs: usize,
     child_sigop_outs: usize,
 ) -> (Mempool, PackageAcceptResult, [Transaction; 4]) {
+    sigop_heavy_package_rbf_with_child_fee(seed, parent_sigop_outs, child_sigop_outs, 200_000)
+}
+
+/// `sigop_heavy_package_rbf` with the child's fee chosen by the caller.
+fn sigop_heavy_package_rbf_with_child_fee(
+    seed: u16,
+    parent_sigop_outs: usize,
+    child_sigop_outs: usize,
+    child_fee: u64,
+) -> (Mempool, PackageAcceptResult, [Transaction; 4]) {
     let mut mp = pool();
     let prev = hash_n(seed);
     let value = 10_000_000u64;
@@ -453,7 +463,6 @@ fn sigop_heavy_package_rbf(
     let mut parent_outs = vec![(parent_change, p2pkh_spk())];
     parent_outs.extend(std::iter::repeat(multisig.clone()).take(parent_sigop_outs));
     let parent = tx_with_outputs(&[(prev, 0)], &parent_outs);
-    let child_fee = 200_000u64;
     let child_change = parent_change - child_fee - 1_000 * child_sigop_outs as u64;
     let mut child_outs = vec![(child_change, p2pkh_spk())];
     child_outs.extend(std::iter::repeat(multisig).take(child_sigop_outs));
@@ -511,4 +520,75 @@ fn test_package_rbf_cluster_weight_at_limit_accepts() {
     assert!(!mp.contains(&descendant.txid()));
     assert!(mp.contains(&parent.txid()));
     assert!(mp.contains(&child.txid()));
+}
+
+/// Core `PreChecks` sets `ws.m_vsize = GetVirtualTransactionSize(tx,
+/// sigop_cost, nBytesPerSigOp)` (policy.cpp), and submitpackage prints that
+/// as `vsize` and `CFeeRate(m_total_modified_fees, m_total_vsize)` as
+/// `effective-feerate`. 126 bare-multisig outputs plus the P2PKH change are
+/// 2521 legacy sigops (cost 10_084), so each tx is 10_084 * 20 / 4 = 50_420 vB
+/// against ~5.9k raw (the shape of the core-regtest
+/// `package_rbf/at-limit/submit` rows), and the package rate is
+/// 206_000 * 1000 / 100_840 = 2042 sat/kvB.
+#[test]
+fn test_package_rbf_result_vsize_and_feerate_are_sigop_adjusted() {
+    let (mp, res, [original, descendant, parent, child]) = sigop_heavy_package_rbf(42, 126, 126);
+    assert_eq!(res.package_error, None, "{res:?}");
+    assert!(parent.vsize() < 6_000 && child.vsize() < 6_000);
+    for r in &res.tx_results {
+        assert_eq!(r.error, None, "{r:?}");
+        assert_eq!(r.vsize, 50_420, "{r:?}");
+        assert_eq!(r.effective_fee_sat_per_kvb, Some(2_042), "{r:?}");
+    }
+    assert_eq!(res.package_vsize, 100_840, "{res:?}");
+    assert!(!mp.contains(&original.txid()));
+    assert!(!mp.contains(&descendant.txid()));
+    assert!(mp.contains(&parent.txid()));
+    assert!(mp.contains(&child.txid()));
+}
+
+/// The adjusted size is also the size `PaysForRBF` charges incremental relay
+/// on (validation.cpp `PackageRBFChecks`: `m_total_vsize`). 5000 sat over the
+/// conflicts covers 100 sat/kvB on the ~11.8k raw vB, but not on the 100_840
+/// adjusted vB, which needs 10_084 sat. Core rejects; the conflicts stay.
+#[test]
+fn test_package_rbf_incremental_relay_uses_sigop_adjusted_vsize() {
+    // Conflicts pay 21_000; the package pays 6_000 + 20_000 = 26_000.
+    let (mp, res, [original, descendant, parent, child]) =
+        sigop_heavy_package_rbf_with_child_fee(43, 126, 126, 20_000);
+    let expect = format!(
+        "package RBF failed: insufficient anti-DoS fees, rejecting replacement {}, not enough additional fees to relay; 0.00005 < 0.00010084",
+        child.txid()
+    );
+    assert_eq!(
+        res.package_error.as_deref(),
+        Some(expect.as_str()),
+        "{res:?}"
+    );
+    assert!(mp.contains(&original.txid()));
+    assert!(mp.contains(&descendant.txid()));
+    assert!(!mp.contains(&parent.txid()));
+    assert!(!mp.contains(&child.txid()));
+}
+
+/// Control for the test above: 11_000 sat over the conflicts clears the
+/// 10_084 sat adjusted-size bar, so PaysForRBF passes and the package goes on
+/// to `ImprovesFeerateDiagram`, which it fails at 0.32 sat/vB adjusted.
+/// Guards against charging more than Core.
+#[test]
+fn test_package_rbf_incremental_relay_sigop_adjusted_passes_when_paid() {
+    let (mp, res, [original, descendant, parent, child]) =
+        sigop_heavy_package_rbf_with_child_fee(44, 126, 126, 26_000);
+    assert_eq!(
+        res.package_error.as_deref(),
+        Some("package RBF failed: insufficient feerate: does not improve feerate diagram"),
+        "{res:?}"
+    );
+    assert!(mp.contains(&original.txid()));
+    assert!(mp.contains(&descendant.txid()));
+    assert!(!mp.contains(&parent.txid()));
+    assert!(!mp.contains(&child.txid()));
+    for r in &res.tx_results {
+        assert_eq!(r.vsize, 50_420, "{r:?}");
+    }
 }
