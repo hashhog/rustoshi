@@ -3874,6 +3874,8 @@ impl RpcServerImpl {
     ) -> Result<u8, ErrorObjectOwned> {
         match v {
             None | Some(serde_json::Value::Null) => Ok(default),
+            // allow_bool=true (getblock): true = 1, false = 0.
+            Some(serde_json::Value::Bool(b)) => Ok(u8::from(*b)),
             Some(v) => {
                 let n = Self::core_get_i32(v)?;
                 // Beyond the meaningful range Core still converts, then treats
