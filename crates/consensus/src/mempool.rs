@@ -6114,6 +6114,10 @@ impl Mempool {
             }
         }
 
+        // Core PreChecks `ws.m_vsize`: every size below (CheckFeeRate,
+        // PaysForRBF, the package feerate, the printed vsize) is sigop-adjusted.
+        let vsizes = self.package_vsizes(&txs, utxo_lookup);
+
         // Calculate fees for new transactions
         for tx in &txs {
             let txid = tx.txid();
@@ -6164,7 +6168,7 @@ impl Mempool {
 
             let output_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
             let fee = input_sum.saturating_sub(output_sum);
-            let vsize = tx.vsize();
+            let vsize = Self::vsize_in(&vsizes, tx);
 
             tx_fees.insert(txid, fee);
             package_fee += fee;
@@ -6193,6 +6197,7 @@ impl Mempool {
             if let Some(aborted) = self.multi_tx_policy_result(
                 &txs,
                 &tx_fees,
+                &vsizes,
                 &already_in_mempool,
                 &different_witness,
                 utxo_lookup,
@@ -6231,6 +6236,7 @@ impl Mempool {
                     return self.unspent_dust_package_result(
                         &txs,
                         &tx_fees,
+                        &vsizes,
                         &already_in_mempool,
                         &different_witness,
                         child_txid,
@@ -6259,7 +6265,7 @@ impl Mempool {
         for tx in txs.iter() {
             let txid = tx.txid();
             let wtxid = tx.wtxid();
-            let vsize = tx.vsize();
+            let vsize = Self::vsize_in(&vsizes, tx);
             let fee = *tx_fees.get(&txid).unwrap_or(&0);
 
             if let Some(other) = different_witness.get(&txid).copied() {
@@ -6518,11 +6524,15 @@ impl Mempool {
     /// when `full` is asked via [`package_truc_violation`].
     pub fn package_truc_violation(&self, txs: &[Transaction]) -> Option<String> {
         let refs: Vec<&Transaction> = txs.iter().collect();
-        self.package_truc_debug(&refs)
+        self.package_truc_debug(&refs, &HashMap::new())
             .map(|debug| format!("TRUC-violation, {debug}"))
     }
 
-    fn package_truc_debug(&self, txs: &[&Transaction]) -> Option<String> {
+    fn package_truc_debug(
+        &self,
+        txs: &[&Transaction],
+        vsizes: &HashMap<Hash256, usize>,
+    ) -> Option<String> {
         let index_of: HashMap<Hash256, usize> = txs
             .iter()
             .enumerate()
@@ -6549,7 +6559,7 @@ impl Mempool {
                     mem_parents.push(pid);
                 }
             }
-            let vsize = tx.vsize();
+            let vsize = Self::vsize_in(vsizes, tx);
             if tx.version == TRUC_VERSION {
                 if vsize > TRUC_MAX_VSIZE {
                     return Some(format!(
@@ -6734,13 +6744,18 @@ impl Mempool {
     /// Individual `ReplacementChecks` fee failure. `Some` is
     /// `TxValidationState::ToString` (`insufficient fee` plus the PaysForRBF
     /// debug). Other RBF results are not reconsiderable.
-    fn reconsiderable_rbf_tostring(&self, tx: &Transaction, mod_fee: i64) -> Option<String> {
+    fn reconsiderable_rbf_tostring(
+        &self,
+        tx: &Transaction,
+        mod_fee: i64,
+        vsize: usize,
+    ) -> Option<String> {
         let direct = self.direct_conflict_ids(tx);
         if direct.is_empty() {
             return None;
         }
         let parents = self.mempool_ancestor_ids(tx);
-        match self.check_rbf_rules(tx, mod_fee, 0.0, tx.vsize(), &direct, &parents) {
+        match self.check_rbf_rules(tx, mod_fee, 0.0, vsize, &direct, &parents) {
             Err(
                 MempoolError::RbfInsufficientAbsoluteFee(_, _)
                 | MempoolError::RbfInsufficientBandwidthFee(_, _)
@@ -6750,13 +6765,13 @@ impl Mempool {
                 // check_rbf_rules sums `get_modified_fee` (clamped at 0). The
                 // displayed original fee uses that same total when the signed
                 // sum would not reproduce the failure it just reported.
-                let original = if Self::pays_would_fail(original, mod_fee, tx.vsize(), self.config.incremental_relay_fee)
+                let original = if Self::pays_would_fail(original, mod_fee, vsize, self.config.incremental_relay_fee)
                 {
                     original
                 } else {
                     self.clamped_conflict_fees(&direct)
                 };
-                self.pays_for_rbf_debug(original, mod_fee, tx.vsize(), tx.txid())
+                self.pays_for_rbf_debug(original, mod_fee, vsize, tx.txid())
                     .map(|debug| format!("insufficient fee, {debug}"))
             }
             _ => None,
@@ -6819,13 +6834,18 @@ impl Mempool {
         None
     }
 
-    fn eval_totals(&self, eval: &[&Transaction], tx_fees: &HashMap<Hash256, u64>) -> (i64, usize) {
+    fn eval_totals(
+        &self,
+        eval: &[&Transaction],
+        tx_fees: &HashMap<Hash256, u64>,
+        vsizes: &HashMap<Hash256, usize>,
+    ) -> (i64, usize) {
         let mut fee = 0i64;
         let mut vsize = 0usize;
         for tx in eval {
             let base = tx_fees.get(&tx.txid()).copied().unwrap_or(0);
             fee = fee.saturating_add(self.modified_fee_of(&tx.txid(), base));
-            vsize += tx.vsize();
+            vsize += Self::vsize_in(vsizes, tx);
         }
         (fee, vsize)
     }
@@ -6853,6 +6873,7 @@ impl Mempool {
         &self,
         eval: &[&Transaction],
         tx_fees: &HashMap<Hash256, u64>,
+        vsizes: &HashMap<Hash256, usize>,
         utxo_lookup: &F,
     ) -> Option<String>
     where
@@ -6885,7 +6906,7 @@ impl Mempool {
             ));
         }
         let (_, original_fees) = self.conflict_closure(&direct);
-        let (total_fee, total_vsize) = self.eval_totals(eval, tx_fees);
+        let (total_fee, total_vsize) = self.eval_totals(eval, tx_fees, vsizes);
         if let Some(debug) =
             self.pays_for_rbf_debug(original_fees, total_fee, total_vsize, child.txid())
         {
@@ -6895,7 +6916,7 @@ impl Mempool {
         }
         let parent = eval[0];
         let parent_fee = self.modified_fee_of(&parent.txid(), tx_fees.get(&parent.txid()).copied().unwrap_or(0));
-        let parent_vsize = parent.vsize();
+        let parent_vsize = Self::vsize_in(vsizes, parent);
         let child_fee = self.modified_fee_of(&child.txid(), tx_fees.get(&child.txid()).copied().unwrap_or(0));
         // CFeeRate <= is cross-multiply, not the truncated GetFeePerK.
         if parent_vsize > 0
@@ -6920,13 +6941,43 @@ impl Mempool {
         if eval.len() > MAX_CLUSTER_SIZE || weight > MAX_CLUSTER_SIZE_WEIGHT {
             return Some("too-large-cluster".to_string());
         }
-        if !self.improves_feerate_diagram(eval, &direct, parent_fee, child_fee) {
+        if !self.improves_feerate_diagram(eval, vsizes, &direct, parent_fee, child_fee) {
             return Some(
                 "package RBF failed: insufficient feerate: does not improve feerate diagram"
                     .to_string(),
             );
         }
         None
+    }
+
+    /// Core `ws.m_vsize` for each package member, keyed by txid: the mempool
+    /// entry's size for a tx already there, otherwise
+    /// `GetVirtualTransactionSize(weight, sigop_cost, nBytesPerSigOp)`
+    /// (policy.cpp) with prevouts from the package, mempool and UTXO set.
+    fn package_vsizes<F>(&self, txs: &[Transaction], utxo_lookup: &F) -> HashMap<Hash256, usize>
+    where
+        F: Fn(&OutPoint) -> Option<CoinEntry>,
+    {
+        let refs: Vec<&Transaction> = txs.iter().collect();
+        txs.iter()
+            .map(|tx| {
+                let txid = tx.txid();
+                let vsize = match self.transactions.get(&txid) {
+                    Some(entry) => entry.vsize,
+                    None => {
+                        let weight = self.package_tx_adjusted_weight(tx, &refs, utxo_lookup);
+                        weight.div_ceil(crate::params::WITNESS_SCALE_FACTOR) as usize
+                    }
+                };
+                (txid, vsize)
+            })
+            .collect()
+    }
+
+    /// Sigop-adjusted vsize from [`Self::package_vsizes`]; raw vsize for a tx
+    /// it does not cover.
+    fn vsize_in(vsizes: &HashMap<Hash256, usize>, tx: &Transaction) -> usize {
+        vsizes.get(&tx.txid()).copied().unwrap_or_else(|| tx.vsize())
     }
 
     /// Core `GetSigOpsAdjustedWeight` for a not-yet-admitted package tx.
@@ -7022,6 +7073,7 @@ impl Mempool {
     fn improves_feerate_diagram(
         &self,
         eval: &[&Transaction],
+        vsizes: &HashMap<Hash256, usize>,
         direct: &HashSet<Hash256>,
         parent_fee: i64,
         child_fee: i64,
@@ -7048,8 +7100,8 @@ impl Mempool {
                 .collect();
             new_chunks.extend(self.diagram_chunks(&remaining));
         }
-        let parent_size = eval[0].vsize() as i64;
-        let child_size = eval[1].vsize() as i64;
+        let parent_size = Self::vsize_in(vsizes, eval[0]) as i64;
+        let child_size = Self::vsize_in(vsizes, eval[1]) as i64;
         let parent_ff = FeeFrac::new(parent_fee, parent_size);
         let child_ff = FeeFrac::new(child_fee, child_size);
         let combined = FeeFrac {
@@ -7102,6 +7154,7 @@ impl Mempool {
         &self,
         txs: &[Transaction],
         tx_fees: &HashMap<Hash256, u64>,
+        vsizes: &HashMap<Hash256, usize>,
         individual: &HashMap<Hash256, String>,
         already_in_mempool: &HashSet<Hash256>,
         different_witness: &HashMap<Hash256, Hash256>,
@@ -7134,7 +7187,7 @@ impl Mempool {
                 tx_results.push(PackageTxResult {
                     txid,
                     wtxid,
-                    vsize: tx.vsize(),
+                    vsize: Self::vsize_in(vsizes, tx),
                     fee,
                     already_in_mempool: true,
                     error: None,
@@ -7149,7 +7202,7 @@ impl Mempool {
             tx_results.push(rejected_package_tx(
                 tx,
                 fee,
-                tx.vsize(),
+                Self::vsize_in(vsizes, tx),
                 individual
                     .get(&txid)
                     .cloned()
@@ -7172,6 +7225,7 @@ impl Mempool {
         &mut self,
         txs: &[Transaction],
         tx_fees: &HashMap<Hash256, u64>,
+        vsizes: &HashMap<Hash256, usize>,
         eval: &[&Transaction],
         individual: &HashMap<Hash256, String>,
         already_in_mempool: &HashSet<Hash256>,
@@ -7196,6 +7250,7 @@ impl Mempool {
                 return self.package_failure_result(
                     txs,
                     tx_fees,
+                    vsizes,
                     &individual,
                     already_in_mempool,
                     different_witness,
@@ -7221,7 +7276,7 @@ impl Mempool {
             self.remove_single(txid);
         }
 
-        let (eval_fee, eval_vsize) = self.eval_totals(eval, tx_fees);
+        let (eval_fee, eval_vsize) = self.eval_totals(eval, tx_fees, vsizes);
         let eval_fee_u = if eval_fee > 0 { eval_fee as u64 } else { 0 };
         let mut added: Vec<Hash256> = Vec::new();
         for tx in eval {
@@ -7248,6 +7303,7 @@ impl Mempool {
                     return self.package_failure_result(
                         txs,
                         tx_fees,
+                        vsizes,
                         &individual,
                         already_in_mempool,
                         different_witness,
@@ -7296,7 +7352,7 @@ impl Mempool {
                     .transactions
                     .get(&txid)
                     .map(|entry| entry.vsize)
-                    .unwrap_or_else(|| tx.vsize());
+                    .unwrap_or_else(|| Self::vsize_in(vsizes, tx));
                 tx_results.push(PackageTxResult {
                     txid,
                     wtxid,
@@ -7316,7 +7372,7 @@ impl Mempool {
                 tx_results.push(PackageTxResult {
                     txid,
                     wtxid,
-                    vsize: tx.vsize(),
+                    vsize: Self::vsize_in(vsizes, tx),
                     fee,
                     already_in_mempool: false,
                     error: None,
@@ -7333,7 +7389,7 @@ impl Mempool {
                 tx_results.push(rejected_package_tx(
                     tx,
                     fee,
-                    tx.vsize(),
+                    Self::vsize_in(vsizes, tx),
                     individual
                         .get(&txid)
                         .cloned()
@@ -7350,6 +7406,7 @@ impl Mempool {
         &mut self,
         txs: &[Transaction],
         tx_fees: &HashMap<Hash256, u64>,
+        vsizes: &HashMap<Hash256, usize>,
         already_in_mempool: &HashSet<Hash256>,
         different_witness: &HashMap<Hash256, Hash256>,
         utxo_lookup: &F,
@@ -7391,7 +7448,8 @@ impl Mempool {
                 individual.insert(txid, "bad-txns-inputs-missingorspent".to_string());
                 continue;
             }
-            if let Some(msg) = self.check_fee_rate_message(mod_fee, tx.vsize()) {
+            let vsize = Self::vsize_in(vsizes, tx);
+            if let Some(msg) = self.check_fee_rate_message(mod_fee, vsize) {
                 eval.push(tx);
                 individual.insert(txid, msg);
                 continue;
@@ -7402,7 +7460,7 @@ impl Mempool {
             // rule (too many conflicts, spends a conflict, not signaling),
             // stops this pre-pass. Core submits the former alone and sets
             // quit_early for the latter (validation.cpp AcceptPackage).
-            if let Some(msg) = self.reconsiderable_rbf_tostring(tx, mod_fee) {
+            if let Some(msg) = self.reconsiderable_rbf_tostring(tx, mod_fee, vsize) {
                 eval.push(tx);
                 individual.insert(txid, msg);
                 continue;
@@ -7412,7 +7470,7 @@ impl Mempool {
         if eval.len() < 2 {
             return None;
         }
-        let package_msg = if let Some(debug) = self.package_truc_debug(&eval) {
+        let package_msg = if let Some(debug) = self.package_truc_debug(&eval, vsizes) {
             format!("TRUC-violation, {debug}")
         } else {
             let mut mod_sum: i64 = 0;
@@ -7420,7 +7478,7 @@ impl Mempool {
             for tx in &eval {
                 let base = *tx_fees.get(&tx.txid()).unwrap_or(&0);
                 mod_sum = mod_sum.saturating_add(self.modified_fee_of(&tx.txid(), base));
-                vsize_sum += tx.vsize();
+                vsize_sum += Self::vsize_in(vsizes, tx);
             }
             if let Some(msg) = self.check_fee_rate_message(mod_sum, vsize_sum) {
                 let last = eval.last().map(|tx| tx.txid());
@@ -7429,12 +7487,15 @@ impl Mempool {
                 }
                 "transaction failed".to_string()
             } else if self.eval_has_direct_conflict(&eval) {
-                if let Some(msg) = self.package_rbf_reject_reason(&eval, tx_fees, utxo_lookup) {
+                if let Some(msg) =
+                    self.package_rbf_reject_reason(&eval, tx_fees, vsizes, utxo_lookup)
+                {
                     msg
                 } else {
                     return Some(self.commit_package_rbf(
                         txs,
                         tx_fees,
+                        vsizes,
                         &eval,
                         &individual,
                         already_in_mempool,
@@ -7475,7 +7536,7 @@ impl Mempool {
                 tx_results.push(PackageTxResult {
                     txid,
                     wtxid,
-                    vsize: tx.vsize(),
+                    vsize: Self::vsize_in(vsizes, tx),
                     fee,
                     already_in_mempool: true,
                     error: None,
@@ -7490,7 +7551,7 @@ impl Mempool {
             tx_results.push(rejected_package_tx(
                 tx,
                 fee,
-                tx.vsize(),
+                Self::vsize_in(vsizes, tx),
                 individual
                     .get(&txid)
                     .cloned()
@@ -7552,6 +7613,7 @@ impl Mempool {
         &mut self,
         txs: &[Transaction],
         tx_fees: &HashMap<Hash256, u64>,
+        vsizes: &HashMap<Hash256, usize>,
         already_in_mempool: &HashSet<Hash256>,
         different_witness: &HashMap<Hash256, Hash256>,
         child_txid: Hash256,
@@ -7577,7 +7639,7 @@ impl Mempool {
         } else {
             let parent_tx = txs.iter().find(|tx| tx.txid() == parent_txid);
             let fee = tx_fees.get(&parent_txid).copied().unwrap_or(0);
-            let vsize = parent_tx.map(|tx| tx.vsize()).unwrap_or(0);
+            let vsize = parent_tx.map(|tx| Self::vsize_in(vsizes, tx)).unwrap_or(0);
             self.individual_fee_reject_message(fee, vsize)
         };
         // Parent failed alone for fee (TX_RECONSIDERABLE) and the child was
@@ -7594,7 +7656,8 @@ impl Mempool {
                     continue;
                 }
                 let fee = tx_fees.get(&txid).copied().unwrap_or(0);
-                if self.individual_fee_reject_message(fee, tx.vsize()).is_some() {
+                let vsize = Self::vsize_in(vsizes, tx);
+                if self.individual_fee_reject_message(fee, vsize).is_some() {
                     continue;
                 }
                 let _ = self.add_transaction_for_package(
@@ -7613,7 +7676,7 @@ impl Mempool {
             let txid = tx.txid();
             let wtxid = tx.wtxid();
             let fee = tx_fees.get(&txid).copied().unwrap_or(0);
-            let vsize = tx.vsize();
+            let vsize = Self::vsize_in(vsizes, tx);
             if let Some(other) = different_witness.get(&txid).copied() {
                 tx_results.push(PackageTxResult {
                     txid,
