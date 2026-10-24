@@ -25695,9 +25695,22 @@ mod tests {
         extra: Vec<Transaction>,
         spent: Vec<(OutPoint, rustoshi_storage::block_store::CoinEntry)>,
     ) -> (Hash256, [u8; 32]) {
-        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
         let mut block = mine_synth_block(h, prev_hash, marker);
         block.transactions.extend(extra);
+        synth_append_built_block(store, h, prev_hash, prev_work, block, spent)
+    }
+
+    /// [`synth_append_with_txs`] for a caller-built `block` (e.g. one whose
+    /// coinbase pays a standard script).
+    fn synth_append_built_block(
+        store: &BlockStore,
+        h: u32,
+        prev_hash: Hash256,
+        prev_work: [u8; 32],
+        block: Block,
+        spent: Vec<(OutPoint, rustoshi_storage::block_store::CoinEntry)>,
+    ) -> (Hash256, [u8; 32]) {
+        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
         let block_hash = block.block_hash();
         let this_work =
             ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(block.header.bits));
@@ -25949,6 +25962,58 @@ mod tests {
         let height_of = |txid: &Hash256| rpc_state.mempool.get(txid).map(|e| e.entry_height);
         assert_eq!(height_of(&tx_cx.txid()), Some(3), "CX (block 4) re-added at tip 3");
         assert_eq!(height_of(&tx_p.txid()), Some(2), "P (block 3) re-added at tip 2");
+    }
+
+    /// Core MaybeUpdateMempoolForReorg calls removeRecursive for every
+    /// disconnected coinbase, which it never re-admits. Re-adding tip-down,
+    /// a spend of a lower block's coinbase is admitted while that coinbase
+    /// still looks confirmed and mature; when the coinbase's own block comes
+    /// off, its in-pool spenders must go. A version-1 spend is the case the
+    /// final sweep cannot catch: the coin is gone from the UTXO set (no
+    /// maturity check) and BIP68 does not apply to version 1.
+    ///
+    /// Chain G(0) - A(1)[coinbase CB] - 2..=101 - S(102)[TX <- CB:0, v1].
+    #[tokio::test]
+    async fn disconnect_to_drops_spend_of_disconnected_coinbase() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB4);
+        // A's coinbase pays P2WSH(OP_TRUE) so its spend passes policy.
+        let mut block_a = mine_synth_block(1, hash_g, 0xB4);
+        block_a.transactions[0].outputs[0].script_pubkey = p2wsh_true_spk();
+        block_a.header.merkle_root = block_a.transactions[0].txid();
+        let cb0 = OutPoint { txid: block_a.transactions[0].txid(), vout: 0 };
+        let (mut prev_hash, mut prev_work) =
+            synth_append_built_block(&store, 1, hash_g, work_g, block_a, vec![]);
+        for h in 2..=101 {
+            let (hash, _, work) = synth_append_with_work(&store, h, prev_hash, prev_work, 0xB4);
+            prev_hash = hash;
+            prev_work = work;
+        }
+
+        // Spent at height 102: 101 confirmations, mature.
+        let mut tx = spend_p2wsh_true(cb0.clone(), 49_990_000);
+        tx.version = 1;
+        let cb0_coin = SCoin { height: 1, is_coinbase: true, value: 50_000_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_s, _) = synth_append_with_txs(
+            &store, 102, prev_hash, prev_work, 0xB4, vec![tx.clone()], vec![(cb0, cb0_coin)],
+        );
+        rpc_state.best_hash = hash_s;
+        rpc_state.best_height = 102;
+
+        disconnect_to(&mut rpc_state, hash_g, 0).expect("disconnect_to");
+        assert_eq!(rpc_state.best_height, 0);
+        assert!(
+            rpc_state.mempool.get(&tx.txid()).is_none(),
+            "spend of A's coinbase must leave with A"
+        );
     }
 
     /// Confirmed parent with `n` outputs and one in-mempool child per output.
