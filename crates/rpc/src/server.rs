@@ -7707,7 +7707,18 @@ impl RustoshiRpcServer for RpcServerImpl {
 
             let mut cursor: usize = 0; // flat-undo cursor (advances per non-coinbase tx)
             let tx_parts: Vec<String> = block.transactions.iter().map(|tx| {
-                let decoded = build_decoded_raw_transaction(tx, Some(&params_clone));
+                let mut decoded = build_decoded_raw_transaction(tx, Some(&params_clone));
+                // Core blockToJSON (rpc/blockchain.cpp:869-875): any verbosity
+                // >= 3 is TxVerbosity::SHOW_DETAILS_AND_PREVOUT, which adds
+                // vin[].prevout from the undo data (coinbase has none).
+                if verbosity >= 3 && have_fees && !tx.is_coinbase() {
+                    let end = cursor + tx.inputs.len();
+                    if end <= spent_coins.len() {
+                        for (vin, coin) in decoded.vin.iter_mut().zip(&spent_coins[cursor..end]) {
+                            vin.prevout = Some(prevout_info_from_coin(coin, &params_clone));
+                        }
+                    }
+                }
                 // Serialize via to_string to preserve BtcAmount's 8-decimal precision.
                 let mut json_str = serde_json::to_string(&decoded).unwrap();
 
@@ -20137,6 +20148,22 @@ fn build_tx_info(
     }
 }
 
+/// Core's `prevout` object (core_io.cpp:473-487) for one spent coin.
+fn prevout_info_from_coin(coin: &CoinEntry, params: &ChainParams) -> PrevoutInfo {
+    PrevoutInfo {
+        generated: coin.is_coinbase,
+        height: coin.height,
+        value: BtcAmount::from_sats(coin.value),
+        script_pubkey: ScriptPubKeyInfo {
+            asm: disassemble_script(&coin.script_pubkey),
+            desc: infer_descriptor(&coin.script_pubkey, params),
+            hex: hex::encode(&coin.script_pubkey),
+            address: script_to_address(&coin.script_pubkey, params),
+            script_type: classify_script(&coin.script_pubkey),
+        },
+    }
+}
+
 /// Add Core's `getrawtransaction` verbosity-2 detail to `info`: each input's
 /// spent coin (`prevout`) and the tx `fee`, read from the containing block's
 /// undo data. Mirrors bitcoin-core/src/rpc/rawtransaction.cpp:348-370 +
@@ -20195,18 +20222,7 @@ fn attach_undo_prevouts(
     let mut total_in: i64 = 0;
     for (vin, coin) in info.vin.iter_mut().zip(coins.iter()) {
         total_in += coin.value as i64;
-        vin.prevout = Some(PrevoutInfo {
-            generated: coin.is_coinbase,
-            height: coin.height,
-            value: BtcAmount::from_sats(coin.value),
-            script_pubkey: ScriptPubKeyInfo {
-                asm: disassemble_script(&coin.script_pubkey),
-                desc: infer_descriptor(&coin.script_pubkey, params),
-                hex: hex::encode(&coin.script_pubkey),
-                address: script_to_address(&coin.script_pubkey, params),
-                script_type: classify_script(&coin.script_pubkey),
-            },
-        });
+        vin.prevout = Some(prevout_info_from_coin(coin, params));
     }
     let total_out: i64 = tx.outputs.iter().map(|o| o.value as i64).sum();
     info.fee = Some(BtcAmount(total_in - total_out));
@@ -28263,6 +28279,70 @@ mod tests {
         let e = rpc.get_block(h12, Some(serde_json::json!(0))).await.expect_err("no body");
         assert_eq!(e.code(), -1, "{}", e.message());
         assert!(e.message().starts_with("Block not available"), "{}", e.message());
+    }
+
+    /// Core rpc/blockchain.cpp:869-875: verbosity >= 3 is SHOW_DETAILS_AND_PREVOUT, so
+    /// every non-coinbase vin carries prevout {generated, height, value,
+    /// scriptPubKey} from the block's undo data. Verbosity 2 has none; the
+    /// coinbase never has one.
+    #[tokio::test]
+    async fn getblock_verbosity3_includes_vin_prevout_from_undo() {
+        use rustoshi_primitives::{OutPoint, TxIn, TxOut, Transaction};
+        use rustoshi_storage::block_store::{CoinEntry as StoreCoin, UndoData};
+        use rustoshi_storage::ChainDb;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(ChainDb::open(tmp.path()).expect("open db"));
+        let (params, blocks) = seed_backfill_chain(&db, 10, 20);
+        let store = BlockStore::new(&db);
+        let mut block = blocks[14].clone();
+        block.transactions.push(Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint { txid: Hash256([7u8; 32]), vout: 1 },
+                script_sig: vec![],
+                sequence: 0xFFFF_FFFD,
+                witness: vec![],
+            }],
+            outputs: vec![TxOut { value: 40_000_000, script_pubkey: vec![0x51] }],
+            lock_time: 0,
+        });
+        let bh = blocks[14].header.block_hash();
+        store.put_block(&bh, &block).unwrap();
+        store
+            .put_undo(
+                &bh,
+                &UndoData {
+                    spent_coins: vec![StoreCoin {
+                        height: 5,
+                        is_coinbase: true,
+                        value: 50_000_000,
+                        script_pubkey: vec![0x51],
+                    }],
+                },
+            )
+            .unwrap();
+        let rpc = r5di_server(db.clone(), params, &blocks, 20);
+        let hash = bh.to_hex();
+        let get = |v: i64| {
+            let rpc = &rpc;
+            let hash = hash.clone();
+            async move {
+                let raw = rpc.get_block(hash, Some(serde_json::json!(v))).await.expect("getblock");
+                serde_json::from_str::<serde_json::Value>(raw.get()).unwrap()
+            }
+        };
+        let v2 = get(2).await;
+        assert!(v2["tx"][1]["vin"][0].get("prevout").is_none(), "verbosity 2 has no prevout");
+        for v in [3, 9] {
+            let j = get(v).await;
+            assert!(j["tx"][0]["vin"][0].get("prevout").is_none(), "coinbase has no prevout");
+            let p = &j["tx"][1]["vin"][0]["prevout"];
+            assert_eq!(p["generated"], serde_json::json!(true), "verbosity {v}: {j}");
+            assert_eq!(p["height"], serde_json::json!(5));
+            assert_eq!(p["value"].as_f64().unwrap(), 0.5);
+            assert_eq!(p["scriptPubKey"]["hex"], serde_json::json!("51"));
+            assert_eq!(j["tx"][1]["fee"].as_f64().unwrap(), 0.1);
+        }
     }
 
     #[tokio::test]
