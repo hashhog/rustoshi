@@ -2103,6 +2103,16 @@ impl Mempool {
         self.coin_mtp_provider = Some(provider);
     }
 
+    /// Swap the BIP68 coin-time lookup, returning the previous one so the
+    /// caller can put it back. Used while re-adding disconnected blocks at
+    /// an intermediate tip whose heights the store no longer indexes.
+    pub fn replace_coin_mtp_provider(
+        &mut self,
+        provider: Option<CoinMtpProvider>,
+    ) -> Option<CoinMtpProvider> {
+        std::mem::replace(&mut self.coin_mtp_provider, provider)
+    }
+
     /// BIP68 at the next block for `tx`, resolving coin heights the way
     /// admission does: a mempool parent's output at tip+1, a confirmed coin
     /// at its own height. A missing input or an unresolvable MTP window is

@@ -5352,34 +5352,98 @@ fn disconnect_to(
     // (commit 22667c2). Cross-impl audit:
     // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
     //
-    // Plan order is tip-down (highest height first). Refill order DOES
-    // matter: Core re-adds earliest-confirmed first (InvalidateBlock runs
-    // MaybeUpdateMempoolForReorg after each DisconnectTip, tip-down, so a
-    // later block's tx is back before the earlier block's parent and is
-    // linked under it by UpdateTransactionsFromBlock). One batch, earliest
-    // first, reaches the same pool: a tx in block N+1 spending a tx of block
-    // N is accepted once its parent is back, never rejected as an orphan.
+    // Core InvalidateBlock runs MaybeUpdateMempoolForReorg after EACH
+    // DisconnectTip (validation.cpp InvalidateBlock), so the txs of the block
+    // at height h are re-accepted with the tip at h-1: their entry height is
+    // h-1, not the final tip. Plan order is tip-down, which is Core's order.
+    // A tx of block h spending a tx of block h-1 is accepted against the
+    // still-confirmed parent; the parent comes back on the next pass and is
+    // linked over it (Core UpdateTransactionsFromBlock).
+    //
+    // The disconnect above committed in one batch, so the store holds the
+    // final tip's coins. The coins at the intermediate tip h-1 are those plus
+    // what the still-connected blocks (plan entries below h) created and did
+    // not spend, minus what they spent. Their heights are no longer in the
+    // height index, so BIP68 coin times for them come from `mtp_at` instead.
+    //
     // Finality / maturity / BIP68 only get stricter as the tip drops, so the
     // single removeForReorg at the final tip removes what the per-block
     // passes would have.
     {
-        // Sync mempool's tip-snapshot to the new tip so that IsFinalTx
-        // (BIP-113) + coinbase-maturity checks during refill use the
-        // post-rewind height + MTP rather than the pre-rewind values.
-        // Mempool refill only (no verdict); a read error has latched AbortNode.
-        let mtp = compute_prev_block_mtp(&store, &target_hash).unwrap_or(0) as i64;
-        state.mempool.notify_new_tip(target_height, mtp);
+        use rustoshi_consensus::validation::{CoinEntry as VCoin, UtxoView};
+        use rustoshi_primitives::OutPoint as Op;
+
+        let mut created: std::collections::HashMap<Op, VCoin> = std::collections::HashMap::new();
+        let mut spent: HashSet<Op> = HashSet::new();
+        // MTP of the chain ending at each intermediate tip height. Mempool
+        // refill only (no verdict); a read error has latched AbortNode.
+        let mut mtp_at: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (h, _hash, block, _undo) in plan.iter() {
+            let tip_mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash).unwrap_or(0);
+            mtp_at.insert(h - 1, tip_mtp);
+            for (i, tx) in block.transactions.iter().enumerate() {
+                let txid = tx.txid();
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    created.insert(
+                        Op { txid, vout: vout as u32 },
+                        VCoin {
+                            height: *h,
+                            is_coinbase: i == 0,
+                            value: out.value,
+                            script_pubkey: out.script_pubkey.clone(),
+                        },
+                    );
+                }
+                if i != 0 {
+                    for input in &tx.inputs {
+                        spent.insert(input.previous_output.clone());
+                    }
+                }
+            }
+        }
+        let overlay = std::sync::Arc::new(mtp_at);
+        let base_provider = state.mempool.replace_coin_mtp_provider(None);
+        {
+            let overlay = std::sync::Arc::clone(&overlay);
+            let base = base_provider.clone();
+            state.mempool.replace_coin_mtp_provider(Some(std::sync::Arc::new(move |height: u32| {
+                match overlay.get(&height) {
+                    Some(mtp) if height > target_height => Some(*mtp),
+                    _ => base.as_ref().and_then(|p| p(height)),
+                }
+            })));
+        }
 
         let refill_view = store.utxo_view();
-        let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
-            use rustoshi_consensus::validation::UtxoView;
-            refill_view.get_utxo(op)
-        };
-        state.mempool.readd_disconnected_blocks(
-            plan.iter().rev().map(|(_h, _hash, block, _undo)| block.transactions.as_slice()),
-            &utxo_lookup,
-        );
+        for (h, _hash, block, _undo) in plan.iter() {
+            // DisconnectTip of this block: its coins leave the view, the
+            // coins it spent come back.
+            for (i, tx) in block.transactions.iter().enumerate() {
+                let txid = tx.txid();
+                for vout in 0..tx.outputs.len() as u32 {
+                    created.remove(&Op { txid, vout });
+                }
+                if i != 0 {
+                    for input in &tx.inputs {
+                        spent.remove(&input.previous_output);
+                    }
+                }
+            }
+            state.mempool.notify_new_tip(h - 1, overlay[&(h - 1)] as i64);
+            let utxo_lookup = |op: &Op| -> Option<VCoin> {
+                if spent.contains(op) {
+                    return None;
+                }
+                created.get(op).cloned().or_else(|| refill_view.get_utxo(op))
+            };
+            state
+                .mempool
+                .readd_disconnected_blocks(std::iter::once(block.transactions.as_slice()), &utxo_lookup);
+        }
+        state.mempool.replace_coin_mtp_provider(base_provider);
 
+        let mtp = compute_prev_block_mtp(&store, &target_hash).unwrap_or(0) as i64;
+        state.mempool.notify_new_tip(target_height, mtp);
         evict_mempool_after_reorg(&mut state.mempool, &store, target_height, mtp);
         // Core MaybeUpdateMempoolForReorg -> LimitMempoolSize.
         state.mempool.limit_mempool_size();
