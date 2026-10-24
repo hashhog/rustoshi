@@ -3509,6 +3509,10 @@ impl Mempool {
         for block_transactions in blocks_earliest_first {
             for tx in block_transactions {
                 if tx.is_coinbase() {
+                    // Core never re-admits a coinbase and removeRecursive's
+                    // it: a spend admitted while this block was still
+                    // connected (tip-down re-add) is now an orphan.
+                    self.remove_spenders_of(tx);
                     continue;
                 }
                 // `reorg_refill`: bypass_limits (no fee floor, no mempool-full
@@ -3524,17 +3528,8 @@ impl Mempool {
                     Err(MempoolError::AlreadyExists)
                     | Err(MempoolError::WtxidAlreadyInMempool)
                     | Err(MempoolError::TxidSameNonwitnessData) => {}
-                    Err(_) => {
-                        // Core: `if (!accepted) removeRecursive(tx)`.
-                        let txid = tx.txid();
-                        for vout in 0..tx.outputs.len() as u32 {
-                            if let Some(spender) =
-                                self.spent_outpoints.get(&OutPoint { txid, vout }).copied()
-                            {
-                                self.remove_transaction(&spender, true);
-                            }
-                        }
-                    }
+                    // Core: `if (!accepted) removeRecursive(tx)`.
+                    Err(_) => self.remove_spenders_of(tx),
                 }
             }
         }
@@ -3542,6 +3537,17 @@ impl Mempool {
         // once every re-added tx has been linked to in-pool children.
         self.trim_cluster_limits();
         readded
+    }
+
+    /// Core `removeRecursive` for a `tx` that is not in the pool: remove
+    /// every in-pool spender of its outputs, with their descendants.
+    fn remove_spenders_of(&mut self, tx: &Transaction) {
+        let txid = tx.txid();
+        for vout in 0..tx.outputs.len() as u32 {
+            if let Some(spender) = self.spent_outpoints.get(&OutPoint { txid, vout }).copied() {
+                self.remove_transaction(&spender, true);
+            }
+        }
     }
 
     /// Drop transactions from clusters that exceed [`MAX_CLUSTER_SIZE`] or
