@@ -7481,7 +7481,7 @@ impl RustoshiRpcServer for RpcServerImpl {
     }
 
     async fn get_block(&self, hash: String, verbosity: Option<serde_json::Value>) -> RpcResult<Box<serde_json::value::RawValue>> {
-        let block_hash = Self::parse_hash(&hash)?;
+        let block_hash = Self::parse_hash_named("blockhash", &hash)?;
         // getInt<int> before the block lookup: an out-of-int32 verbosity was
         // refused at DESERIALIZATION with -32602 where Core answers -1.
         let verbosity: u8 = match verbosity {
@@ -9115,7 +9115,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         verbosity: Option<serde_json::Value>,
         blockhash: Option<String>,
     ) -> RpcResult<Box<serde_json::value::RawValue>> {
-        let tx_hash = Self::parse_hash(&txid)?;
+        let tx_hash = Self::parse_hash_named("parameter 1", &txid)?;
 
         // Parse verbosity: accepts bool (false→0, true→1) or integer (0/1/2).
         // This matches Bitcoin Core's ParseVerbosity semantics.
@@ -29212,6 +29212,38 @@ mod tests {
             createraw_err(serde_json::json!({"txid": "abc", "vout": 0}), None).await;
         assert_eq!(code, -8, "got {code} / {msg}");
         assert_eq!(msg, "txid must be of length 64 (not 3, for 'abc')");
+    }
+
+    // Core ParseHashV names the argument: getblock passes "blockhash"
+    // (rpc/blockchain.cpp), getrawtransaction passes "parameter 1"
+    // (rpc/rawtransaction.cpp). Both are -8.
+    #[tokio::test]
+    async fn getblock_malformed_hash_names_blockhash() {
+        let server = setup_test_server();
+        let e = server.get_block("abc".into(), None).await.unwrap_err();
+        assert_eq!(e.code(), -8);
+        assert_eq!(e.message(), "blockhash must be of length 64 (not 3, for 'abc')");
+        let bad = "zz".repeat(32);
+        let e = server.get_block(bad.clone(), None).await.unwrap_err();
+        assert_eq!(e.code(), -8);
+        assert_eq!(
+            e.message(),
+            format!("blockhash must be hexadecimal string (not '{}')", bad)
+        );
+    }
+
+    #[tokio::test]
+    async fn getrawtransaction_malformed_txid_names_parameter_1() {
+        let server = setup_test_server();
+        let e = server
+            .get_raw_transaction("abc".into(), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), -8);
+        assert_eq!(
+            e.message(),
+            "parameter 1 must be of length 64 (not 3, for 'abc')"
+        );
     }
 
     /// Core guards the sequence range check with `if (sequenceObj.isNum())`, so
