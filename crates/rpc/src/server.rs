@@ -5371,34 +5371,98 @@ fn disconnect_to(
     // (commit 22667c2). Cross-impl audit:
     // CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
     //
-    // Plan order is tip-down (highest height first). Refill order DOES
-    // matter: Core re-adds earliest-confirmed first (InvalidateBlock runs
-    // MaybeUpdateMempoolForReorg after each DisconnectTip, tip-down, so a
-    // later block's tx is back before the earlier block's parent and is
-    // linked under it by UpdateTransactionsFromBlock). One batch, earliest
-    // first, reaches the same pool: a tx in block N+1 spending a tx of block
-    // N is accepted once its parent is back, never rejected as an orphan.
+    // Core InvalidateBlock runs MaybeUpdateMempoolForReorg after EACH
+    // DisconnectTip (validation.cpp InvalidateBlock), so the txs of the block
+    // at height h are re-accepted with the tip at h-1: their entry height is
+    // h-1, not the final tip. Plan order is tip-down, which is Core's order.
+    // A tx of block h spending a tx of block h-1 is accepted against the
+    // still-confirmed parent; the parent comes back on the next pass and is
+    // linked over it (Core UpdateTransactionsFromBlock).
+    //
+    // The disconnect above committed in one batch, so the store holds the
+    // final tip's coins. The coins at the intermediate tip h-1 are those plus
+    // what the still-connected blocks (plan entries below h) created and did
+    // not spend, minus what they spent. Their heights are no longer in the
+    // height index, so BIP68 coin times for them come from `mtp_at` instead.
+    //
     // Finality / maturity / BIP68 only get stricter as the tip drops, so the
     // single removeForReorg at the final tip removes what the per-block
     // passes would have.
     {
-        // Sync mempool's tip-snapshot to the new tip so that IsFinalTx
-        // (BIP-113) + coinbase-maturity checks during refill use the
-        // post-rewind height + MTP rather than the pre-rewind values.
-        // Mempool refill only (no verdict); a read error has latched AbortNode.
-        let mtp = compute_prev_block_mtp(&store, &target_hash).unwrap_or(0) as i64;
-        state.mempool.notify_new_tip(target_height, mtp);
+        use rustoshi_consensus::validation::{CoinEntry as VCoin, UtxoView};
+        use rustoshi_primitives::OutPoint as Op;
+
+        let mut created: std::collections::HashMap<Op, VCoin> = std::collections::HashMap::new();
+        let mut spent: HashSet<Op> = HashSet::new();
+        // MTP of the chain ending at each intermediate tip height. Mempool
+        // refill only (no verdict); a read error has latched AbortNode.
+        let mut mtp_at: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        for (h, _hash, block, _undo) in plan.iter() {
+            let tip_mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash).unwrap_or(0);
+            mtp_at.insert(h - 1, tip_mtp);
+            for (i, tx) in block.transactions.iter().enumerate() {
+                let txid = tx.txid();
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    created.insert(
+                        Op { txid, vout: vout as u32 },
+                        VCoin {
+                            height: *h,
+                            is_coinbase: i == 0,
+                            value: out.value,
+                            script_pubkey: out.script_pubkey.clone(),
+                        },
+                    );
+                }
+                if i != 0 {
+                    for input in &tx.inputs {
+                        spent.insert(input.previous_output.clone());
+                    }
+                }
+            }
+        }
+        let overlay = std::sync::Arc::new(mtp_at);
+        let base_provider = state.mempool.replace_coin_mtp_provider(None);
+        {
+            let overlay = std::sync::Arc::clone(&overlay);
+            let base = base_provider.clone();
+            state.mempool.replace_coin_mtp_provider(Some(std::sync::Arc::new(move |height: u32| {
+                match overlay.get(&height) {
+                    Some(mtp) if height > target_height => Some(*mtp),
+                    _ => base.as_ref().and_then(|p| p(height)),
+                }
+            })));
+        }
 
         let refill_view = store.utxo_view();
-        let utxo_lookup = |op: &rustoshi_primitives::OutPoint| -> Option<rustoshi_consensus::validation::CoinEntry> {
-            use rustoshi_consensus::validation::UtxoView;
-            refill_view.get_utxo(op)
-        };
-        state.mempool.readd_disconnected_blocks(
-            plan.iter().rev().map(|(_h, _hash, block, _undo)| block.transactions.as_slice()),
-            &utxo_lookup,
-        );
+        for (h, _hash, block, _undo) in plan.iter() {
+            // DisconnectTip of this block: its coins leave the view, the
+            // coins it spent come back.
+            for (i, tx) in block.transactions.iter().enumerate() {
+                let txid = tx.txid();
+                for vout in 0..tx.outputs.len() as u32 {
+                    created.remove(&Op { txid, vout });
+                }
+                if i != 0 {
+                    for input in &tx.inputs {
+                        spent.remove(&input.previous_output);
+                    }
+                }
+            }
+            state.mempool.notify_new_tip(h - 1, overlay[&(h - 1)] as i64);
+            let utxo_lookup = |op: &Op| -> Option<VCoin> {
+                if spent.contains(op) {
+                    return None;
+                }
+                created.get(op).cloned().or_else(|| refill_view.get_utxo(op))
+            };
+            state
+                .mempool
+                .readd_disconnected_blocks(std::iter::once(block.transactions.as_slice()), &utxo_lookup);
+        }
+        state.mempool.replace_coin_mtp_provider(base_provider);
 
+        let mtp = compute_prev_block_mtp(&store, &target_hash).unwrap_or(0) as i64;
+        state.mempool.notify_new_tip(target_height, mtp);
         evict_mempool_after_reorg(&mut state.mempool, &store, target_height, mtp);
         // Core MaybeUpdateMempoolForReorg -> LimitMempoolSize.
         state.mempool.limit_mempool_size();
@@ -25669,9 +25733,22 @@ mod tests {
         extra: Vec<Transaction>,
         spent: Vec<(OutPoint, rustoshi_storage::block_store::CoinEntry)>,
     ) -> (Hash256, [u8; 32]) {
-        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
         let mut block = mine_synth_block(h, prev_hash, marker);
         block.transactions.extend(extra);
+        synth_append_built_block(store, h, prev_hash, prev_work, block, spent)
+    }
+
+    /// [`synth_append_with_txs`] for a caller-built `block` (e.g. one whose
+    /// coinbase pays a standard script).
+    fn synth_append_built_block(
+        store: &BlockStore,
+        h: u32,
+        prev_hash: Hash256,
+        prev_work: [u8; 32],
+        block: Block,
+        spent: Vec<(OutPoint, rustoshi_storage::block_store::CoinEntry)>,
+    ) -> (Hash256, [u8; 32]) {
+        use rustoshi_consensus::pow::{get_block_proof, ChainWork};
         let block_hash = block.block_hash();
         let this_work =
             ChainWork::from_be_bytes(prev_work).saturating_add(&get_block_proof(block.header.bits));
@@ -25810,6 +25887,170 @@ mod tests {
             rpc_state.mempool.get_cluster_id(&p),
             rpc_state.mempool.get_cluster_id(&m),
             "M joined the P/CX cluster"
+        );
+    }
+
+    /// Core InvalidateBlock calls MaybeUpdateMempoolForReorg after EACH
+    /// DisconnectTip, so the txs of the block at height h are re-accepted with
+    /// the tip at h-1 (core-regtest warden_d/d-invalidate: entry heights
+    /// 101/102/103 after invalidating 102). Pre-fix every tx was re-added at
+    /// the final tip: P, CX and DX all had entry height 1.
+    ///
+    /// Chain G(0) - A(1) - B(2)[P <- U] - C(3)[CX <- P:0] - D(4)[DX <- CX:0].
+    #[tokio::test]
+    async fn disconnect_to_readds_each_block_at_its_parent_height() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB2);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xB2);
+
+        let u = OutPoint { txid: Hash256::from_bytes([0x78; 32]), vout: 0 };
+        let u_coin = SCoin { height: 1, is_coinbase: false, value: 1_000_000, script_pubkey: p2wsh_true_spk() };
+        store.put_utxo(&u, &u_coin).unwrap();
+
+        let tx_p = spend_p2wsh_true(u.clone(), 990_000);
+        let p0 = OutPoint { txid: tx_p.txid(), vout: 0 };
+        let (hash_b, work_b) = synth_append_with_txs(
+            &store, 2, hash_a, work_a, 0xB2, vec![tx_p.clone()], vec![(u.clone(), u_coin)],
+        );
+        let tx_cx = spend_p2wsh_true(p0.clone(), 980_000);
+        let cx0 = OutPoint { txid: tx_cx.txid(), vout: 0 };
+        let p0_coin = SCoin { height: 2, is_coinbase: false, value: 990_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_c, work_c) = synth_append_with_txs(
+            &store, 3, hash_b, work_b, 0xB2, vec![tx_cx.clone()], vec![(p0, p0_coin)],
+        );
+        let tx_dx = spend_p2wsh_true(cx0.clone(), 970_000);
+        let cx0_coin = SCoin { height: 3, is_coinbase: false, value: 980_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_d, _) = synth_append_with_txs(
+            &store, 4, hash_c, work_c, 0xB2, vec![tx_dx.clone()], vec![(cx0, cx0_coin)],
+        );
+        rpc_state.best_hash = hash_d;
+        rpc_state.best_height = 4;
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+        assert_eq!(rpc_state.best_height, 1);
+
+        let height_of = |txid: &Hash256| rpc_state.mempool.get(txid).map(|e| e.entry_height);
+        assert_eq!(height_of(&tx_p.txid()), Some(1), "P (block 2) re-added at tip 1");
+        assert_eq!(height_of(&tx_cx.txid()), Some(2), "CX (block 3) re-added at tip 2");
+        assert_eq!(height_of(&tx_dx.txid()), Some(3), "DX (block 4) re-added at tip 3");
+
+        // Re-added tip-down, each child is linked under its parent.
+        let mut desc_p = rpc_state.mempool.get_descendants_of(&tx_p.txid());
+        desc_p.sort();
+        let mut want = vec![tx_cx.txid(), tx_dx.txid()];
+        want.sort();
+        assert_eq!(desc_p, want, "P's descendants are CX and DX");
+        assert_eq!(rpc_state.mempool.get(&tx_dx.txid()).unwrap().ancestor_count, 3);
+        assert_eq!(rpc_state.mempool.get(&tx_p.txid()).unwrap().descendant_count, 3);
+        assert_eq!(rpc_state.mempool.tip_height, 1, "mempool tip is the final tip");
+    }
+
+    /// Re-adding block h at the intermediate tip h-1 evaluates BIP68 against
+    /// coins whose heights the committed disconnect already dropped from the
+    /// height index. A time-based relative lock of 0 on a coin confirmed at
+    /// height 3 asks for the MTP at height 2; without the intermediate-tip
+    /// MTPs that lookup fails closed and CX would be dropped, where Core
+    /// (and the pre-fix single batch at the final tip) keeps it.
+    ///
+    /// Chain G(0) - A(1) - B(2) - C(3)[P <- U] - D(4)[CX <- P:0, seq time|0].
+    #[tokio::test]
+    async fn disconnect_to_readd_resolves_bip68_coin_times_at_intermediate_tip() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB3);
+        let (hash_a, _, work_a) = synth_append_with_work(&store, 1, hash_g, work_g, 0xB3);
+        let (hash_b, _, work_b) = synth_append_with_work(&store, 2, hash_a, work_a, 0xB3);
+
+        let u = OutPoint { txid: Hash256::from_bytes([0x79; 32]), vout: 0 };
+        let u_coin = SCoin { height: 1, is_coinbase: false, value: 1_000_000, script_pubkey: p2wsh_true_spk() };
+        store.put_utxo(&u, &u_coin).unwrap();
+
+        let tx_p = spend_p2wsh_true(u.clone(), 990_000);
+        let p0 = OutPoint { txid: tx_p.txid(), vout: 0 };
+        let (hash_c, work_c) = synth_append_with_txs(
+            &store, 3, hash_b, work_b, 0xB3, vec![tx_p.clone()], vec![(u.clone(), u_coin)],
+        );
+        let mut tx_cx = spend_p2wsh_true(p0.clone(), 980_000);
+        // BIP68 time-based relative lock (type flag, 0 units).
+        tx_cx.inputs[0].sequence = 0x0040_0000;
+        let p0_coin = SCoin { height: 3, is_coinbase: false, value: 990_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_d, _) = synth_append_with_txs(
+            &store, 4, hash_c, work_c, 0xB3, vec![tx_cx.clone()], vec![(p0, p0_coin)],
+        );
+        rpc_state.best_hash = hash_d;
+        rpc_state.best_height = 4;
+
+        disconnect_to(&mut rpc_state, hash_a, 1).expect("disconnect_to");
+
+        let height_of = |txid: &Hash256| rpc_state.mempool.get(txid).map(|e| e.entry_height);
+        assert_eq!(height_of(&tx_cx.txid()), Some(3), "CX (block 4) re-added at tip 3");
+        assert_eq!(height_of(&tx_p.txid()), Some(2), "P (block 3) re-added at tip 2");
+    }
+
+    /// Core MaybeUpdateMempoolForReorg calls removeRecursive for every
+    /// disconnected coinbase, which it never re-admits. Re-adding tip-down,
+    /// a spend of a lower block's coinbase is admitted while that coinbase
+    /// still looks confirmed and mature; when the coinbase's own block comes
+    /// off, its in-pool spenders must go. A version-1 spend is the case the
+    /// final sweep cannot catch: the coin is gone from the UTXO set (no
+    /// maturity check) and BIP68 does not apply to version 1.
+    ///
+    /// Chain G(0) - A(1)[coinbase CB] - 2..=101 - S(102)[TX <- CB:0, v1].
+    #[tokio::test]
+    async fn disconnect_to_drops_spend_of_disconnected_coinbase() {
+        use rustoshi_consensus::ChainParams;
+        use rustoshi_storage::block_store::CoinEntry as SCoin;
+        use rustoshi_storage::ChainDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        let store = BlockStore::new(&db);
+
+        let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xB4);
+        // A's coinbase pays P2WSH(OP_TRUE) so its spend passes policy.
+        let mut block_a = mine_synth_block(1, hash_g, 0xB4);
+        block_a.transactions[0].outputs[0].script_pubkey = p2wsh_true_spk();
+        block_a.header.merkle_root = block_a.transactions[0].txid();
+        let cb0 = OutPoint { txid: block_a.transactions[0].txid(), vout: 0 };
+        let (mut prev_hash, mut prev_work) =
+            synth_append_built_block(&store, 1, hash_g, work_g, block_a, vec![]);
+        for h in 2..=101 {
+            let (hash, _, work) = synth_append_with_work(&store, h, prev_hash, prev_work, 0xB4);
+            prev_hash = hash;
+            prev_work = work;
+        }
+
+        // Spent at height 102: 101 confirmations, mature.
+        let mut tx = spend_p2wsh_true(cb0.clone(), 49_990_000);
+        tx.version = 1;
+        let cb0_coin = SCoin { height: 1, is_coinbase: true, value: 50_000_000, script_pubkey: p2wsh_true_spk() };
+        let (hash_s, _) = synth_append_with_txs(
+            &store, 102, prev_hash, prev_work, 0xB4, vec![tx.clone()], vec![(cb0, cb0_coin)],
+        );
+        rpc_state.best_hash = hash_s;
+        rpc_state.best_height = 102;
+
+        disconnect_to(&mut rpc_state, hash_g, 0).expect("disconnect_to");
+        assert_eq!(rpc_state.best_height, 0);
+        assert!(
+            rpc_state.mempool.get(&tx.txid()).is_none(),
+            "spend of A's coinbase must leave with A"
         );
     }
 
