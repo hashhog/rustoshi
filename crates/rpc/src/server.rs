@@ -3858,12 +3858,20 @@ impl RpcServerImpl {
     /// `maxfeerate` (BTC/kvB) for sendrawtransaction / testmempoolaccept.
     /// Core declares it `RPCArg::Type::AMOUNT` (no type gate) and reads it
     /// with `ParseFeeRate` -> `AmountFromValue`, so a non-numeric value is
-    /// -3 "Invalid amount". Omitted / null -> the 0.10 BTC/kvB default.
+    /// -3 "Invalid amount". A parsed rate >= 1 BTC/kvB is -8 (Core rejects
+    /// exactly 1 too). Omitted / null -> the 0.10 BTC/kvB default.
     fn parse_maxfeerate_btc_kvb(v: Option<&serde_json::Value>) -> Result<f64, ErrorObjectOwned> {
-        match v {
-            None | Some(serde_json::Value::Null) => Ok(0.10),
-            Some(v) => Ok(Self::core_amount_from_value(v)? as f64 / COIN as f64),
+        let sat_kvb = match v {
+            None | Some(serde_json::Value::Null) => COIN / 10,
+            Some(v) => Self::core_amount_from_value(v)?,
+        };
+        if sat_kvb >= COIN {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+            ));
         }
+        Ok(sat_kvb as f64 / COIN as f64)
     }
 
     /// Core rpc/util.cpp ParseRange + ParseDescriptorRange: a number N means
@@ -9510,21 +9518,6 @@ impl RustoshiRpcServer for RpcServerImpl {
         maxfeerate: Option<serde_json::Value>,
         maxburnamount: Option<f64>,
     ) -> RpcResult<String> {
-        // Default maxfeerate: 0.10 BTC/kvB (10,000,000 sat/kvB)
-        // Bitcoin Core uses DEFAULT_MAX_RAW_TX_FEE_RATE = 0.10 BTC/kvB
-        let max_fee_rate_btc_kvb = Self::parse_maxfeerate_btc_kvb(maxfeerate.as_ref())?;
-
-        // Reject fee rates > 1 BTC/kvB as clearly erroneous
-        if max_fee_rate_btc_kvb > 1.0 {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "maxfeerate cannot exceed 1 BTC/kvB",
-            ));
-        }
-
-        // Convert BTC/kvB to sat/vB: BTC/kvB * COIN / 1000
-        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
-
         // Default maxburnamount: 0 BTC
         let max_burn_btc = maxburnamount.unwrap_or(0.0);
         let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
@@ -9557,6 +9550,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 ));
             }
         }
+
+        // Core parses maxfeerate (ParseFeeRate) only after the decode and the
+        // burn check. Default 0.10 BTC/kvB (DEFAULT_MAX_RAW_TX_FEE_RATE).
+        let max_fee_rate_btc_kvb = Self::parse_maxfeerate_btc_kvb(maxfeerate.as_ref())?;
+
+        // Convert BTC/kvB to sat/vB: BTC/kvB * COIN / 1000
+        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
 
         let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
 
@@ -14856,31 +14856,11 @@ impl RustoshiRpcServer for RpcServerImpl {
 
         // Core's RPCHelpMan type gate (-3), not jsonrpsee's -32602.
         Self::core_type_gate(&[("rawtxs", Some(&rawtxs), CoreArgType::Arr, false)])?;
-        let rawtxs: Vec<String> = rawtxs
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|v| {
-                v.as_str().map(str::to_owned).ok_or_else(|| {
-                    Self::rpc_error(
-                        rpc_error::RPC_MISC_ERROR,
-                        format!(
-                            "JSON value of type {} is not of expected type string",
-                            Self::json_uvtype(v)
-                        ),
-                    )
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let rawtxs = rawtxs.as_array().map(Vec::as_slice).unwrap_or_default();
 
-        // Default maxfeerate: 0.10 BTC/kvB. 0 disables the post-ATMP cap.
-        // Core applies it as `fee > maxfeerate.GetFee(vsize)` after a VALID
-        // result and reports `reject-reason` `max-fee-exceeded` (no details).
-        let max_fee_rate_btc_kvb = Self::parse_maxfeerate_btc_kvb(maxfeerate.as_ref())?;
-        let max_sat_kvb = (max_fee_rate_btc_kvb * COIN as f64).round() as u64;
-
-        // Core testmempoolaccept: the array length is an RPC -8, before decode
-        // and before any per-tx result. It is not `package-too-many-transactions`.
+        // Core's order: array length (-8), then ParseFeeRate(maxfeerate),
+        // then per-element get_str() and DecodeHexTx. The length error is not
+        // `package-too-many-transactions`.
         if rawtxs.is_empty() || rawtxs.len() > MAX_PACKAGE_COUNT {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_PARAMETER,
@@ -14888,10 +14868,29 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
+        // Default maxfeerate: 0.10 BTC/kvB. 0 disables the post-ATMP cap.
+        // Core applies it as `fee > maxfeerate.GetFee(vsize)` after a VALID
+        // result and reports `reject-reason` `max-fee-exceeded` (no details).
+        let max_fee_rate_btc_kvb = Self::parse_maxfeerate_btc_kvb(maxfeerate.as_ref())?;
+        let max_sat_kvb = (max_fee_rate_btc_kvb * COIN as f64).round() as u64;
+
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
         for raw in rawtxs.iter() {
+            // A non-string element is UniValue::type_error from get_str(),
+            // which rpc/server.cpp reports as RPC_TYPE_ERROR (-3). Core reads
+            // and decodes each element in turn, so an earlier undecodable
+            // element wins. The array type gate does not look inside.
+            let raw = raw.as_str().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(raw)
+                    ),
+                )
+            })?;
             Self::parse_hex(raw)?;
             let tx = Self::core_decode_hex_tx(raw).ok_or_else(|| {
                 Self::rpc_error(
