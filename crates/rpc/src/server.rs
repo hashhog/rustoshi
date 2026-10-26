@@ -9475,9 +9475,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
 
         // Parse the transaction
-        let tx_bytes = Self::parse_hex(&hex)?;
-
-        let tx = Transaction::deserialize(&tx_bytes).map_err(|_| {
+        // Core DecodeHexTx: non-hex and undecodable bytes are the same -22.
+        let tx = Self::core_decode_hex_tx(&hex).ok_or_else(|| {
             Self::rpc_error(
                 rpc_error::RPC_DESERIALIZATION_ERROR,
                 "TX decode failed. Make sure the tx has at least one input.",
@@ -14803,12 +14802,13 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
-        for (i, raw) in rawtxs.iter().enumerate() {
-            let bytes = Self::parse_hex(raw)?;
-            let tx = Transaction::deserialize(&bytes).map_err(|e| {
+        for raw in rawtxs.iter() {
+            // Core rpc/mempool.cpp: non-hex and undecodable bytes are both -22
+            // with the raw string echoed back.
+            let tx = Self::core_decode_hex_tx(raw).ok_or_else(|| {
                 Self::rpc_error(
                     rpc_error::RPC_DESERIALIZATION_ERROR,
-                    format!("TX decode failed (tx {}): {}", i, e),
+                    format!("TX decode failed: {} Make sure the tx has at least one input.", raw),
                 )
             })?;
             txs.push(tx);
