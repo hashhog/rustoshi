@@ -14854,12 +14854,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
-        for (i, raw) in rawtxs.iter().enumerate() {
+        for raw in rawtxs.iter() {
             Self::parse_hex(raw)?;
             let tx = Self::core_decode_hex_tx(raw).ok_or_else(|| {
                 Self::rpc_error(
                     rpc_error::RPC_DESERIALIZATION_ERROR,
-                    format!("TX decode failed (tx {}): input not a single whole transaction", i),
+                    format!("TX decode failed: {} Make sure the tx has at least one input.", raw),
                 )
             })?;
             txs.push(tx);
