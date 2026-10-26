@@ -11685,8 +11685,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                     PeerInfoRpc {
                         id: snap.peer_id.0,
                         addr: info.addr.to_string(),
-                        addrbind: None,
-                        addrlocal: None,
+                        // Core ToStringAddrPort(): "ip:port", "[v6]:port".
+                        addrbind: info.addr_bind.map(|a| a.to_string()),
+                        addrlocal: info.addr_local.map(|a| a.to_string()),
                         network: peer_network_str(&info.addr),
                         services: format!("{:016x}", info.services),
                         servicesnames: decode_services(info.services),

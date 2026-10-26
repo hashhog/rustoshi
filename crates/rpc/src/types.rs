@@ -895,9 +895,13 @@ pub struct PeerInfoRpc {
     pub id: u64,
     /// Peer address.
     pub addr: String,
-    /// Bound local address.
+    /// Bound local address. Omitted when unknown (Core rpc/net.cpp only
+    /// pushes it when `addrBind.IsValid()`), never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addrbind: Option<String>,
-    /// Local address as seen by peer.
+    /// Local address as seen by peer. Omitted when the peer's VERSION
+    /// addrMe was empty (Core rpc/net.cpp), never null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addrlocal: Option<String>,
     /// Network type (ipv4, ipv6, onion).
     pub network: String,
@@ -1802,6 +1806,10 @@ mod tests {
         let json = serde_json::to_string(&peer).unwrap();
         assert!(json.contains("\"id\":1"));
         assert!(json.contains("\"version\":70016"));
+        // Core rpc/net.cpp omits addrbind/addrlocal when unknown; never null.
+        let v = serde_json::to_value(&peer).unwrap();
+        assert_eq!(v["addrbind"], "0.0.0.0:8333");
+        assert!(v.get("addrlocal").is_none(), "addrlocal must be omitted, not null: {v}");
     }
 
     #[test]
