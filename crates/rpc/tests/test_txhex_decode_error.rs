@@ -57,7 +57,7 @@ async fn sendrawtransaction_bad_hex_is_22_with_core_message() {
 async fn testmempoolaccept_bad_hex_is_22_with_core_message() {
     let srv = server();
     for raw in bad_inputs() {
-        let err = srv.test_mempool_accept(vec![raw.clone()], None).await.expect_err("must fail");
+        let err = srv.test_mempool_accept(serde_json::json!([raw.clone()]), None).await.expect_err("must fail");
         assert_eq!(err.code(), RPC_DESERIALIZATION_ERROR, "input {raw:?}: {}", err.message());
         assert_eq!(
             err.message(),
@@ -73,7 +73,7 @@ async fn valid_tx_hex_passes_the_decode_gate() {
     if let Err(e) = srv.send_raw_transaction(tx_hex(), None, None).await {
         assert_ne!(e.code(), RPC_DESERIALIZATION_ERROR, "message: {}", e.message());
     }
-    if let Err(e) = srv.test_mempool_accept(vec![tx_hex()], None).await {
+    if let Err(e) = srv.test_mempool_accept(serde_json::json!([tx_hex()]), None).await {
         assert_ne!(e.code(), RPC_DESERIALIZATION_ERROR, "message: {}", e.message());
     }
 }
