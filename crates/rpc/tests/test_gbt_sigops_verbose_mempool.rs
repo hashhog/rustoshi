@@ -775,7 +775,7 @@ async fn verbose_sendrawtransaction_stays_unbroadcast_without_peers() {
     );
     let hex_tx = hex::encode(local.serialize());
     let txid = rpc
-        .send_raw_transaction(hex_tx, Some(0.0), None)
+        .send_raw_transaction(hex_tx, Some(serde_json::json!(0.0)), None)
         .await
         .expect("sendrawtransaction");
     state.write().await.best_height = 55;
