@@ -9513,8 +9513,7 @@ impl RustoshiRpcServer for RpcServerImpl {
         let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
 
         // Parse the transaction
-        Self::parse_hex(&hex)?;
-
+        // Core DecodeHexTx: non-hex and undecodable bytes are the same -22.
         let tx = Self::core_decode_hex_tx(&hex).ok_or_else(|| {
             Self::rpc_error(
                 rpc_error::RPC_DESERIALIZATION_ERROR,
@@ -14856,7 +14855,8 @@ impl RustoshiRpcServer for RpcServerImpl {
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
         for raw in rawtxs.iter() {
-            Self::parse_hex(raw)?;
+            // Core rpc/mempool.cpp: non-hex and undecodable bytes are both -22
+            // with the raw string echoed back.
             let tx = Self::core_decode_hex_tx(raw).ok_or_else(|| {
                 Self::rpc_error(
                     rpc_error::RPC_DESERIALIZATION_ERROR,
