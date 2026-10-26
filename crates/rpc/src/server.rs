@@ -1178,7 +1178,11 @@ pub trait RustoshiRpc {
 
     /// Decode a raw transaction without broadcasting.
     #[method(name = "decoderawtransaction")]
-    async fn decode_raw_transaction(&self, hexstring: serde_json::Value) -> RpcResult<Box<serde_json::value::RawValue>>;
+    async fn decode_raw_transaction(
+        &self,
+        hexstring: serde_json::Value,
+        iswitness: Option<serde_json::Value>,
+    ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Combine multiple partially-signed versions of the SAME transaction into
     /// one carrying the union of their signature data.
@@ -3785,11 +3789,45 @@ impl RpcServerImpl {
     /// caller turns that into `RPC_DESERIALIZATION_ERROR` (-22). Returns `None`
     /// on either failure; the caller supplies Core's per-method message.
     fn core_decode_hex_tx(s: &str) -> Option<Transaction> {
+        Self::core_decode_hex_tx_with(s, false, true)
+    }
+
+    /// Core's `DecodeHexTx(tx, hex, try_no_witness, try_witness)` (core_io.cpp
+    /// `DecodeTx`): a decode only counts when it CONSUMES THE WHOLE INPUT
+    /// (`ssData.empty()`), so trailing bytes are a decode failure. The
+    /// extended (witness-aware) parse is tried first when `try_witness`, then
+    /// the legacy parse when `try_no_witness`. Core additionally prefers
+    /// whichever passes CheckTxScriptsSanity when BOTH succeed; here the
+    /// extended result wins, which differs only for a hex that parses both ways.
+    /// sendrawtransaction / testmempoolaccept / submitpackage use
+    /// `(false, true)`; decoderawtransaction derives the pair from `iswitness`.
+    fn core_decode_hex_tx_with(
+        s: &str,
+        try_no_witness: bool,
+        try_witness: bool,
+    ) -> Option<Transaction> {
+        use rustoshi_primitives::Decodable;
         if !Self::core_is_hex(s) {
             return None;
         }
         let bytes = hex::decode(s).ok()?;
-        Transaction::deserialize(&bytes).ok()
+        if try_witness {
+            let mut cur = std::io::Cursor::new(&bytes[..]);
+            if let Ok(tx) = Transaction::decode(&mut cur) {
+                if cur.position() as usize == bytes.len() {
+                    return Some(tx);
+                }
+            }
+        }
+        if try_no_witness {
+            let mut cur = std::io::Cursor::new(&bytes[..]);
+            if let Ok(tx) = Transaction::decode_no_witness(&mut cur) {
+                if cur.position() as usize == bytes.len() {
+                    return Some(tx);
+                }
+            }
+        }
+        None
     }
 
     /// Core's `AmountFromValue` (rpc/util.cpp): the value must be a JSON number
@@ -9492,9 +9530,9 @@ impl RustoshiRpcServer for RpcServerImpl {
         let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
 
         // Parse the transaction
-        let tx_bytes = Self::parse_hex(&hex)?;
+        Self::parse_hex(&hex)?;
 
-        let tx = Transaction::deserialize(&tx_bytes).map_err(|_| {
+        let tx = Self::core_decode_hex_tx(&hex).ok_or_else(|| {
             Self::rpc_error(
                 rpc_error::RPC_DESERIALIZATION_ERROR,
                 "TX decode failed. Make sure the tx has at least one input.",
@@ -9708,16 +9746,29 @@ impl RustoshiRpcServer for RpcServerImpl {
         }
     }
 
-    async fn decode_raw_transaction(&self, hexstring: serde_json::Value) -> RpcResult<Box<serde_json::value::RawValue>> {
+    async fn decode_raw_transaction(
+        &self,
+        hexstring: serde_json::Value,
+        iswitness: Option<serde_json::Value>,
+    ) -> RpcResult<Box<serde_json::value::RawValue>> {
         // Core rawtransaction.cpp decoderawtransaction: the RPCHelpMan gate
         // (-3 on a non-string), then `if (!DecodeHexTx(...)) throw
         // JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed")`. A
         // non-hex string and undecodable bytes are the SAME failure there --
         // DecodeHexTx returns false for both -- so both are -22, not the
         // transport code -32602 the shared parse_hex used to answer.
-        Self::core_type_gate(&[("hexstring", Some(&hexstring), CoreArgType::Str, false)])?;
+        Self::core_type_gate(&[
+            ("hexstring", Some(&hexstring), CoreArgType::Str, false),
+            ("iswitness", iswitness.as_ref(), CoreArgType::Bool, true),
+        ])?;
         let hex = hexstring.as_str().unwrap_or_default();
-        let tx = Self::core_decode_hex_tx(hex).ok_or_else(|| {
+        // Core: `try_witness = params[1].isNull() ? true : iswitness;
+        // try_no_witness = params[1].isNull() ? true : !iswitness`.
+        let (try_no_witness, try_witness) = match iswitness.as_ref().and_then(|v| v.as_bool()) {
+            Some(b) => (!b, b),
+            None => (true, true),
+        };
+        let tx = Self::core_decode_hex_tx_with(hex, try_no_witness, try_witness).ok_or_else(|| {
             Self::rpc_error(rpc_error::RPC_DESERIALIZATION_ERROR, "TX decode failed")
         })?;
 
@@ -11702,8 +11753,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                     PeerInfoRpc {
                         id: snap.peer_id.0,
                         addr: info.addr.to_string(),
-                        addrbind: None,
-                        addrlocal: None,
+                        // Core ToStringAddrPort(): "ip:port", "[v6]:port".
+                        addrbind: info.addr_bind.map(|a| a.to_string()),
+                        addrlocal: info.addr_local.map(|a| a.to_string()),
                         network: peer_network_str(&info.addr),
                         services: format!("{:016x}", info.services),
                         servicesnames: decode_services(info.services),
@@ -14839,12 +14891,12 @@ impl RustoshiRpcServer for RpcServerImpl {
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
-        for (i, raw) in rawtxs.iter().enumerate() {
-            let bytes = Self::parse_hex(raw)?;
-            let tx = Transaction::deserialize(&bytes).map_err(|e| {
+        for raw in rawtxs.iter() {
+            Self::parse_hex(raw)?;
+            let tx = Self::core_decode_hex_tx(raw).ok_or_else(|| {
                 Self::rpc_error(
                     rpc_error::RPC_DESERIALIZATION_ERROR,
-                    format!("TX decode failed (tx {}): {}", i, e),
+                    format!("TX decode failed: {} Make sure the tx has at least one input.", raw),
                 )
             })?;
             txs.push(tx);
