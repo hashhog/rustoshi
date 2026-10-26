@@ -315,6 +315,9 @@ pub struct PeerInfo {
     /// per-peer advertised-address choice (see `localaddr.rs`). `None`
     /// before the handshake.
     pub addr_local: Option<SocketAddr>,
+    /// Our local socket address for this connection (Core
+    /// `CNode::addrBind`, reported as `addrbind` by getpeerinfo).
+    pub addr_bind: Option<SocketAddr>,
 }
 
 /// Unique identifier for a peer connection.
@@ -1006,6 +1009,8 @@ async fn run_v1_outbound_flow(
         feefilter: 0,
         // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
         addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
+        // Our own end of the TCP connection (Core CNode::addrBind).
+        addr_bind: reader.get_ref().local_addr().ok(),
     };
 
     stats.mark_connected();
@@ -1230,6 +1235,8 @@ pub async fn run_outbound_peer(
         feefilter: 0,
         // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
         addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
+        // Our own end of the TCP connection (Core CNode::addrBind).
+        addr_bind: reader.get_ref().local_addr().ok(),
     };
 
     // Stamp connection-established time before publishing the event so
@@ -1945,6 +1952,8 @@ async fn run_outbound_v2_peer(
         feefilter: 0,
         // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
         addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
+        // Our own end of the TCP connection (Core CNode::addrBind).
+        addr_bind: reader.get_ref().local_addr().ok(),
     };
 
     stats.mark_connected();
@@ -3278,6 +3287,7 @@ mod tests {
             supports_addrv2: false,
             feefilter: 0,
             addr_local: None,
+            addr_bind: None,
         };
 
         assert_eq!(info.version, 70016);
@@ -3528,6 +3538,7 @@ mod tests {
             supports_addrv2: false,
             feefilter: 0,
             addr_local: None,
+            addr_bind: None,
         };
 
         let events = [

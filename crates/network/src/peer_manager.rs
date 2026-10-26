@@ -3998,6 +3998,7 @@ impl PeerManager {
                     supports_addrv2: false,
                     feefilter: 0,
                     addr_local: None,
+                    addr_bind: None,
                 },
                 command_tx: cmd_tx,
                 conn_type,
@@ -4119,6 +4120,7 @@ impl PeerManager {
                     supports_addrv2: false,
                     feefilter: 0,
                     addr_local: None,
+                    addr_bind: None,
                 },
                 command_tx: cmd_tx,
                 conn_type,
@@ -5624,6 +5626,7 @@ impl PeerManager {
                     supports_addrv2: false,
                     feefilter: 0,
                     addr_local: None,
+                    addr_bind: None,
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::FullRelay,
@@ -5688,6 +5691,7 @@ impl PeerManager {
                     supports_addrv2: false,
                     feefilter: 0,
                     addr_local: None,
+                    addr_bind: None,
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::Inbound,
@@ -5747,6 +5751,7 @@ impl PeerManager {
                     supports_addrv2: false,
                     feefilter: 0,
                     addr_local: None,
+                    addr_bind: None,
                 },
                 command_tx: cmd_tx,
                 conn_type: ConnectionType::FullRelay,
@@ -5800,6 +5805,7 @@ impl PeerManager {
             supports_addrv2: false,
             feefilter: 0,
             addr_local: None,
+            addr_bind: None,
         };
         self.peers.insert(
             peer_id,
@@ -5860,6 +5866,7 @@ impl PeerManager {
                     supports_addrv2: false,
                     feefilter: 0,
                     addr_local: None,
+                    addr_bind: None,
                 },
                 command_tx: cmd_tx,
                 conn_type,
@@ -6395,6 +6402,8 @@ pub async fn run_inbound_peer(
         feefilter: 0,
         // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
         addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
+        // Our own end of the TCP connection (Core CNode::addrBind).
+        addr_bind: reader.get_ref().local_addr().ok(),
     };
 
     // Per-peer atomic counters; populated for the entire post-handshake
@@ -6798,6 +6807,8 @@ async fn run_inbound_v2_peer(
         feefilter: 0,
         // VERSION addr_recv: how the peer sees us (Core CNode::m_addr_local).
         addr_local: crate::peer_manager::net_address_to_socket_addr(&their_version.addr_recv),
+        // Our own end of the TCP connection (Core CNode::addrBind).
+        addr_bind: reader.get_ref().local_addr().ok(),
     };
 
     let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
@@ -9146,6 +9157,7 @@ mod tests {
             supports_addrv2: false,
             feefilter: 0,
             addr_local: None,
+            addr_bind: None,
         };
         let stats = std::sync::Arc::new(crate::peer::PeerStats::new());
         mgr.handle_event(PeerEvent::Connected(peer_id, info, stats))
@@ -9464,6 +9476,7 @@ mod tests {
                 inbound,
                 state: PeerState::Established,
                 last_send: Instant::now(),
+                addr_bind: None,
                 last_recv: Instant::now(),
                 ping_nonce: None,
                 ping_time: None,
