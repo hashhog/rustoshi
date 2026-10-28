@@ -17558,11 +17558,12 @@ impl RustoshiRpcServer for RpcServerImpl {
             let script = Self::scanobject_to_script(obj, &state.params)?;
             needles.push((script, obj.clone()));
         }
+        let params = state.params.clone();
         let db = Arc::clone(&state.db);
         let fallback = (state.best_hash, state.best_height);
         drop(state);
 
-        tokio::task::spawn_blocking(move || Self::scantxoutset_walk(&db, &needles, fallback))
+        tokio::task::spawn_blocking(move || Self::scantxoutset_walk(&db, &needles, &params, fallback))
             .await
             .map_err(|e| {
                 Self::rpc_error(rpc_error::RPC_INTERNAL_ERROR, format!("scantxoutset walk: {e}"))
@@ -19316,6 +19317,7 @@ impl RpcServerImpl {
     fn scantxoutset_walk(
         db: &ChainDb,
         needles: &[(Vec<u8>, String)],
+        params: &ChainParams,
         fallback: (Hash256, u32),
     ) -> RpcResult<serde_json::Value> {
         crate::test_hooks::txoutset_walk_sleep("scantxoutset");
@@ -19346,13 +19348,18 @@ impl RpcServerImpl {
             // Match the output script against every needle. Core dedups
             // scripts in a std::set; here we just stop at the first match
             // (an output script matches at most one descriptor's bytes
-            // anyway, and the descriptor string echoed is that needle's).
+            // anyway).
             let matched = needles
                 .iter()
                 .find(|(spk, _)| spk.as_slice() == coin.script_pubkey.as_slice());
-            let Some((_, desc)) = matched else {
+            if matched.is_none() {
                 continue;
-            };
+            }
+            // Core reports InferDescriptor(output script), not the scan
+            // object that matched (blockchain.cpp scantxoutset
+            // `unspent.pushKV("desc", descriptors[txo_script])` is the
+            // inferred descriptor of the coin's own script).
+            let desc = infer_descriptor(&coin.script_pubkey, params);
 
             let mut txid_bytes = [0u8; 32];
             txid_bytes.copy_from_slice(&key[..32]);
