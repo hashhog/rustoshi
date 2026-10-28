@@ -861,7 +861,7 @@ async fn submitheader_of_failed_parent_is_bad_prevblk_and_not_stored() {
     );
 
     let missing = server
-        .get_block_header(child.block_hash().to_hex(), Some(true))
+        .get_block_header(child.block_hash().to_hex(), Some(serde_json::json!(true)))
         .await;
     assert!(missing.is_err(), "failed-parent header must not be stored: {missing:?}");
     let tips = server.get_chain_tips().await.unwrap();

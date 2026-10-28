@@ -293,7 +293,7 @@ async fn f0_gettxout_sees_unflushed_spend() {
 async fn f0_testmempoolaccept_rejects_tx_spending_unflushed_spend() {
     let (c, h102, stop, handle) = unflushed_window().await;
     let (d, _x) = double_spend(&c, h102);
-    let r = c.server.test_mempool_accept(vec![hex_of(&d)], None).await;
+    let r = c.server.test_mempool_accept(serde_json::json!([hex_of(&d)]), None).await;
     finish(stop, handle);
     let r: serde_json::Value = serde_json::from_str(r.expect("testmempoolaccept answered").get()).unwrap();
     assert_eq!(
@@ -335,7 +335,7 @@ async fn f0_control_flushed_window_answers_like_core() {
     assert!(BlockStore::new(&c.db).get_utxo(&c.u).unwrap().is_none(), "flushed: U gone from disk");
     let (d, x103) = double_spend(&c, h102);
     let g = c.server.get_tx_out(c.u.txid.to_hex(), serde_json::json!(0), Some(false)).await;
-    let t = c.server.test_mempool_accept(vec![hex_of(&d)], None).await;
+    let t = c.server.test_mempool_accept(serde_json::json!([hex_of(&d)]), None).await;
     let s = c.server.submit_block(hex_of(&x103)).await;
     finish(stop, handle);
     assert!(g.expect("gettxout").is_none());

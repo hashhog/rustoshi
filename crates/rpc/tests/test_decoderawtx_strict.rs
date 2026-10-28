@@ -113,7 +113,7 @@ async fn testmempoolaccept_trailing_byte_is_22() {
     let srv = server();
     for h in [segwit_tx_hex(), legacy_tx_hex()] {
         let err = srv
-            .test_mempool_accept(vec![format!("{h}00")], None)
+            .test_mempool_accept(serde_json::json!([format!("{h}00")]), None)
             .await
             .expect_err("trailing byte must fail");
         assert_decode_failed(err);
@@ -128,7 +128,7 @@ async fn whole_tx_passes_the_decode_gate_in_send_and_testmempoolaccept() {
     if let Err(e) = srv.send_raw_transaction(segwit_tx_hex(), None, None).await {
         assert_ne!(e.code(), RPC_DESERIALIZATION_ERROR, "message: {}", e.message());
     }
-    if let Err(e) = srv.test_mempool_accept(vec![segwit_tx_hex()], None).await {
+    if let Err(e) = srv.test_mempool_accept(serde_json::json!([segwit_tx_hex()]), None).await {
         assert_ne!(e.code(), RPC_DESERIALIZATION_ERROR, "message: {}", e.message());
     }
 }

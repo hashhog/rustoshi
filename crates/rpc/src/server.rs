@@ -1024,7 +1024,7 @@ pub trait RustoshiRpc {
     async fn get_block_header(
         &self,
         hash: String,
-        verbose: Option<bool>,
+        verbose: Option<serde_json::Value>,
     ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Get the current block count (height of the best chain).
@@ -1172,7 +1172,7 @@ pub trait RustoshiRpc {
     async fn send_raw_transaction(
         &self,
         hex: String,
-        maxfeerate: Option<f64>,
+        maxfeerate: Option<serde_json::Value>,
         maxburnamount: Option<f64>,
     ) -> RpcResult<String>;
 
@@ -1850,8 +1850,8 @@ pub trait RustoshiRpc {
     #[method(name = "testmempoolaccept")]
     async fn test_mempool_accept(
         &self,
-        rawtxs: Vec<String>,
-        maxfeerate: Option<f64>,
+        rawtxs: serde_json::Value,
+        maxfeerate: Option<serde_json::Value>,
     ) -> RpcResult<Box<serde_json::value::RawValue>>;
 
     /// Create a raw transaction from inputs and outputs.
@@ -3853,6 +3853,25 @@ impl RpcServerImpl {
             return Err(Self::rpc_error(rpc_error::RPC_TYPE_ERROR, "Amount out of range"));
         }
         Ok(amount as u64)
+    }
+
+    /// `maxfeerate` (BTC/kvB) for sendrawtransaction / testmempoolaccept.
+    /// Core declares it `RPCArg::Type::AMOUNT` (no type gate) and reads it
+    /// with `ParseFeeRate` -> `AmountFromValue`, so a non-numeric value is
+    /// -3 "Invalid amount". A parsed rate >= 1 BTC/kvB is -8 (Core rejects
+    /// exactly 1 too). Omitted / null -> the 0.10 BTC/kvB default.
+    fn parse_maxfeerate_btc_kvb(v: Option<&serde_json::Value>) -> Result<f64, ErrorObjectOwned> {
+        let sat_kvb = match v {
+            None | Some(serde_json::Value::Null) => COIN / 10,
+            Some(v) => Self::core_amount_from_value(v)?,
+        };
+        if sat_kvb >= COIN {
+            return Err(Self::rpc_error(
+                rpc_error::RPC_INVALID_PARAMETER,
+                "Fee rates larger than or equal to 1BTC/kvB are not accepted",
+            ));
+        }
+        Ok(sat_kvb as f64 / COIN as f64)
     }
 
     /// Core rpc/util.cpp ParseRange + ParseDescriptorRange: a number N means
@@ -7930,10 +7949,16 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn get_block_header(
         &self,
         hash: String,
-        verbose: Option<bool>,
+        verbose: Option<serde_json::Value>,
     ) -> RpcResult<Box<serde_json::value::RawValue>> {
+        // Core's RPCHelpMan type gate (-3), not jsonrpsee's -32602.
+        let hash_v = serde_json::Value::String(hash.clone());
+        Self::core_type_gate(&[
+            ("blockhash", Some(&hash_v), CoreArgType::Str, false),
+            ("verbose", verbose.as_ref(), CoreArgType::Bool, true),
+        ])?;
         let block_hash = Self::parse_hash(&hash)?;
-        let verbose = verbose.unwrap_or(true);
+        let verbose = verbose.and_then(|v| v.as_bool()).unwrap_or(true);
 
         // Collect everything we need while holding the read-lock.
         struct HeaderSnapshot {
@@ -9490,24 +9515,9 @@ impl RustoshiRpcServer for RpcServerImpl {
     async fn send_raw_transaction(
         &self,
         hex: String,
-        maxfeerate: Option<f64>,
+        maxfeerate: Option<serde_json::Value>,
         maxburnamount: Option<f64>,
     ) -> RpcResult<String> {
-        // Default maxfeerate: 0.10 BTC/kvB (10,000,000 sat/kvB)
-        // Bitcoin Core uses DEFAULT_MAX_RAW_TX_FEE_RATE = 0.10 BTC/kvB
-        let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
-
-        // Reject fee rates > 1 BTC/kvB as clearly erroneous
-        if max_fee_rate_btc_kvb > 1.0 {
-            return Err(Self::rpc_error(
-                rpc_error::RPC_INVALID_PARAMS,
-                "maxfeerate cannot exceed 1 BTC/kvB",
-            ));
-        }
-
-        // Convert BTC/kvB to sat/vB: BTC/kvB * COIN / 1000
-        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
-
         // Default maxburnamount: 0 BTC
         let max_burn_btc = maxburnamount.unwrap_or(0.0);
         let max_burn_sats = (max_burn_btc * COIN as f64) as u64;
@@ -9539,6 +9549,13 @@ impl RustoshiRpcServer for RpcServerImpl {
                 ));
             }
         }
+
+        // Core parses maxfeerate (ParseFeeRate) only after the decode and the
+        // burn check. Default 0.10 BTC/kvB (DEFAULT_MAX_RAW_TX_FEE_RATE).
+        let max_fee_rate_btc_kvb = Self::parse_maxfeerate_btc_kvb(maxfeerate.as_ref())?;
+
+        // Convert BTC/kvB to sat/vB: BTC/kvB * COIN / 1000
+        let max_fee_rate_sat_vb = max_fee_rate_btc_kvb * (COIN as f64) / 1000.0;
 
         let mut state = crate::coins_coherence::write_coherent(&self.state).await.map_err(Self::coins_incoherent_error)?;
 
@@ -14831,19 +14848,18 @@ impl RustoshiRpcServer for RpcServerImpl {
 
     async fn test_mempool_accept(
         &self,
-        rawtxs: Vec<String>,
-        maxfeerate: Option<f64>,
+        rawtxs: serde_json::Value,
+        maxfeerate: Option<serde_json::Value>,
     ) -> RpcResult<Box<serde_json::value::RawValue>> {
         use rustoshi_consensus::mempool::{AtmpOptions, MAX_PACKAGE_COUNT};
 
-        // Default maxfeerate: 0.10 BTC/kvB. 0 disables the post-ATMP cap.
-        // Core applies it as `fee > maxfeerate.GetFee(vsize)` after a VALID
-        // result and reports `reject-reason` `max-fee-exceeded` (no details).
-        let max_fee_rate_btc_kvb = maxfeerate.unwrap_or(0.10);
-        let max_sat_kvb = (max_fee_rate_btc_kvb * COIN as f64).round() as u64;
+        // Core's RPCHelpMan type gate (-3), not jsonrpsee's -32602.
+        Self::core_type_gate(&[("rawtxs", Some(&rawtxs), CoreArgType::Arr, false)])?;
+        let rawtxs = rawtxs.as_array().map(Vec::as_slice).unwrap_or_default();
 
-        // Core testmempoolaccept: the array length is an RPC -8, before decode
-        // and before any per-tx result. It is not `package-too-many-transactions`.
+        // Core's order: array length (-8), then ParseFeeRate(maxfeerate),
+        // then per-element get_str() and DecodeHexTx. The length error is not
+        // `package-too-many-transactions`.
         if rawtxs.is_empty() || rawtxs.len() > MAX_PACKAGE_COUNT {
             return Err(Self::rpc_error(
                 rpc_error::RPC_INVALID_PARAMETER,
@@ -14851,10 +14867,29 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
+        // Default maxfeerate: 0.10 BTC/kvB. 0 disables the post-ATMP cap.
+        // Core applies it as `fee > maxfeerate.GetFee(vsize)` after a VALID
+        // result and reports `reject-reason` `max-fee-exceeded` (no details).
+        let max_fee_rate_btc_kvb = Self::parse_maxfeerate_btc_kvb(maxfeerate.as_ref())?;
+        let max_sat_kvb = (max_fee_rate_btc_kvb * COIN as f64).round() as u64;
+
         // Decode all transactions up front so we fail fast on malformed hex
         // before acquiring any lock.
         let mut txs: Vec<Transaction> = Vec::with_capacity(rawtxs.len());
         for raw in rawtxs.iter() {
+            // A non-string element is UniValue::type_error from get_str(),
+            // which rpc/server.cpp reports as RPC_TYPE_ERROR (-3). Core reads
+            // and decodes each element in turn, so an earlier undecodable
+            // element wins. The array type gate does not look inside.
+            let raw = raw.as_str().ok_or_else(|| {
+                Self::rpc_error(
+                    rpc_error::RPC_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        Self::json_uvtype(raw)
+                    ),
+                )
+            })?;
             // Core rpc/mempool.cpp: non-hex and undecodable bytes are both -22
             // with the raw string echoed back.
             let tx = Self::core_decode_hex_tx(raw).ok_or_else(|| {
@@ -28393,7 +28428,7 @@ mod tests {
         assert_eq!(h1, blocks[1].header.block_hash().to_hex());
 
         let hdr = rpc
-            .get_block_header(h1.clone(), Some(true))
+            .get_block_header(h1.clone(), Some(serde_json::json!(true)))
             .await
             .expect("getblockheader after backfill");
         let v: serde_json::Value = serde_json::from_str(hdr.get()).unwrap();
