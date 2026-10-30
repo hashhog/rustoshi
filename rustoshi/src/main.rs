@@ -839,6 +839,30 @@ fn header_chain_height_of(
     (floor..=max_height).rev().find(|&h| on_chain_at(h))
 }
 
+/// How recent our best header must be for every new peer to get an initial
+/// getheaders, not only the one sync peer (Core net_processing.cpp
+/// SendMessages: `m_best_header->Time() > NodeClock::now() - 24h`).
+const INITIAL_GETHEADERS_EVERY_PEER_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+/// Whether a newly connected peer gets its own initial getheaders.
+///
+/// Core starts header sync with a single peer only while it is far behind;
+/// once its best header is within 24h of now it sends the initial getheaders
+/// to every peer that can serve blocks (`CanServeBlocks`: NODE_NETWORK or
+/// NODE_NETWORK_LIMITED). rustoshi only ever asked the one `start_sync` peer,
+/// so a block found while it was down reached it only from that peer. On
+/// mainnet 2026-10-30 that peer answered every locator with a stale batch
+/// forking at 957448; 973840 had been mined during the restart, so no peer
+/// announced it, and rustoshi sat at blocks = headers = 973839 with 18 peers
+/// until the next block was announced.
+fn initial_getheaders_to_peer(best_header_time: Option<u32>, now: u64, services: u64) -> bool {
+    let serves_blocks =
+        services & (rustoshi_network::NODE_NETWORK | rustoshi_network::NODE_NETWORK_LIMITED) != 0;
+    serves_blocks
+        && best_header_time
+            .is_some_and(|t| u64::from(t) + INITIAL_GETHEADERS_EVERY_PEER_WINDOW_SECS > now)
+}
+
 /// Store a header that passed the header-validation gates (the last step of
 /// the `process_headers` closure).
 ///
@@ -6466,7 +6490,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         );
 
                         // Start header sync if we need to catch up
-                        match header_sync.start_sync(|h| {
+                        let sync_target = match header_sync.start_sync(|h| {
                             block_store.get_hash_by_height(h).ok().flatten()
                         }) {
                             Some((target_peer, msg)) => {
@@ -6476,11 +6500,44 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     let ok = pm.send_to_peer(target_peer, msg).await;
                                     tracing::info!("getheaders send result: {}", ok);
                                 }
+                                Some(target_peer)
                             }
                             None => {
                                 tracing::info!("No sync peer found (our height={}, peers={})",
                                     header_sync.best_header_height(),
                                     header_sync.peer_count());
+                                None
+                            }
+                        };
+                        // Near the tip, ask this peer too (Core's initial
+                        // getheaders goes to every block-serving peer once the
+                        // best header is under 24h old). A plain getheaders
+                        // from our header tip: it does not move the active
+                        // sync peer, and a reply that extends our tip is
+                        // processed as an unsolicited announcement.
+                        if sync_target != Some(peer_id) {
+                            let best_header_time = block_store
+                                .get_header(&header_sync.best_header_hash())
+                                .ok()
+                                .flatten()
+                                .map(|h| h.timestamp);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if initial_getheaders_to_peer(best_header_time, now, info.services) {
+                                let gh = NetworkMessage::GetHeaders(header_sync.make_getheaders(
+                                    |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                ));
+                                tracing::info!(
+                                    "Sending initial getheaders to peer {} (header tip {} is recent)",
+                                    peer_id.0,
+                                    header_sync.best_header_height()
+                                );
+                                let ps = peer_state.read().await;
+                                if let Some(ref pm) = ps.peer_manager {
+                                    pm.try_send_to_peer(peer_id, gh);
+                                }
                             }
                         }
                         if historical_backfill.is_some() {
@@ -11939,6 +11996,30 @@ mod tests {
         assert_eq!(header_chain_height_of(&store, &a3.block_hash(), 3), Some(3));
         let far = 3 + HEADER_CHAIN_FALLBACK_SCAN + 1;
         assert_eq!(header_chain_height_of(&store, &a3.block_hash(), far), None);
+    }
+
+    /// Mainnet 2026-10-30: within 24h of the tip every block-serving peer gets
+    /// an initial getheaders (Core SendMessages), so a block found while we
+    /// were down is learned from any honest peer, not only the sync peer.
+    #[test]
+    fn follow_tip_initial_getheaders_to_every_block_serving_peer_near_tip() {
+        use rustoshi_network::{NODE_NETWORK, NODE_NETWORK_LIMITED, NODE_WITNESS};
+        let now = 1_761_840_000u64;
+        let ask =
+            |time: Option<u32>, services: u64| initial_getheaders_to_peer(time, now, services);
+        let tip_time = Some((now - 600) as u32);
+        assert!(ask(tip_time, NODE_NETWORK | NODE_WITNESS));
+        assert!(ask(tip_time, NODE_NETWORK_LIMITED));
+        // Exactly 24h old is no longer "> now - 24h".
+        let day_old = (now - INITIAL_GETHEADERS_EVERY_PEER_WINDOW_SECS) as u32;
+        assert!(!ask(Some(day_old), NODE_NETWORK));
+        assert!(ask(Some(day_old + 1), NODE_NETWORK));
+        // Far behind (IBD): one sync peer only, as before.
+        assert!(!ask(Some(1_231_006_505), NODE_NETWORK));
+        // A peer that cannot serve blocks (e.g. a crawler with no service
+        // bits) is not asked; nor is anyone when our header is unreadable.
+        assert!(!ask(tip_time, NODE_WITNESS));
+        assert!(!ask(None, NODE_NETWORK));
     }
 
     /// The observed wedge (tools/p2p-invalid-block-feed.py `after`, live
