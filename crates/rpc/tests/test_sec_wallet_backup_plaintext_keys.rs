@@ -51,7 +51,11 @@ impl Fixture {
         rpc.create_wallet(Some(wallet.to_string()), None, None, None, None, None, None)
             .await
             .expect("createwallet");
-        Fixture { _dir: dir, datadir, rpc }
+        Fixture {
+            _dir: dir,
+            datadir,
+            rpc,
+        }
     }
 
     fn wallet_dir(&self, wallet: &str) -> PathBuf {
@@ -93,7 +97,9 @@ fn all_bytes(dir: &Path) -> Vec<u8> {
 }
 
 fn contains(haystack: &[u8], needle: &str) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle.as_bytes())
+    haystack
+        .windows(needle.len())
+        .any(|w| w == needle.as_bytes())
 }
 
 fn mode(p: &Path) -> u32 {
@@ -117,9 +123,18 @@ async fn backupwallet_refuses_existing_directory_and_keeps_its_files() {
         .expect_err("backupwallet into a non-backup directory must fail");
     assert_eq!(err.code(), RPC_WALLET_ERROR, "{err:?}");
 
-    assert_eq!(fs::read(dest.join("precious.txt")).unwrap(), b"do not delete");
-    assert_eq!(fs::read(dest.join("sub").join("nested.txt")).unwrap(), b"nested");
-    assert!(!dest.join("wallet.sqlite").exists(), "nothing may be written into it");
+    assert_eq!(
+        fs::read(dest.join("precious.txt")).unwrap(),
+        b"do not delete"
+    );
+    assert_eq!(
+        fs::read(dest.join("sub").join("nested.txt")).unwrap(),
+        b"nested"
+    );
+    assert!(
+        !dest.join("wallet.sqlite").exists(),
+        "nothing may be written into it"
+    );
 }
 
 #[tokio::test]
@@ -134,7 +149,10 @@ async fn backupwallet_refuses_existing_plain_file_and_keeps_it() {
         .await
         .expect_err("backupwallet onto a non-wallet file must fail");
     assert_eq!(err.code(), RPC_WALLET_ERROR, "{err:?}");
-    assert!(dest.is_file(), "the file must not be replaced by a directory");
+    assert!(
+        dest.is_file(),
+        "the file must not be replaced by a directory"
+    );
     assert_eq!(fs::read(&dest).unwrap(), b"my notes");
 }
 
@@ -162,7 +180,10 @@ async fn backupwallet_overwrites_an_earlier_backup_and_restores() {
     let dest = fx.datadir.join("w.bak");
     let d = dest.to_string_lossy().into_owned();
     fx.rpc.backup_wallet(d.clone()).await.expect("first backup");
-    fx.rpc.backup_wallet(d.clone()).await.expect("second backup over the first");
+    fx.rpc
+        .backup_wallet(d.clone())
+        .await
+        .expect("second backup over the first");
     assert!(dest.join("wallet.sqlite").is_file());
     assert!(dest.join("wallet_seed.bin").is_file());
 
@@ -188,19 +209,42 @@ async fn importdescriptors_wif_is_not_stored_in_wallet_db_even_after_encryptwall
         wdir.display()
     );
 
-    fx.rpc.encrypt_wallet("hunter2".into()).await.expect("encryptwallet");
+    fx.rpc
+        .encrypt_wallet("hunter2".into())
+        .await
+        .expect("encryptwallet");
     assert!(
         !contains(&all_bytes(&wdir), WIF),
         "the imported WIF is still on disk in plaintext after encryptwallet"
     );
 
     // The watch set must still survive a reload from the public form.
-    let listed = fx.rpc.list_descriptors(None).await.expect("listdescriptors");
-    let desc = listed["descriptors"][0]["desc"].as_str().unwrap().to_string();
-    assert!(desc.starts_with("wpkh(0"), "public form expected, got {desc}");
-    fx.rpc.unload_wallet(Some("w".into()), None).await.expect("unloadwallet");
-    fx.rpc.load_wallet("w".into(), None).await.expect("loadwallet");
-    let listed = fx.rpc.list_descriptors(None).await.expect("listdescriptors");
+    let listed = fx
+        .rpc
+        .list_descriptors(None)
+        .await
+        .expect("listdescriptors");
+    let desc = listed["descriptors"][0]["desc"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        desc.starts_with("wpkh(0"),
+        "public form expected, got {desc}"
+    );
+    fx.rpc
+        .unload_wallet(Some("w".into()), None)
+        .await
+        .expect("unloadwallet");
+    fx.rpc
+        .load_wallet("w".into(), None)
+        .await
+        .expect("loadwallet");
+    let listed = fx
+        .rpc
+        .list_descriptors(None)
+        .await
+        .expect("listdescriptors");
     assert_eq!(listed["descriptors"][0]["desc"].as_str().unwrap(), desc);
 }
 
@@ -223,7 +267,11 @@ async fn importdescriptors_xprv_is_not_stored_in_wallet_db() {
 async fn wallet_files_and_backups_are_owner_only() {
     let fx = Fixture::new("w").await;
     let wdir = fx.wallet_dir("w");
-    assert_eq!(mode(&wdir.join("wallet.sqlite")), 0o600, "wallet.sqlite mode");
+    assert_eq!(
+        mode(&wdir.join("wallet.sqlite")),
+        0o600,
+        "wallet.sqlite mode"
+    );
     assert_eq!(mode(&wdir), 0o700, "wallet directory mode");
 
     let dest = fx.datadir.join("w.bak");
@@ -232,6 +280,14 @@ async fn wallet_files_and_backups_are_owner_only() {
         .await
         .expect("backup");
     assert_eq!(mode(&dest), 0o700, "backup directory mode");
-    assert_eq!(mode(&dest.join("wallet.sqlite")), 0o600, "backup wallet.sqlite mode");
-    assert_eq!(mode(&dest.join("wallet_seed.bin")), 0o600, "backup seed mode");
+    assert_eq!(
+        mode(&dest.join("wallet.sqlite")),
+        0o600,
+        "backup wallet.sqlite mode"
+    );
+    assert_eq!(
+        mode(&dest.join("wallet_seed.bin")),
+        0o600,
+        "backup seed mode"
+    );
 }

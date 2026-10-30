@@ -34,9 +34,53 @@ const SEED_FILE_NAME: &str = "wallet_seed.bin";
 /// and BIP-39 64-byte seeds).
 const SEED_LEN: usize = 64;
 
-/// Recursively copy a wallet directory (sqlite + seed file).
+/// File names a wallet directory (and so a `backupwallet` copy) may hold.
+const WALLET_FILE_NAMES: &[&str] = &[
+    "wallet.sqlite",
+    "wallet.sqlite-journal",
+    "wallet.sqlite-wal",
+    "wallet.sqlite-shm",
+    SEED_FILE_NAME,
+];
+
+/// If `dest` is a directory (not a symlink) containing only regular files
+/// named in [`WALLET_FILE_NAMES`], i.e. an earlier `backupwallet`, return
+/// those files. Anything else (a plain file, a symlink, a subdirectory, a
+/// foreign file) is `None`: the caller must not touch it.
+fn earlier_backup_files(dest: &Path) -> Option<Vec<PathBuf>> {
+    if !fs::symlink_metadata(dest).ok()?.is_dir() {
+        return None;
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dest).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        if !entry.file_type().ok()?.is_file()
+            || !WALLET_FILE_NAMES.iter().any(|n| name.as_os_str() == *n)
+        {
+            return None;
+        }
+        files.push(entry.path());
+    }
+    Some(files)
+}
+
+/// Create `dir` (and parents) and restrict it to the owner on Unix, so wallet
+/// files inside are not reachable by other local users whatever the umask.
+fn create_private_dir(dir: &Path) -> Result<(), WalletError> {
+    fs::create_dir_all(dir).map_err(WalletError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(WalletError::Io)?;
+    }
+    Ok(())
+}
+
+/// Recursively copy a wallet directory (sqlite + seed file). `fs::copy`
+/// carries the 0600 mode of the source files over.
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), WalletError> {
-    fs::create_dir_all(dst).map_err(WalletError::Io)?;
+    create_private_dir(dst)?;
     for entry in fs::read_dir(src).map_err(WalletError::Io)? {
         let entry = entry.map_err(WalletError::Io)?;
         let ty = entry.file_type().map_err(WalletError::Io)?;
@@ -357,9 +401,8 @@ impl WalletManager {
 
         let mut warnings = Vec::new();
 
-        // Create wallet directory
-        fs::create_dir_all(&wallet_dir)
-            .map_err(WalletError::Io)?;
+        // Create wallet directory (owner-only: it holds the seed and keys)
+        create_private_dir(&wallet_dir)?;
 
         // Create database
         let db_path = wallet_dir.join("wallet.sqlite");
@@ -882,12 +925,27 @@ impl WalletManager {
                 name
             )));
         }
-        if dest.exists() {
-            if dest.is_dir() {
-                fs::remove_dir_all(&dest).map_err(WalletError::Io)?;
-            } else {
-                fs::remove_file(&dest).map_err(WalletError::Io)?;
+        // Never delete what the caller names. Core's SQLiteDatabase::Backup
+        // opens the destination as a database and fails on a directory or a
+        // non-wallet file; the only thing it replaces is an earlier backup.
+        // The rustoshi analogue: an existing destination is accepted only if
+        // it is a directory holding nothing but wallet files (an earlier
+        // backupwallet), and only those files are replaced.
+        match fs::symlink_metadata(&dest) {
+            Ok(_) => {
+                let stale = earlier_backup_files(&dest).ok_or_else(|| {
+                    WalletError::InvalidPath(format!(
+                        "Error: Wallet backup failed! Destination {} already exists and is \
+                         not a wallet backup; refusing to overwrite it",
+                        dest.display()
+                    ))
+                })?;
+                for f in stale {
+                    fs::remove_file(f).map_err(WalletError::Io)?;
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(WalletError::Io(e)),
         }
         copy_dir_all(&src, &dest)
     }
