@@ -84,7 +84,8 @@ Flags use the `--name value` or `--name=value` form. Boolean flags are switched 
 | `--rpc-tls-cert <pem>`, `--rpc-tls-key <pem>` | none | Serve RPC over HTTPS. Both must be set. |
 | `--rest` | off | Enable Core's `/rest/` interface (no authentication). |
 | `--restbind <ip:port>` | RPC IP, RPC port + 100 | REST listen address. rustoshi serves REST on its own port, not the RPC port as Core does. |
-| `--metrics-port <port>` | 9332 | Prometheus `/metrics` and JSON `/health` on `0.0.0.0:<port>`. `0` disables. |
+| `--metrics-port <port>` | 9332 | Prometheus `/metrics` and JSON `/health` on `<metricsbind>:<port>`. `0` disables. |
+| `--metricsbind <ip>` | 127.0.0.1 | Metrics listen address. The endpoint has no authentication. |
 
 ### Logging
 
@@ -107,7 +108,7 @@ Flags use the `--name value` or `--name=value` form. Boolean flags are switched 
 
 rustoshi reads one config file, from the first of these that exists: `--conf <path>`, `<datadir>/rustoshi.conf`, `~/.rustoshi/rustoshi.conf`. The format is `key=value` per line, as in `bitcoin.conf`. `#` starts a comment, `[section]` headers are ignored, and values may be quoted, so the TOML-style `config.example.toml` in this repo also parses. Command-line flags override the file.
 
-Keys read from the file: `network`, `datadir`, `rpcbind`, `rpcuser`, `rpcpassword`, `rpc-tls-cert`, `rpc-tls-key`, `listen`, `peerbloomfilters`, `blockfilterindex`, `peerblockfilters`, `port`, `externalip`, `discover`, `maxconnections`, `connect` (comma-separated), `nodnsseed`, `nofixedseeds`, `txindex`, `coinstatsindex`, `loglevel`, `metrics_port`, `p2p_watchdog_secs`, `prune`, `daemon`, `no-historical-backfill`, `pidfile`, `debug`, `printtoconsole`, `debuglogfile`, `rest`, `restbind`, `asmap`, `proxy`, `onion`, `i2psam`, `cjdnsreachable`, `par`. Booleans accept `1`, `true`, `yes` or `on`. Other flags (for example `dbcache`, `maxmempool`, `txospenderindex`, `assumevalid`) are command-line only, and unknown keys are ignored.
+Keys read from the file: `network`, `datadir`, `rpcbind`, `rpcuser`, `rpcpassword`, `rpc-tls-cert`, `rpc-tls-key`, `listen`, `peerbloomfilters`, `blockfilterindex`, `peerblockfilters`, `port`, `externalip`, `discover`, `maxconnections`, `connect` (comma-separated), `nodnsseed`, `nofixedseeds`, `txindex`, `coinstatsindex`, `loglevel`, `metrics_port`, `metricsbind`, `p2p_watchdog_secs`, `prune`, `daemon`, `no-historical-backfill`, `pidfile`, `debug`, `printtoconsole`, `debuglogfile`, `rest`, `restbind`, `asmap`, `proxy`, `onion`, `i2psam`, `cjdnsreachable`, `par`. Booleans accept `1`, `true`, `yes` or `on`. Other flags (for example `dbcache`, `maxmempool`, `txospenderindex`, `assumevalid`) are command-line only, and unknown keys are ignored.
 
 Example, on regtest:
 
@@ -171,7 +172,7 @@ With the default `--metrics-port 9332`:
 - `GET /metrics` returns Prometheus text: block height, peer count, mempool size and script-check counters.
 - `GET /health` (also `/healthz`, `/livez`) returns `{"status":"ok","height":N,"peers":N}`.
 
-The metrics server binds all interfaces. Firewall the port or pass `--metrics-port 0` if you do not want it reachable.
+The metrics server binds `127.0.0.1` and has no authentication. To scrape it from another host, pass `--metricsbind 0.0.0.0` (or a LAN address) and firewall the port. Idle clients are dropped after 30 s and at most 16 connections are served at once.
 
 ## A regtest walkthrough
 

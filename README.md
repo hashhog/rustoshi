@@ -47,7 +47,7 @@ Choose a network with `--network` (`mainnet`, `testnet4`, `testnet3`, `signet` o
 | signet | 38333 | 38332 | `<datadir>/signet/` |
 | regtest | 18444 | 18443 | `<datadir>/regtest/` |
 
-A Prometheus endpoint listens on `0.0.0.0:9332` unless you pass `--metrics-port 0`.
+A Prometheus endpoint listens on `127.0.0.1:9332` unless you pass `--metrics-port 0`; `--metricsbind <ip>` changes the address.
 
 For mainnet, plan for the same disk as an unpruned Bitcoin Core node (several hundred GB), or pass `--prune <MiB>` to keep only recent blocks. Memory use is driven mostly by the UTXO cache, `--dbcache <MiB>` (default 2560); a larger cache makes the initial sync faster.
 
