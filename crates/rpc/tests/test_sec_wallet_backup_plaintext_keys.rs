@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use rustoshi_crypto::address::Network;
 use rustoshi_rpc::{ImportDescriptorRequest, WalletRpcImpl, WalletRpcServer, WalletRpcState};
-use rustoshi_wallet::{descriptor_checksum, encode_xprv, ExtendedPrivKey, WalletManager};
+use rustoshi_wallet::{
+    descriptor_checksum, encode_xprv, parse_descriptor, ExtendedPrivKey, WalletManager,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
@@ -260,6 +262,28 @@ async fn importdescriptors_xprv_is_not_stored_in_wallet_db() {
         !contains(&all_bytes(&wdir), &xprv),
         "the imported xprv is stored in plaintext under {}",
         wdir.display()
+    );
+
+    // The stored public form must still watch the same script after a reload.
+    let addr = parse_descriptor(&format!("wpkh({xprv}/0/5)"))
+        .unwrap()
+        .derive_addresses(0, Network::Regtest)
+        .unwrap()[0]
+        .encode();
+    fx.rpc
+        .unload_wallet(Some("w".into()), None)
+        .await
+        .expect("unloadwallet");
+    fx.rpc
+        .load_wallet("w".into(), None)
+        .await
+        .expect("loadwallet");
+    let info = fx.rpc.get_address_info(addr).await.expect("getaddressinfo");
+    assert_eq!(info["ismine"], json!(true), "{info}");
+    let parent = info["parent_desc"].as_str().unwrap_or_default();
+    assert!(
+        !parent.contains("prv"),
+        "parent_desc leaks the key: {parent}"
     );
 }
 
