@@ -4201,6 +4201,16 @@ impl PeerManager {
             .is_some_and(|p| !p.command_tx.is_closed())
     }
 
+    /// Free slots in the peer's outbound command queue (0 for an unknown or
+    /// closed peer). The getdata server stops reading blocks for a peer at 0,
+    /// Core's `fPauseSend` check in `ProcessGetData`.
+    pub fn send_capacity(&self, peer_id: PeerId) -> usize {
+        self.peers
+            .get(&peer_id)
+            .filter(|p| !p.command_tx.is_closed())
+            .map_or(0, |p| p.command_tx.capacity())
+    }
+
     /// Try to send a message without blocking. Drops the message if the
     /// peer's send buffer is full. Use for non-critical bulk responses.
     pub fn try_send_to_peer(&self, peer_id: PeerId, msg: NetworkMessage) -> bool {

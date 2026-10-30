@@ -630,6 +630,215 @@ fn parent_timestamp_for_connect(
     }
 }
 
+/// Serve `peer`'s queued getdata items, at most as many as its outbound queue
+/// has free slots for (Core `ProcessGetData` stops at `fPauseSend`). Whatever
+/// is left waits for the next getdata or validation tick. Each item sends at
+/// most one message, so a peer that is not reading costs at most one queue's
+/// worth of block reads, not one per item it asked for (audit H4: 50,000
+/// items naming one block were 50,000 disk reads in a single pass).
+async fn serve_queued_getdata(
+    queue: &mut rustoshi_network::GetDataQueue,
+    peer_id: rustoshi_network::PeerId,
+    block_store: &BlockStore<'_>,
+    pending_blocks: &[(Hash256, rustoshi_primitives::Block, rustoshi_storage::block_store::UndoData)],
+    rpc_state: &RwLock<RpcState>,
+    peer_state: &RwLock<PeerState>,
+) {
+    let capacity = {
+        let ps = peer_state.read().await;
+        match ps.peer_manager {
+            Some(ref pm) => pm.send_capacity(peer_id),
+            None => 0,
+        }
+    };
+    for item in queue.take_batch(peer_id, capacity) {
+        let item = &item;
+        match item.inv_type {
+            // MSG_CMPCT_BLOCK: a Core peer that chose us as a
+            // BIP-152 high-bandwidth peer fetches an announced
+            // tip this way. A fully validated block within
+            // MAX_CMPCTBLOCK_DEPTH of a fresh tip is answered with
+            // a cmpctblock, anything else with the full block
+            // (ProcessGetBlockData, IsMsgCmpctBlk arm).
+            InvType::MsgBlock | InvType::MsgWitnessBlock | InvType::MsgCmpctBlock => {
+                // Look up block from storage and send it. A block
+                // connected since the last durable flush lives only
+                // in `pending_blocks` until the atomic batch lands;
+                // it is already our tip and already announced
+                // (announce_connected_tip), so a peer WILL ask for
+                // it — serve it from there instead of dropping the
+                // request (Core writes the body before ConnectTip,
+                // so it never has this gap).
+                let found = match block_store.get_block(&item.hash) {
+                    Ok(Some(block)) => Some(block),
+                    _ => pending_blocks
+                        .iter()
+                        .rev()
+                        .find(|(h, _, _)| *h == item.hash)
+                        .map(|(_, b, _)| b.clone()),
+                };
+                match found {
+                    Some(block) => {
+                        tracing::debug!(
+                            "Serving block {} to peer {}",
+                            item.hash, peer_id.0
+                        );
+                        let reply = if item.inv_type == InvType::MsgCmpctBlock {
+                            let (tip_height, tip_hash) = {
+                                let rpc = rpc_state.read().await;
+                                (rpc.best_height, rpc.best_hash)
+                            };
+                            let block_index = block_store
+                                .get_block_index(&item.hash)
+                                .ok()
+                                .flatten();
+                            let tip_time = block_store
+                                .get_block_index(&tip_hash)
+                                .ok()
+                                .flatten()
+                                .map(|e| e.timestamp);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            block_getdata_reply(
+                                item.inv_type,
+                                block,
+                                block_index.as_ref(),
+                                tip_height,
+                                tip_time,
+                                now,
+                                rand::random::<u64>(),
+                            )
+                        } else {
+                            NetworkMessage::Block(block)
+                        };
+                        let ps = peer_state.read().await;
+                        if let Some(ref pm) = ps.peer_manager {
+                            pm.try_send_to_peer(peer_id, reply);
+                        }
+                    }
+                    _ => {
+                        tracing::debug!(
+                            "Block {} not found for peer {}",
+                            item.hash, peer_id.0
+                        );
+                    }
+                }
+            }
+            InvType::MsgTx | InvType::MsgWitnessTx => {
+                // Serve transaction from mempool (by txid)
+                let rpc = rpc_state.read().await;
+                if let Some(entry) = rpc.mempool.get(&item.hash) {
+                    let tx = entry.tx.clone();
+                    let txid = entry.txid;
+                    drop(rpc);
+                    let sent = {
+                        let ps = peer_state.read().await;
+                        if let Some(ref pm) = ps.peer_manager {
+                            pm.try_send_to_peer(
+                                peer_id,
+                                NetworkMessage::Tx(tx),
+                            )
+                        } else {
+                            false
+                        }
+                    };
+                    // Core ProcessGetData drops the tx from the
+                    // unbroadcast set once the reply is queued.
+                    if sent {
+                        rpc_state
+                            .write()
+                            .await
+                            .mempool
+                            .remove_unbroadcast(&txid);
+                    }
+                }
+            }
+            InvType::MsgWtx => {
+                // BIP 339: a wtxidrelay peer requests a tx by
+                // its wtxid. Resolve the wtxid → entry via the
+                // mempool's wtxid index and serve the full tx.
+                // On miss, reply with notfound (Core sends a
+                // notfound so the peer can retry elsewhere).
+                let rpc = rpc_state.read().await;
+                let served = rpc
+                    .mempool
+                    .get_by_wtxid(&item.hash)
+                    .map(|entry| (entry.txid, entry.tx.clone()));
+                drop(rpc);
+                let sent_txid = {
+                    let ps = peer_state.read().await;
+                    if let Some(ref pm) = ps.peer_manager {
+                        match served {
+                            Some((txid, tx)) => {
+                                let sent = pm.try_send_to_peer(
+                                    peer_id,
+                                    NetworkMessage::Tx(tx),
+                                );
+                                if sent { Some(txid) } else { None }
+                            }
+                            None => {
+                                pm.try_send_to_peer(
+                                    peer_id,
+                                    NetworkMessage::NotFound(vec![
+                                        item.clone(),
+                                    ]),
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(txid) = sent_txid {
+                    rpc_state
+                        .write()
+                        .await
+                        .mempool
+                        .remove_unbroadcast(&txid);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// How far below the header tip `header_chain_height_of` scans the height
+/// index for a stored header that has no block-index entry (headers written
+/// before `store_validated_header` began inserting one). One full headers
+/// batch, far deeper than any reorg we follow.
+const HEADER_CHAIN_FALLBACK_SCAN: u32 = rustoshi_network::MAX_HEADERS_PER_REQUEST as u32;
+
+/// Height of `hash` on our header chain (the height index) at or below
+/// `max_height`, or None. Core resolves a headers message's parent with an
+/// O(1) `LookupBlockIndex`; this used to walk the height index from the
+/// header tip down to genesis on every attacker-supplied `prev`, ~1M reads
+/// per message on mainnet (audit H3). Now: the block index names the height,
+/// one height-index read confirms it is on our header chain. A header we
+/// store but never block-indexed gets a scan bounded to the top
+/// `HEADER_CHAIN_FALLBACK_SCAN` heights; an unknown hash costs two reads.
+fn header_chain_height_of(
+    block_store: &BlockStore,
+    hash: &Hash256,
+    max_height: u32,
+) -> Option<u32> {
+    let on_chain_at = |h: u32| {
+        h <= max_height && block_store.get_hash_by_height(h).ok().flatten() == Some(*hash)
+    };
+    if let Some(entry) = block_store.get_block_index(hash).ok().flatten() {
+        // The entry's height is authoritative: a side-branch header is
+        // simply not on our header chain, no scan needed.
+        return on_chain_at(entry.height).then_some(entry.height);
+    }
+    if !matches!(block_store.get_header(hash), Ok(Some(_))) {
+        return None;
+    }
+    let floor = max_height.saturating_sub(HEADER_CHAIN_FALLBACK_SCAN);
+    (floor..=max_height).rev().find(|&h| on_chain_at(h))
+}
+
 /// Store a header that passed the header-validation gates (the last step of
 /// the `process_headers` closure).
 ///
@@ -5313,6 +5522,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         (rustoshi_primitives::Hash256, rustoshi_network::PartiallyDownloadedBlock),
     > = std::collections::HashMap::new();
 
+    // getdata items not yet served, per peer (audit H4): drained as each
+    // peer's send queue frees up, on getdata arrival and every validation tick.
+    let mut getdata_queue = rustoshi_network::GetDataQueue::new();
+
     let mut block_retry_interval = tokio::time::interval(std::time::Duration::from_secs(10));
     block_retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -5472,6 +5685,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             // Even if peer events dominate, this will statistically fire
             // ~50% of the time when both are ready.
             _ = validation_interval.tick() => {
+                for peer in getdata_queue.peers() {
+                    serve_queued_getdata(
+                        &mut getdata_queue,
+                        peer,
+                        &block_store,
+                        &pending_blocks,
+                        &rpc_state,
+                        &peer_state,
+                    )
+                    .await;
+                }
                 // ============================================================
                 // FORCE-FLUSH SERVICE (Core `ForceFlushStateToDisk`)
                 // ============================================================
@@ -6519,16 +6743,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         store_validated_header(&block_store, header, height)
                                     },
                                     &|hash| {
-                                        // Walk back through the height index to find this hash.
-                                        // This is the equivalent of Bitcoin Core's FindForkInGlobalIndex.
-                                        for h in (0..=current_header_height).rev() {
-                                            if let Ok(Some(stored_hash)) = block_store.get_hash_by_height(h) {
-                                                if stored_hash == *hash {
-                                                    return Some(h);
-                                                }
-                                            }
-                                        }
-                                        None
+                                        header_chain_height_of(
+                                            &block_store,
+                                            hash,
+                                            current_header_height,
+                                        )
                                     },
                                     // Reorg Unit E (E2): our current header chain's
                                     // nBits at `height`, for the heavier-fork work
@@ -8208,158 +8427,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
                             NetworkMessage::GetData(items) => {
                                 tracing::info!("Received getdata with {} items from peer {}", items.len(), peer_id.0);
-                                // Serve requested blocks/transactions to peers
-                                for item in &items {
-                                    match item.inv_type {
-                                        // MSG_CMPCT_BLOCK: a Core peer that chose us as a
-                                        // BIP-152 high-bandwidth peer fetches an announced
-                                        // tip this way. A fully validated block within
-                                        // MAX_CMPCTBLOCK_DEPTH of a fresh tip is answered with
-                                        // a cmpctblock, anything else with the full block
-                                        // (ProcessGetBlockData, IsMsgCmpctBlk arm).
-                                        InvType::MsgBlock | InvType::MsgWitnessBlock | InvType::MsgCmpctBlock => {
-                                            // Look up block from storage and send it. A block
-                                            // connected since the last durable flush lives only
-                                            // in `pending_blocks` until the atomic batch lands;
-                                            // it is already our tip and already announced
-                                            // (announce_connected_tip), so a peer WILL ask for
-                                            // it — serve it from there instead of dropping the
-                                            // request (Core writes the body before ConnectTip,
-                                            // so it never has this gap).
-                                            let found = match block_store.get_block(&item.hash) {
-                                                Ok(Some(block)) => Some(block),
-                                                _ => pending_blocks
-                                                    .iter()
-                                                    .rev()
-                                                    .find(|(h, _, _)| *h == item.hash)
-                                                    .map(|(_, b, _)| b.clone()),
-                                            };
-                                            match found {
-                                                Some(block) => {
-                                                    tracing::debug!(
-                                                        "Serving block {} to peer {}",
-                                                        item.hash, peer_id.0
-                                                    );
-                                                    let reply = if item.inv_type == InvType::MsgCmpctBlock {
-                                                        let (tip_height, tip_hash) = {
-                                                            let rpc = rpc_state.read().await;
-                                                            (rpc.best_height, rpc.best_hash)
-                                                        };
-                                                        let block_index = block_store
-                                                            .get_block_index(&item.hash)
-                                                            .ok()
-                                                            .flatten();
-                                                        let tip_time = block_store
-                                                            .get_block_index(&tip_hash)
-                                                            .ok()
-                                                            .flatten()
-                                                            .map(|e| e.timestamp);
-                                                        let now = std::time::SystemTime::now()
-                                                            .duration_since(std::time::UNIX_EPOCH)
-                                                            .map(|d| d.as_secs())
-                                                            .unwrap_or(0);
-                                                        block_getdata_reply(
-                                                            item.inv_type,
-                                                            block,
-                                                            block_index.as_ref(),
-                                                            tip_height,
-                                                            tip_time,
-                                                            now,
-                                                            rand::random::<u64>(),
-                                                        )
-                                                    } else {
-                                                        NetworkMessage::Block(block)
-                                                    };
-                                                    let ps = peer_state.read().await;
-                                                    if let Some(ref pm) = ps.peer_manager {
-                                                        pm.try_send_to_peer(peer_id, reply);
-                                                    }
-                                                }
-                                                _ => {
-                                                    tracing::debug!(
-                                                        "Block {} not found for peer {}",
-                                                        item.hash, peer_id.0
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        InvType::MsgTx | InvType::MsgWitnessTx => {
-                                            // Serve transaction from mempool (by txid)
-                                            let rpc = rpc_state.read().await;
-                                            if let Some(entry) = rpc.mempool.get(&item.hash) {
-                                                let tx = entry.tx.clone();
-                                                let txid = entry.txid;
-                                                drop(rpc);
-                                                let sent = {
-                                                    let ps = peer_state.read().await;
-                                                    if let Some(ref pm) = ps.peer_manager {
-                                                        pm.try_send_to_peer(
-                                                            peer_id,
-                                                            NetworkMessage::Tx(tx),
-                                                        )
-                                                    } else {
-                                                        false
-                                                    }
-                                                };
-                                                // Core ProcessGetData drops the tx from the
-                                                // unbroadcast set once the reply is queued.
-                                                if sent {
-                                                    rpc_state
-                                                        .write()
-                                                        .await
-                                                        .mempool
-                                                        .remove_unbroadcast(&txid);
-                                                }
-                                            }
-                                        }
-                                        InvType::MsgWtx => {
-                                            // BIP 339: a wtxidrelay peer requests a tx by
-                                            // its wtxid. Resolve the wtxid → entry via the
-                                            // mempool's wtxid index and serve the full tx.
-                                            // On miss, reply with notfound (Core sends a
-                                            // notfound so the peer can retry elsewhere).
-                                            let rpc = rpc_state.read().await;
-                                            let served = rpc
-                                                .mempool
-                                                .get_by_wtxid(&item.hash)
-                                                .map(|entry| (entry.txid, entry.tx.clone()));
-                                            drop(rpc);
-                                            let sent_txid = {
-                                                let ps = peer_state.read().await;
-                                                if let Some(ref pm) = ps.peer_manager {
-                                                    match served {
-                                                        Some((txid, tx)) => {
-                                                            let sent = pm.try_send_to_peer(
-                                                                peer_id,
-                                                                NetworkMessage::Tx(tx),
-                                                            );
-                                                            if sent { Some(txid) } else { None }
-                                                        }
-                                                        None => {
-                                                            pm.try_send_to_peer(
-                                                                peer_id,
-                                                                NetworkMessage::NotFound(vec![
-                                                                    item.clone(),
-                                                                ]),
-                                                            );
-                                                            None
-                                                        }
-                                                    }
-                                                } else {
-                                                    None
-                                                }
-                                            };
-                                            if let Some(txid) = sent_txid {
-                                                rpc_state
-                                                    .write()
-                                                    .await
-                                                    .mempool
-                                                    .remove_unbroadcast(&txid);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
+                                // Queued and served as the peer drains its send
+                                // queue, not all in this pass (audit H4; see
+                                // serve_queued_getdata).
+                                let dropped = getdata_queue.push(peer_id, items);
+                                if dropped > 0 {
+                                    tracing::debug!(
+                                        "getdata from peer {}: {} items past the per-peer queue cap dropped",
+                                        peer_id.0, dropped
+                                    );
                                 }
+                                serve_queued_getdata(
+                                    &mut getdata_queue,
+                                    peer_id,
+                                    &block_store,
+                                    &pending_blocks,
+                                    &rpc_state,
+                                    &peer_state,
+                                )
+                                .await;
                             }
 
                             // ============================================================
@@ -9175,6 +9261,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tracing::info!("Peer {} disconnected: {:?}", peer_id.0, reason);
                         header_sync.remove_peer(peer_id);
                         block_downloader.remove_peer(peer_id);
+                        getdata_queue.remove_peer(peer_id);
                         // Re-sync the watchdog peer mirror so the gate drops to 0
                         // when the node becomes isolated (a legitimately peerless
                         // node must not restart-loop).
@@ -11814,6 +11901,44 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    /// Audit H3: a headers message's parent resolves through the block index
+    /// plus one height-index read, not a walk from the tip to genesis. Covers
+    /// on-chain, off-chain (a side-branch header), above-the-tip, unknown, and
+    /// a stored header with no block-index entry (bounded fallback scan).
+    #[test]
+    fn sec_h3_header_chain_height_of_resolves_without_full_scan() {
+        let (_dir, db) = mtp_test_store();
+        let store = BlockStore::new(&db);
+        let g = rt_header(Hash256::ZERO, 1_700_000_000);
+        let a1 = rt_header(g.block_hash(), 1_700_000_100);
+        let a2 = rt_header(a1.block_hash(), 1_700_000_200);
+        let b1 = rt_header(g.block_hash(), 1_700_000_300);
+        for (h, ht) in [(&g, 0), (&a1, 1), (&a2, 2), (&b1, 1)] {
+            index_entry(&store, h, ht);
+        }
+        for (h, ht) in [(&g, 0), (&a1, 1), (&a2, 2)] {
+            store.put_height_index(ht, &h.block_hash()).unwrap();
+        }
+        assert_eq!(header_chain_height_of(&store, &a1.block_hash(), 2), Some(1));
+        assert_eq!(header_chain_height_of(&store, &g.block_hash(), 2), Some(0));
+        // Side branch: block-indexed at height 1, but the height index names
+        // a1 there, so it is not on our header chain (no fallback scan).
+        assert_eq!(header_chain_height_of(&store, &b1.block_hash(), 2), None);
+        // Above the header tip we were given.
+        assert_eq!(header_chain_height_of(&store, &a2.block_hash(), 1), None);
+        assert_eq!(header_chain_height_of(&store, &Hash256([0x5a; 32]), 2), None);
+
+        // A header stored on the height index but never block-indexed (written
+        // before store_validated_header inserted entries) is still found near
+        // the tip, and not past HEADER_CHAIN_FALLBACK_SCAN.
+        let a3 = rt_header(a2.block_hash(), 1_700_000_400);
+        store.put_header(&a3.block_hash(), &a3).unwrap();
+        store.put_height_index(3, &a3.block_hash()).unwrap();
+        assert_eq!(header_chain_height_of(&store, &a3.block_hash(), 3), Some(3));
+        let far = 3 + HEADER_CHAIN_FALLBACK_SCAN + 1;
+        assert_eq!(header_chain_height_of(&store, &a3.block_hash(), far), None);
     }
 
     /// The observed wedge (tools/p2p-invalid-block-feed.py `after`, live
