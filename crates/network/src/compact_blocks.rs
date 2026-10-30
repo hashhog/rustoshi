@@ -239,6 +239,59 @@ impl CmpctBlock {
     }
 }
 
+/// A mempool transaction handed to [`PartiallyDownloadedBlock::init_data`].
+///
+/// Only transactions whose short ID matches a slot are converted, so a
+/// borrowed `&Transaction` (the live mempool) is cloned for matches only.
+pub trait CompactTxSource {
+    /// The transaction as the `Arc` stored in the partial block.
+    fn to_arc(&self) -> Arc<Transaction>;
+}
+
+impl CompactTxSource for &Arc<Transaction> {
+    fn to_arc(&self) -> Arc<Transaction> {
+        Arc::clone(self)
+    }
+}
+
+impl CompactTxSource for &Transaction {
+    fn to_arc(&self) -> Arc<Transaction> {
+        Arc::new((*self).clone())
+    }
+}
+
+/// Decoder for BIP152 differentially-encoded u16 indexes (prefilled tx
+/// indexes in `cmpctblock`, requested indexes in `getblocktxn`).
+///
+/// Mirrors Core's `DifferenceFormatter::Unser` (blockencodings.h): each diff
+/// is read as a u64 and added with an overflow check, and the running index
+/// must stay within u16. Every decoded index is therefore strictly greater
+/// than the previous one. The old decoder read the diff `as i32`, so a diff of
+/// 0xFFFFFFFF became -1 and pinned the index in place: one `getblocktxn` could
+/// request the same transaction ~66k times (audit C2).
+struct DifferenceDecoder {
+    shift: u64,
+}
+
+impl DifferenceDecoder {
+    fn new() -> Self {
+        Self { shift: 0 }
+    }
+
+    fn next<R: Read>(&mut self, reader: &mut R) -> io::Result<u16> {
+        let diff = read_compact_size(reader)?;
+        let index = self
+            .shift
+            .checked_add(diff)
+            .filter(|&v| v <= u16::MAX as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "differential value overflow")
+            })?;
+        self.shift = index + 1;
+        Ok(index as u16)
+    }
+}
+
 /// Encode a compact block to bytes.
 ///
 /// Format:
@@ -307,29 +360,28 @@ impl CmpctBlock {
             short_ids.push(u64::from_le_bytes(full_bytes));
         }
 
-        // Prefilled transactions
-        let prefilled_len = read_compact_size(reader)? as usize;
-        // DoS check
-        if short_ids_len + prefilled_len > MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT {
+        // Prefilled transactions.
+        //
+        // `prefilled_len` is peer-controlled and `read_compact_size` does not
+        // cap it, so it is bounded BEFORE it is added to `short_ids_len`: a
+        // u64::MAX count used to overflow that sum and panic the process
+        // (audit C1). Core rejects any compact block whose BlockTxCount()
+        // exceeds u16::MAX ("indexes overflowed 16 bits", blockencodings.h).
+        let prefilled_len = read_compact_size(reader)?;
+        let tx_count = (short_ids_len as u64).checked_add(prefilled_len);
+        if tx_count.map_or(true, |n| n > u16::MAX as u64) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "too many transactions",
+                "indexes overflowed 16 bits",
             ));
         }
+        let prefilled_len = prefilled_len as usize;
         let mut prefilled_txn = Vec::with_capacity(prefilled_len);
-        let mut last_index: i32 = -1;
+        let mut indices = DifferenceDecoder::new();
         for _ in 0..prefilled_len {
-            let diff = read_compact_size(reader)? as i32;
-            last_index = last_index.saturating_add(diff).saturating_add(1);
-            if last_index < 0 || last_index > u16::MAX as i32 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "prefilled index overflow",
-                ));
-            }
-
+            let index = indices.next(reader)?;
             let tx = Transaction::decode(reader)?;
-            prefilled_txn.push(PrefilledTx::new(last_index as u16, tx));
+            prefilled_txn.push(PrefilledTx::new(index, tx));
         }
 
         // Validate that prefilled indices don't exceed block tx count
@@ -419,14 +471,9 @@ impl BlockTxnRequest {
         }
 
         let mut indices = Vec::with_capacity(count);
-        let mut last_index: i32 = -1;
+        let mut decoder = DifferenceDecoder::new();
         for _ in 0..count {
-            let diff = read_compact_size(reader)? as i32;
-            last_index = last_index.saturating_add(diff).saturating_add(1);
-            if last_index < 0 || last_index > u16::MAX as i32 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "index overflow"));
-            }
-            indices.push(last_index as u16);
+            indices.push(decoder.next(reader)?);
         }
 
         Ok(Self {
@@ -653,6 +700,17 @@ impl PartiallyDownloadedBlock {
         mempool_txns: impl Iterator<Item = (&'a Hash256, &'a Arc<Transaction>)>,
         extra_txns: &[(&Hash256, Arc<Transaction>)],
     ) -> Result<Self, ReadStatus> {
+        Self::init_data_with(cmpct, mempool_txns, extra_txns)
+    }
+
+    /// [`Self::init_data`] over any [`CompactTxSource`], e.g. borrowed
+    /// `&Transaction`s straight from the mempool, so only matched
+    /// transactions are cloned.
+    pub fn init_data_with<'a, T: CompactTxSource>(
+        cmpct: &CmpctBlock,
+        mempool_txns: impl Iterator<Item = (&'a Hash256, T)>,
+        extra_txns: &[(&Hash256, Arc<Transaction>)],
+    ) -> Result<Self, ReadStatus> {
         // Validation
         if cmpct.header == BlockHeader::default()
             || (cmpct.short_ids.is_empty() && cmpct.prefilled_txn.is_empty())
@@ -750,7 +808,7 @@ impl PartiallyDownloadedBlock {
             let short_id = cmpct.get_short_id(wtxid);
             if let Some(&index) = short_id_map.get(&short_id) {
                 if !have_txn[index] {
-                    partial.txn_available[index] = Some(tx.clone());
+                    partial.txn_available[index] = Some(tx.to_arc());
                     have_txn[index] = true;
                     partial.mempool_count += 1;
                 } else if partial.txn_available[index].is_some() {
