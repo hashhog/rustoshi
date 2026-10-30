@@ -1209,6 +1209,60 @@ fn blocktxn_within_depth(block_height: u32, tip_height: u32) -> bool {
     block_height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
 }
 
+/// The transactions a `getblocktxn` asks for, in request order, or `None` if
+/// any index is past the end of the block.
+///
+/// Core `SendBlockTransactions` (net_processing.cpp) answers an out-of-range
+/// index with `Misbehaving(peer, "getblocktxn with out-of-bounds tx indices")`
+/// and sends nothing. This used to `filter_map` the bad indices away, so a
+/// probing peer paid no penalty (audit C2).
+fn blocktxn_transactions(
+    block: &rustoshi_primitives::Block,
+    indices: &[u16],
+) -> Option<Vec<Arc<rustoshi_primitives::Transaction>>> {
+    indices
+        .iter()
+        .map(|&idx| block.transactions.get(idx as usize).map(|tx| Arc::new(tx.clone())))
+        .collect()
+}
+
+/// Verdict on a `cmpctblock` header, taken before any reconstruction work.
+#[derive(Debug, PartialEq, Eq)]
+enum CmpctHeaderGate {
+    /// Parent known and PoW valid: reconstruct.
+    Accept,
+    /// Parent header unknown: send getheaders, do not reconstruct.
+    UnknownParent,
+    /// Hash does not meet nBits, or nBits is easier than `pow_limit`.
+    HighHash,
+}
+
+/// Gate a `cmpctblock` header the way Core does before it touches the
+/// mempool or allocates a partial block (net_processing.cpp CMPCTBLOCK):
+/// an unknown `hashPrevBlock` gets `MaybeSendGetHeaders` and nothing else,
+/// and the header must pass `ProcessNewBlockHeaders` (PoW against
+/// `pow_limit`) or the peer is punished.
+///
+/// Without this, any made-up ~100-byte header was reconstructed against the
+/// whole mempool and could park a partial block in memory (audit C3, H1).
+fn cmpctblock_header_gate(
+    header: &rustoshi_primitives::BlockHeader,
+    parent_known: bool,
+    params: &ChainParams,
+) -> CmpctHeaderGate {
+    if !parent_known {
+        return CmpctHeaderGate::UnknownParent;
+    }
+    if !rustoshi_consensus::check_proof_of_work(
+        header.block_hash().as_bytes(),
+        header.bits,
+        params,
+    ) {
+        return CmpctHeaderGate::HighHash;
+    }
+    CmpctHeaderGate::Accept
+}
+
 /// Mirrors Bitcoin Core's `MAX_CMPCTBLOCK_DEPTH` (net_processing.cpp:138).
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 
@@ -5195,13 +5249,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // calls fill_block() with the provided transactions, and submits the
     // completed block to the chain via block_downloader.block_received().
     //
-    // One entry per (peer, block) is sufficient because Bitcoin Core only allows
-    // one compact-block in flight per peer at a time (net_processing.cpp:5028).
-    // We hold at most one entry per peer; the map is keyed by (peer_id_u64,
-    // block_hash) so multiple peers can each have one in-flight block.
+    // Keyed by peer id ONLY, holding (block_hash, partial): at most one
+    // partial block per peer, so the map is bounded by the peer count. It used
+    // to be keyed by (peer, block_hash), which let one peer stream distinct
+    // made-up headers and park a near-full block for each (audit C3). A newer
+    // cmpctblock from the same peer replaces the older partial.
     let mut inflight_partial_blocks: std::collections::HashMap<
-        (u64, rustoshi_primitives::Hash256),
-        rustoshi_network::PartiallyDownloadedBlock,
+        u64,
+        (rustoshi_primitives::Hash256, rustoshi_network::PartiallyDownloadedBlock),
     > = std::collections::HashMap::new();
 
     let mut block_retry_interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -8694,85 +8749,129 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             NetworkMessage::CmpctBlock(data) => {
                                 // BIP 152: Reconstruct block from compact block + mempool
                                 use rustoshi_network::{CmpctBlock, PartiallyDownloadedBlock, BlockTxnRequest};
-                                use rustoshi_primitives::{Hash256, Transaction};
                                 match CmpctBlock::decode(&mut std::io::Cursor::new(&data)) {
                                     Ok(cmpct) => {
                                         let block_hash = cmpct.block_hash();
-                                        let (mempool_txns, segwit_active) = {
-                                            let rpc = rpc_state.read().await;
-                                            let seg = rpc.params.is_segwit_active(rpc.best_height);
-                                            (rpc.mempool.collect_for_compact_block(), seg)
+                                        let parent_known = block_store
+                                            .has_header(&cmpct.header.prev_block_hash)
+                                            .unwrap_or(false);
+                                        let accepted = match cmpctblock_header_gate(&cmpct.header, parent_known, &params) {
+                                            CmpctHeaderGate::Accept => true,
+                                            CmpctHeaderGate::UnknownParent => {
+                                                // Core: MaybeSendGetHeaders and return.
+                                                tracing::debug!(
+                                                    "cmpctblock {} from peer {} has unknown parent {}; sending getheaders",
+                                                    block_hash, peer_id.0, cmpct.header.prev_block_hash
+                                                );
+                                                let gh = NetworkMessage::GetHeaders(header_sync.make_getheaders(
+                                                    |h| block_store.get_hash_by_height(h).ok().flatten(),
+                                                ));
+                                                let ps = peer_state.read().await;
+                                                if let Some(ref pm) = ps.peer_manager {
+                                                    pm.try_send_to_peer(peer_id, gh);
+                                                }
+                                                false
+                                            }
+                                            CmpctHeaderGate::HighHash => {
+                                                tracing::warn!(
+                                                    "cmpctblock {} from peer {} fails proof of work",
+                                                    block_hash, peer_id.0
+                                                );
+                                                let mut ps = peer_state.write().await;
+                                                if let Some(ref mut pm) = ps.peer_manager {
+                                                    pm.misbehaving(
+                                                        peer_id,
+                                                        MisbehaviorReason::InvalidBlockHeader,
+                                                    )
+                                                    .await;
+                                                }
+                                                false
+                                            }
                                         };
-                                        let mempool_refs: Vec<(&Hash256, &Arc<Transaction>)> =
-                                            mempool_txns.iter().map(|(h, t)| (h, t)).collect();
-                                        match PartiallyDownloadedBlock::init_data(
-                                            &cmpct, mempool_refs.into_iter(), &[],
-                                        ) {
-                                            Ok(mut partial) => {
-                                                let missing = partial.get_missing_indices();
-                                                let (prefilled, from_mempool, _extra) = partial.stats();
-                                                if missing.is_empty() {
-                                                    match partial.fill_block(vec![], segwit_active) {
-                                                        Ok(block) => {
-                                                            tracing::info!(
-                                                                "Compact block {} reconstructed (prefilled={}, mempool={})",
-                                                                block_hash, prefilled, from_mempool
-                                                            );
-                                                            block_downloader.block_received(peer_id, block);
-                                                            let refill = block_downloader.take_refill_requests();
-                                                            send_download_requests(
-                                                                &mut block_downloader,
-                                                                &peer_state,
-                                                                refill,
-                                                            )
-                                                            .await;
+                                        if accepted {
+                                            let (init, segwit_active) = {
+                                                let rpc = rpc_state.read().await;
+                                                let seg = rpc.params.is_segwit_active(rpc.best_height);
+                                                let init = PartiallyDownloadedBlock::init_data_with(
+                                                    &cmpct, rpc.mempool.iter_by_wtxid(), &[],
+                                                );
+                                                (init, seg)
+                                            };
+                                            match init {
+                                                Ok(mut partial) => {
+                                                    let missing = partial.get_missing_indices();
+                                                    let (prefilled, from_mempool, _extra) = partial.stats();
+                                                    if missing.is_empty() {
+                                                        match partial.fill_block(vec![], segwit_active) {
+                                                            Ok(block) => {
+                                                                tracing::info!(
+                                                                    "Compact block {} reconstructed (prefilled={}, mempool={})",
+                                                                    block_hash, prefilled, from_mempool
+                                                                );
+                                                                block_downloader.block_received(peer_id, block);
+                                                                let refill = block_downloader.take_refill_requests();
+                                                                send_download_requests(
+                                                                    &mut block_downloader,
+                                                                    &peer_state,
+                                                                    refill,
+                                                                )
+                                                                .await;
+                                                            }
+                                                            Err(_) => {
+                                                                tracing::warn!("Compact block {} merkle mismatch, requesting full block", block_hash);
+                                                                let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
+                                                                let ps = peer_state.read().await;
+                                                                if let Some(ref pm) = ps.peer_manager {
+                                                                    let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                                }
+                                                            }
                                                         }
-                                                        Err(_) => {
-                                                            tracing::warn!("Compact block {} merkle mismatch, requesting full block", block_hash);
+                                                    } else {
+                                                        let miss_pct = missing.len() as f64 / cmpct.block_tx_count() as f64 * 100.0;
+                                                        if miss_pct > 50.0 {
+                                                            tracing::info!("Compact block {} missing {:.0}% txns, requesting full block", block_hash, miss_pct);
                                                             let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
                                                             let ps = peer_state.read().await;
                                                             if let Some(ref pm) = ps.peer_manager {
                                                                 let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
                                                             }
-                                                        }
-                                                    }
-                                                } else {
-                                                    let miss_pct = missing.len() as f64 / cmpct.block_tx_count() as f64 * 100.0;
-                                                    if miss_pct > 50.0 {
-                                                        tracing::info!("Compact block {} missing {:.0}% txns, requesting full block", block_hash, miss_pct);
-                                                        let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
-                                                        let ps = peer_state.read().await;
-                                                        if let Some(ref pm) = ps.peer_manager {
-                                                            let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
-                                                        }
-                                                    } else {
-                                                        tracing::info!("Compact block {} missing {} txns (mempool_hits={}), sending getblocktxn", block_hash, missing.len(), from_mempool);
-                                                        let req = BlockTxnRequest::new(block_hash, missing);
-                                                        // Store the PartiallyDownloadedBlock so the
-                                                        // blocktxn handler can complete reconstruction.
-                                                        // Key: (peer_id, block_hash) — one in-flight
-                                                        // block per peer (Core net_processing.cpp:5028).
-                                                        inflight_partial_blocks
-                                                            .insert((peer_id.0, block_hash), partial);
-                                                        let ps = peer_state.read().await;
-                                                        if let Some(ref pm) = ps.peer_manager {
-                                                            if !pm.send_to_peer(peer_id, NetworkMessage::GetBlockTxn(req.serialize())).await {
-                                                                // #74: getblocktxn never left — free the
-                                                                // one-per-peer partial-block slot instead of
-                                                                // stranding it until remove_peer.
-                                                                inflight_partial_blocks.remove(&(peer_id.0, block_hash));
+                                                        } else {
+                                                            tracing::info!("Compact block {} missing {} txns (mempool_hits={}), sending getblocktxn", block_hash, missing.len(), from_mempool);
+                                                            let req = BlockTxnRequest::new(block_hash, missing);
+                                                            // Store the PartiallyDownloadedBlock so the
+                                                            // blocktxn handler can complete reconstruction.
+                                                            // Key: peer_id — one in-flight partial per peer;
+                                                            // this replaces any older one (audit C3). The
+                                                            // replaced block is not dropped: ask the peer
+                                                            // for it in full, as the other fallbacks do.
+                                                            let replaced = inflight_partial_blocks
+                                                                .insert(peer_id.0, (block_hash, partial))
+                                                                .map(|(hash, _)| hash)
+                                                                .filter(|hash| *hash != block_hash);
+                                                            let ps = peer_state.read().await;
+                                                            if let Some(ref pm) = ps.peer_manager {
+                                                                if let Some(hash) = replaced {
+                                                                    let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash };
+                                                                    pm.try_send_to_peer(peer_id, NetworkMessage::GetData(vec![inv]));
+                                                                }
+                                                                if !pm.send_to_peer(peer_id, NetworkMessage::GetBlockTxn(req.serialize())).await {
+                                                                    // #74: getblocktxn never left — free the
+                                                                    // one-per-peer partial-block slot instead of
+                                                                    // stranding it until remove_peer.
+                                                                    inflight_partial_blocks.remove(&peer_id.0);
+                                                                }
                                                             }
                                                         }
                                                     }
                                                 }
-                                            }
-                                            Err(status) => {
-                                                tracing::warn!("Compact block init failed ({:?}), requesting full block", status);
-                                                let block_hash = rustoshi_crypto::sha256d(&data[..80]);
-                                                let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
-                                                let ps = peer_state.read().await;
-                                                if let Some(ref pm) = ps.peer_manager {
-                                                    let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                Err(status) => {
+                                                    tracing::warn!("Compact block init failed ({:?}), requesting full block", status);
+                                                    let block_hash = rustoshi_crypto::sha256d(&data[..80]);
+                                                    let inv = InvVector { inv_type: InvType::MsgWitnessBlock, hash: block_hash };
+                                                    let ps = peer_state.read().await;
+                                                    if let Some(ref pm) = ps.peer_manager {
+                                                        let _ = pm.send_to_peer(peer_id, NetworkMessage::GetData(vec![inv])).await;
+                                                    }
                                                 }
                                             }
                                         }
@@ -8815,13 +8914,30 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             Ok(Some(block_height)) if blocktxn_within_depth(block_height, tip_height) => {
                                                 // Near tip: serve the small targeted blocktxn.
                                                 if let Ok(Some(block)) = block_store.get_block(&req.block_hash) {
-                                                    let txns: Vec<Arc<rustoshi_primitives::Transaction>> = req.indices.iter()
-                                                        .filter_map(|&idx| block.transactions.get(idx as usize).map(|tx| Arc::new(tx.clone())))
-                                                        .collect();
-                                                    let resp = BlockTxn::from_arcs(req.block_hash, txns);
-                                                    let ps = peer_state.read().await;
-                                                    if let Some(ref pm) = ps.peer_manager {
-                                                        let _ = pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                                    match blocktxn_transactions(&block, &req.indices) {
+                                                        Some(txns) => {
+                                                            let resp = BlockTxn::from_arcs(req.block_hash, txns);
+                                                            let ps = peer_state.read().await;
+                                                            if let Some(ref pm) = ps.peer_manager {
+                                                                let _ = pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                                            }
+                                                        }
+                                                        None => {
+                                                            tracing::warn!(
+                                                                "peer {} sent getblocktxn with out-of-bounds tx indices for {}",
+                                                                peer_id.0, req.block_hash
+                                                            );
+                                                            let mut ps = peer_state.write().await;
+                                                            if let Some(ref mut pm) = ps.peer_manager {
+                                                                pm.misbehaving(
+                                                                    peer_id,
+                                                                    MisbehaviorReason::ProtocolViolation(
+                                                                        "getblocktxn with out-of-bounds tx indices".to_string(),
+                                                                    ),
+                                                                )
+                                                                .await;
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -8875,8 +8991,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             blocktxn.block_hash, peer_id.0, blocktxn.transactions.len()
                                         );
 
-                                        let key = (peer_id.0, blocktxn.block_hash);
-                                        match inflight_partial_blocks.remove(&key) {
+                                        let inflight = match inflight_partial_blocks.get(&peer_id.0) {
+                                            Some((hash, _)) if *hash == blocktxn.block_hash => {
+                                                inflight_partial_blocks.remove(&peer_id.0).map(|(_, p)| p)
+                                            }
+                                            _ => None,
+                                        };
+                                        match inflight {
                                             None => {
                                                 // No in-flight partial block for this hash + peer.
                                                 // Could be a duplicate response or arrived after a
@@ -9009,7 +9130,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         );
                         // Discard any in-flight partial block for this peer —
                         // the blocktxn response will never arrive.
-                        inflight_partial_blocks.retain(|(pid, _), _| *pid != peer_id.0);
+                        inflight_partial_blocks.remove(&peer_id.0);
                         // Drop any orphans this peer announced — they're
                         // unverifiable now that the source is gone, so
                         // freeing the slot benefits other peers.
@@ -10002,6 +10123,54 @@ mod tests {
         // so any block height is within depth — matches Core's negative RHS.
         assert!(blocktxn_within_depth(0, 5));
         assert!(blocktxn_within_depth(5, 5));
+    }
+
+    /// Audit C2: getblocktxn with an index past the block's tx count is
+    /// refused (the caller Misbehaves, Core SendBlockTransactions); in-range
+    /// requests come back in request order.
+    #[test]
+    fn sec_c2_getblocktxn_out_of_bounds_index_is_refused() {
+        let block = cmpct_test_block();
+        let got = blocktxn_transactions(&block, &[0, 2]).expect("in range");
+        assert_eq!(got.len(), 2);
+        assert_eq!(*got[1], block.transactions[2]);
+        assert!(blocktxn_transactions(&block, &[3]).is_none());
+        assert!(blocktxn_transactions(&block, &[0, 1, 65_535]).is_none());
+        assert_eq!(blocktxn_transactions(&block, &[]).map(|v| v.len()), Some(0));
+    }
+
+    /// Audits C3/H1: a cmpctblock is reconstructed only once its parent header
+    /// is known and its own header passes PoW against pow_limit (Core:
+    /// unknown parent → getheaders; bad PoW → punish).
+    #[test]
+    fn sec_c3_h1_cmpctblock_header_gate() {
+        let params = ChainParams::regtest();
+        let mut header = cmpct_test_block().header;
+        // Grind a nonce that meets regtest's 0x207fffff target.
+        while !rustoshi_consensus::check_proof_of_work(
+            header.block_hash().as_bytes(),
+            header.bits,
+            &params,
+        ) {
+            header.nonce += 1;
+        }
+        assert_eq!(cmpctblock_header_gate(&header, true, &params), CmpctHeaderGate::Accept);
+        assert_eq!(
+            cmpctblock_header_gate(&header, false, &params),
+            CmpctHeaderGate::UnknownParent
+        );
+
+        // nBits easier than regtest's pow_limit: high-hash even if the hash
+        // meets the declared target.
+        let mut easy = header.clone();
+        easy.bits = 0x2100ffff;
+        assert_eq!(cmpctblock_header_gate(&easy, true, &params), CmpctHeaderGate::HighHash);
+
+        // A mainnet-difficulty header with an ordinary hash fails PoW.
+        let mainnet = ChainParams::mainnet();
+        let mut hard = header.clone();
+        hard.bits = 0x1d00ffff;
+        assert_eq!(cmpctblock_header_gate(&hard, true, &mainnet), CmpctHeaderGate::HighHash);
     }
 
     /// Three-transaction block used by the compact-block serving tests.

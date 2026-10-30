@@ -4986,13 +4986,19 @@ impl Mempool {
             .and_then(|txid| self.transactions.get(txid))
     }
 
-    /// Collect all mempool transactions as (wtxid, Arc<Transaction>) pairs.
+    /// Every mempool transaction as a (wtxid, tx) pair, by reference.
     /// Used for BIP152 compact block reconstruction.
-    pub fn collect_for_compact_block(&self) -> Vec<(Hash256, Arc<Transaction>)> {
-        self.transactions.values().map(|entry| {
-            let wtxid = entry.tx.wtxid();
-            (wtxid, Arc::new(entry.tx.clone()))
-        }).collect()
+    ///
+    /// The wtxid comes from the maintained `wtxid_index`, so nothing is
+    /// re-serialized, re-hashed or cloned; the caller clones only the
+    /// transactions a compact block actually matches (Core's InitData walks
+    /// the mempool the same way, by reference with cached wtxids). The old
+    /// `collect_for_compact_block` deep-cloned and re-hashed the whole
+    /// mempool for every `cmpctblock` received (audit H1).
+    pub fn iter_by_wtxid(&self) -> impl Iterator<Item = (&Hash256, &Transaction)> {
+        self.wtxid_index
+            .iter()
+            .filter_map(move |(wtxid, txid)| self.transactions.get(txid).map(|e| (wtxid, &e.tx)))
     }
 
     /// Iterate over all mempool entries.
