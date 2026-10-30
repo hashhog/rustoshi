@@ -246,6 +246,12 @@ struct Cli {
     #[arg(long, default_value = "9332")]
     metrics_port: u16,
 
+    /// Address the metrics/health listener binds. The endpoint has no
+    /// authentication, so it defaults to loopback like `--rpcbind`; pass
+    /// `0.0.0.0` (or a LAN address) only behind a firewall.
+    #[arg(long = "metricsbind", default_value = "127.0.0.1", value_name = "ADDR")]
+    metricsbind: String,
+
     /// P2P liveness watchdog: restart (exit 1) if no inbound P2P activity for
     /// this many seconds while >=1 peer is connected. 0 disables. Default 900
     /// (15 min): healthy nodes see ping/inv within ~2 min, so 15 min of total
@@ -1720,8 +1726,22 @@ fn resolve_datadir(datadir: &str, params: &ChainParams) -> PathBuf {
 // PROMETHEUS METRICS SERVER
 // ============================================================
 
+/// Idle-client timeout for the metrics listener: a client that has not sent
+/// its request (or not drained the reply) by then is dropped. Matches Core's
+/// `DEFAULT_HTTP_SERVER_TIMEOUT` (`-rpcservertimeout`, 30 s).
+const METRICS_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Concurrent metrics connections. Further clients wait in the kernel accept
+/// backlog, which costs no fd in this process, so a flood of idle sockets
+/// cannot starve RPC, REST, P2P or RocksDB of file descriptors.
+const METRICS_MAX_CONNECTIONS: usize = 16;
+
 /// Start a lightweight HTTP server that serves Prometheus-format metrics.
+///
+/// Unauthenticated, so it binds `bind` (loopback by default), times out idle
+/// clients and caps concurrent connections (security audit C4).
 async fn start_metrics_server(
+    bind: String,
     port: u16,
     rpc_state: Arc<RwLock<RpcState>>,
     peer_state: Arc<RwLock<PeerState>>,
@@ -1729,7 +1749,13 @@ async fn start_metrics_server(
     if port == 0 {
         return;
     }
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = match bind.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port),
+        Err(e) => {
+            tracing::warn!("Metrics server not started: bad --metricsbind {:?}: {}", bind, e);
+            return;
+        }
+    };
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -1739,91 +1765,117 @@ async fn start_metrics_server(
     };
     tracing::info!("Prometheus metrics server listening on {}", addr);
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(METRICS_MAX_CONNECTIONS));
     loop {
-        let (mut stream, _) = match listener.accept().await {
+        // Take a slot before accepting so excess clients never get an fd.
+        let permit = match slots.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let (stream, _) = match listener.accept().await {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                // EMFILE/ENFILE persist until something closes; retrying at
+                // once spins a core (audit C4 saw 211% CPU).
+                tracing::warn!("Metrics server accept error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let rpc_state = rpc_state.clone();
         let peer_state = peer_state.clone();
         tokio::spawn(async move {
-            // Read the HTTP request line so we can route by path.
-            let mut buf = [0u8; 4096];
-            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await
-                .unwrap_or(0);
-            let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
-            // Extract first request line, then the path token.
-            let path = req.lines().next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("/")
-                .to_string();
-
-            // /health: minimal liveness endpoint for process supervisors.
-            // Returns 200 once the node has booted (we're inside the running
-            // metrics task, which only starts after RPC is up). Body is
-            // small JSON so curl/jq scripts can consume it.
-            if path == "/health" || path == "/healthz" || path == "/livez" {
-                let height = {
-                    let state = rpc_state.read().await;
-                    state.best_height
-                };
-                let peers = {
-                    let ps = peer_state.read().await;
-                    ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
-                };
-                let body = format!(
-                    "{{\"status\":\"ok\",\"height\":{},\"peers\":{}}}\n",
-                    height, peers
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: application/json\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\r\n{}",
-                    body.len(), body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-                return;
-            }
-
-            // Default: Prometheus /metrics body.
-            let (height, mempool_size) = {
-                let state = rpc_state.read().await;
-                (state.best_height, state.mempool.size())
-            };
-            let peers = {
-                let ps = peer_state.read().await;
-                ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
-            };
-
-            let script_checks = read_script_checks_total();
-            let body = format!(
-                "# HELP bitcoin_blocks_total Current block height\n\
-                 # TYPE bitcoin_blocks_total gauge\n\
-                 bitcoin_blocks_total {}\n\
-                 # HELP bitcoin_peers_connected Number of connected peers\n\
-                 # TYPE bitcoin_peers_connected gauge\n\
-                 bitcoin_peers_connected {}\n\
-                 # HELP bitcoin_mempool_size Mempool transaction count\n\
-                 # TYPE bitcoin_mempool_size gauge\n\
-                 bitcoin_mempool_size {}\n\
-                 # HELP bitcoin_script_checks_total Input scripts actually verified (not skipped via assumevalid)\n\
-                 # TYPE bitcoin_script_checks_total counter\n\
-                 bitcoin_script_checks_total {}\n",
-                height, peers, mempool_size, script_checks,
-            );
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
+            let _permit = permit;
+            let _ = tokio::time::timeout(
+                METRICS_IO_TIMEOUT,
+                serve_metrics_conn(stream, rpc_state, peer_state),
+            )
+            .await;
         });
     }
+}
+
+/// Answer one metrics/health request on `stream`.
+async fn serve_metrics_conn(
+    mut stream: tokio::net::TcpStream,
+    rpc_state: Arc<RwLock<RpcState>>,
+    peer_state: Arc<RwLock<PeerState>>,
+) {
+    // Read the HTTP request line so we can route by path.
+    let mut buf = [0u8; 4096];
+    let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await
+        .unwrap_or(0);
+    let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    // Extract first request line, then the path token.
+    let path = req.lines().next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string();
+
+    // /health: minimal liveness endpoint for process supervisors.
+    // Returns 200 once the node has booted (we're inside the running
+    // metrics task, which only starts after RPC is up). Body is
+    // small JSON so curl/jq scripts can consume it.
+    if path == "/health" || path == "/healthz" || path == "/livez" {
+        let height = {
+            let state = rpc_state.read().await;
+            state.best_height
+        };
+        let peers = {
+            let ps = peer_state.read().await;
+            ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
+        };
+        let body = format!(
+            "{{\"status\":\"ok\",\"height\":{},\"peers\":{}}}\n",
+            height, peers
+        );
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        return;
+    }
+
+    // Default: Prometheus /metrics body.
+    let (height, mempool_size) = {
+        let state = rpc_state.read().await;
+        (state.best_height, state.mempool.size())
+    };
+    let peers = {
+        let ps = peer_state.read().await;
+        ps.peer_manager.as_ref().map_or(0, |pm| pm.peer_count() as u32)
+    };
+
+    let script_checks = read_script_checks_total();
+    let body = format!(
+        "# HELP bitcoin_blocks_total Current block height\n\
+         # TYPE bitcoin_blocks_total gauge\n\
+         bitcoin_blocks_total {}\n\
+         # HELP bitcoin_peers_connected Number of connected peers\n\
+         # TYPE bitcoin_peers_connected gauge\n\
+         bitcoin_peers_connected {}\n\
+         # HELP bitcoin_mempool_size Mempool transaction count\n\
+         # TYPE bitcoin_mempool_size gauge\n\
+         bitcoin_mempool_size {}\n\
+         # HELP bitcoin_script_checks_total Input scripts actually verified (not skipped via assumevalid)\n\
+         # TYPE bitcoin_script_checks_total counter\n\
+         bitcoin_script_checks_total {}\n",
+        height, peers, mempool_size, script_checks,
+    );
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
 }
 
 /// Get the appropriate RPC port for a network.
@@ -3339,6 +3391,7 @@ fn apply_conf_to_cli(cli: &mut Cli, conf: &ConfFile, raw_argv: &[String]) {
             }
         }
     }
+    merge_str!(metricsbind, "metricsbind");
     if !was_set(raw_argv, "p2p-watchdog-secs") && !was_set(raw_argv, "p2p_watchdog_secs") {
         if let Some(v) = conf.get("p2p_watchdog_secs") {
             if let Ok(n) = v.parse::<u64>() {
@@ -4729,6 +4782,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     // Start Prometheus metrics server
     tokio::spawn(start_metrics_server(
+        cli.metricsbind.clone(),
         cli.metrics_port,
         rpc_state.clone(),
         peer_state.clone(),
