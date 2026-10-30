@@ -2099,7 +2099,17 @@ impl WalletRpcImpl {
         //    privkey-enabled wallets) import any WIF secrets so the funds are
         //    spendable, mirroring AddWalletDescriptor's key import.
         let label = request.label.clone().unwrap_or_default();
-        let canonical = desc_str.to_string();
+        // Keep only the public form of a private descriptor: `canonical` is
+        // persisted to wallet.sqlite and shown by listdescriptors and
+        // getaddressinfo.parent_desc, and must never carry a WIF or xprv
+        // (Core prints desc->ToString() without secrets there). Storing the
+        // descriptor as given left the raw key on disk, outside the reach of
+        // encryptwallet (security audit H6).
+        let canonical = if info.has_private_keys {
+            parsed.to_string_with_checksum()
+        } else {
+            desc_str.to_string()
+        };
         wallet
             .register_descriptor(&canonical, &parsed, &label, range_end)
             .map_err(|e| {

@@ -104,7 +104,24 @@ pub struct WalletMeta {
 
 impl WalletDb {
     /// Open or create a wallet database.
+    ///
+    /// On Unix the file is created (or tightened, for an existing wallet)
+    /// at mode 0600 before SQLite opens it, as Core does with umask 077:
+    /// it holds wallet metadata, and SQLite gives its journal the same mode.
     pub fn open(path: &Path) -> Result<Self, WalletError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(WalletError::Io)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(WalletError::Io)?;
+        }
         let conn = Connection::open(path)
             .map_err(|e| WalletError::Io(std::io::Error::other(e.to_string())))?;
 
