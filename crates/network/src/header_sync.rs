@@ -471,9 +471,30 @@ impl HeaderSync {
             return Err("too many headers".into());
         }
 
+        // Core CheckHeadersPoW (net_processing.cpp): the whole batch must be
+        // continuous and every header must meet the target it declares BEFORE
+        // anything looks at its work or where it connects. The fork-work
+        // compare below sums the declared nBits; without this an unmined
+        // header declaring target 1 (proof ~2^255) out-weighed the whole real
+        // chain and rewound the header tip to its parent (audit H2).
+        for pair in headers.windows(2) {
+            if pair[1].prev_block_hash != pair[0].block_hash() {
+                return Err("headers not connected".into());
+            }
+        }
+        if headers.iter().any(|h| !h.validate_pow_against_declared_target()) {
+            return Err("bad proof of work".into());
+        }
+
         // Validate header chain connectivity
         let mut prev_hash = self.best_header_hash;
         let mut base_height = self.best_header_height;
+        // Heavier-fork rewind point. Committed to `best_header_*` and
+        // `pending_rewind` only once every header in the batch has been
+        // validated and stored: a batch that fails part-way must not leave
+        // the header tip or the block-download floor at the fork point
+        // (audit H2).
+        let mut fork_rewind: Option<(u32, Hash256)> = None;
 
         // Check if the first header connects to our tip. If not, see if it
         // connects to an earlier block in our chain (fork/reorg scenario).
@@ -495,8 +516,16 @@ impl HeaderSync {
                 for h in &headers {
                     fork_work = fork_work.saturating_add(&get_block_proof(h.bits));
                 }
+                // Stop as soon as our suffix has at least the fork's work: the
+                // answer ("not heavier") cannot change past that point. The
+                // fork's work is PoW-proven above, so a cheap header forking
+                // deep (e.g. at height 1) costs a read or two instead of one
+                // per height of our chain (audit H3).
                 let mut our_work = ChainWork::ZERO;
                 for height in (fork_height + 1)..=old_best {
+                    if our_work >= fork_work {
+                        break;
+                    }
                     if let Some(bits) = get_existing_header_bits(height) {
                         our_work = our_work.saturating_add(&get_block_proof(bits));
                     }
@@ -518,24 +547,12 @@ impl HeaderSync {
                 }
 
                 tracing::info!(
-                    "Headers from peer {} fork from height {} (hash {}), HEAVIER (fork_work {} > our_work {}); rewinding header tip from height {}",
+                    "Headers from peer {} fork from height {} (hash {}), HEAVIER (fork_work {} > our_work {}); rewinding header tip from height {} once the batch validates",
                     peer_id.0, fork_height, fork_prev, fork_work, our_work, self.best_header_height
                 );
-                self.best_header_height = fork_height;
-                self.best_header_hash = *fork_prev;
                 prev_hash = *fork_prev;
                 base_height = fork_height;
-                // Reorg Unit E (E3): record the fork point so the block-download
-                // enqueue floors at min(chainstate_tip, fork_height) and
-                // requests the fork's bodies below the active tip. Sticky and
-                // min-across-batches: a multi-batch fork rewinds on its first
-                // batch (which may be a full Ok(true) batch that does not itself
-                // enqueue); the lowest fork point must survive until the caller
-                // consumes it via take_pending_rewind.
-                self.pending_rewind = Some(match self.pending_rewind {
-                    Some(existing) => existing.min(fork_height),
-                    None => fork_height,
-                });
+                fork_rewind = Some((fork_height, *fork_prev));
             } else {
                 return Err(format!(
                     "first header prev_hash {} doesn't match our tip {} and is not in our chain",
@@ -565,15 +582,29 @@ impl HeaderSync {
             // closure the caller supplies (rustoshi/src/main.rs runs
             // `check_proof_of_work` and `diffbits_gate_for_header` there); this
             // just rejects the obviously-bogus without paying for a store walk.
-            if !header.validate_pow_against_declared_target() {
-                return Err("bad proof of work".into());
-            }
+            // (Run for the whole batch above, before the fork-work compare.)
 
             // Store and validate the header — this is where the params-aware
             // PoW / difficulty gates actually run.
             validate_and_store(header, height)?;
 
             prev_hash = header.block_hash();
+        }
+
+        if let Some((fork_height, fork_prev)) = fork_rewind {
+            self.best_header_height = fork_height;
+            self.best_header_hash = fork_prev;
+            // Reorg Unit E (E3): record the fork point so the block-download
+            // enqueue floors at min(chainstate_tip, fork_height) and
+            // requests the fork's bodies below the active tip. Sticky and
+            // min-across-batches: a multi-batch fork rewinds on its first
+            // batch (which may be a full Ok(true) batch that does not itself
+            // enqueue); the lowest fork point must survive until the caller
+            // consumes it via take_pending_rewind.
+            self.pending_rewind = Some(match self.pending_rewind {
+                Some(existing) => existing.min(fork_height),
+                None => fork_height,
+            });
         }
 
         // Update our best header
@@ -768,8 +799,10 @@ mod tests {
             last_hash: genesis_hash,
         };
 
-        // Create a header that doesn't connect to genesis
-        let bad_header = make_test_header(Hash256([1; 32]), 0);
+        // Create a header that doesn't connect to genesis. Mined, so it gets
+        // past the batch PoW check (which, as in Core, runs first) and the
+        // connectivity check is what rejects it.
+        let bad_header = make_valid_header_chain(Hash256([1; 32]), 1).remove(0);
 
         let result = sync.process_headers(
             peer,
@@ -780,6 +813,32 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("prev_hash"));
+    }
+
+    /// Core CheckHeadersPoW runs before the unconnecting check: a header
+    /// that fails its own declared target is "bad proof of work" whether or
+    /// not it connects (audit H2).
+    #[test]
+    fn test_process_headers_bad_pow_checked_before_connectivity() {
+        let genesis_hash = Hash256([0; 32]);
+        let mut sync = HeaderSync::new(genesis_hash);
+        let peer = PeerId(1);
+        sync.register_peer(peer, 100);
+        sync.state = SyncState::DownloadingHeaders {
+            peer,
+            last_hash: genesis_hash,
+        };
+
+        let mut unmined = make_test_header(Hash256([1; 32]), 0);
+        unmined.bits = 0x0300_0001; // target 1: no hash meets it
+        let result = sync.process_headers(
+            peer,
+            vec![unmined],
+            &mut |_, _| Ok(()),
+            &|_| None,
+            &|_| None,
+        );
+        assert_eq!(result, Err("bad proof of work".to_string()));
     }
 
     #[test]
