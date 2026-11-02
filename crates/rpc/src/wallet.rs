@@ -2349,7 +2349,9 @@ impl WalletRpcServer for WalletRpcImpl {
             Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
         })?;
 
-        let trusted = Self::sats_to_btc(wallet_guard.confirmed_balance());
+        // Core's GetBalance puts immature coinbase only in `immature`, never
+        // in `trusted`; spendable_balance is confirmed AND mature.
+        let trusted = Self::sats_to_btc(wallet_guard.spendable_balance());
         let untrusted = Self::sats_to_btc(wallet_guard.unconfirmed_balance());
         let immature = Self::sats_to_btc(wallet_guard.immature_balance());
         let lastprocessedblock = Self::last_processed_block(&state);
@@ -3021,7 +3023,8 @@ impl WalletRpcServer for WalletRpcImpl {
             Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
         })?;
 
-        let balance = Self::sats_to_btc(wallet_guard.confirmed_balance());
+        // getwalletinfo.balance is getbalances' mine.trusted (immature excluded).
+        let balance = Self::sats_to_btc(wallet_guard.spendable_balance());
         let unconfirmed_balance = Self::sats_to_btc(wallet_guard.unconfirmed_balance());
         let immature_balance = Self::sats_to_btc(wallet_guard.immature_balance());
         // Core getwalletinfo.txcount is mapWallet.size() (confirmed + mempool

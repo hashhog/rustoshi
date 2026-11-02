@@ -2614,8 +2614,14 @@ impl Wallet {
                     }
                 }
 
-                // Receive / generate line items for wallet-owned outputs.
-                for (vout, value, _is_change, addr) in &credit_outs {
+                // Receive / generate line items for wallet-owned outputs. On a
+                // tx the wallet funded, change gets no line at all (Core's
+                // CachedTxGetAmounts skips IsChange outputs when nDebit > 0,
+                // before either the send or the receive push).
+                for (vout, value, is_change, addr) in &credit_outs {
+                    if debit_sats > 0 && *is_change {
+                        continue;
+                    }
                     let category = if is_cb { "generate" } else { "receive" };
                     details.push(TxDetail {
                         address: addr.clone(),

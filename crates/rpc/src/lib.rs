@@ -59,6 +59,8 @@ mod submitblock_wallet_tests;
 #[cfg(test)]
 mod listunspent_immature_tests;
 #[cfg(test)]
+mod wallet_change_balance_tests;
+#[cfg(test)]
 mod invalidated_submit_tests;
 #[cfg(test)]
 mod submitpackage_result_tests;
