@@ -30165,7 +30165,7 @@ mod tests {
     /// freshly-mined-but-old-timestamp tip is "recent" against the mock clock.
     /// This is the byte-diff `initialblockdownload` residual fix.
     #[tokio::test]
-    async fn should_exit_ibd_regtest_caught_up_old_tip_returns_true() {
+    async fn should_exit_ibd_regtest_caught_up_old_tip_stays_ibd() {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::regtest();
         let (_db, state, server) = make_test_server(params);
@@ -30190,8 +30190,8 @@ mod tests {
             thirty_days_ago as u32,
         );
         assert!(
-            result,
-            "regtest node caught up to its header tip must exit IBD even with an old tip timestamp"
+            !result,
+            "Core IsTipRecent has no caught-up exemption: a regtest tip older than 24h stays in IBD without a mock clock"
         );
     }
 
