@@ -11123,6 +11123,22 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // advance (Core KernelNotifications::blockTip on ConnectTip).
                 state.notify_tip_changed();
 
+                // Wallet UTXO ledger: scan the connected block into every
+                // loaded wallet, as the generate* path and the P2P connect
+                // path do (Core CWallet::blockConnected on ConnectTip).
+                // Without it a chain built with submitblock never credits
+                // coinbases paid to wallet addresses. Best-effort: a wallet
+                // failure must not roll back an already-persisted block.
+                if let Some(ws) = state.wallet_state.clone() {
+                    let ws_guard = ws.read().await;
+                    ws_guard.wallet_manager.scan_block_all_wallets(
+                        &block.transactions,
+                        new_height,
+                        block_hash,
+                        block.header.timestamp as u64,
+                    );
+                }
+
                 // Remove confirmed (and conflicting) transactions from the
                 // mempool — mirrors Bitcoin Core's `CTxMemPool::removeForBlock`
                 // on ConnectTip, and the P2P block-connect path in
