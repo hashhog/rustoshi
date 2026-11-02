@@ -57,6 +57,8 @@ mod fallbackfee_tests;
 #[cfg(test)]
 mod submitblock_wallet_tests;
 #[cfg(test)]
+mod listunspent_immature_tests;
+#[cfg(test)]
 mod invalidated_submit_tests;
 #[cfg(test)]
 mod submitpackage_result_tests;

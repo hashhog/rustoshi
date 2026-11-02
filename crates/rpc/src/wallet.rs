@@ -2371,7 +2371,7 @@ impl WalletRpcServer for WalletRpcImpl {
         maxconf: Option<u32>,
         addresses: Option<Vec<String>>,
         _include_unsafe: Option<bool>,
-        _query_options: Option<serde_json::Value>,
+        query_options: Option<serde_json::Value>,
     ) -> RpcResult<Vec<UnspentOutput>> {
         let state = self.state.read().await;
 
@@ -2416,9 +2416,20 @@ impl WalletRpcServer for WalletRpcImpl {
             None
         };
 
+        // Core coins.cpp ListUnspent -> AvailableCoins: a coinbase with blocks
+        // to maturity > 0 is skipped (wallet/spend.cpp
+        // `IsTxImmatureCoinBase && !include_immature_coinbase`) unless
+        // query_options.include_immature_coinbase is true.
+        let include_immature = query_options
+            .as_ref()
+            .and_then(|o| o.get("include_immature_coinbase"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let utxos: Vec<UnspentOutput> = wallet_guard
             .list_unspent()
             .iter()
+            .filter(|utxo| include_immature || wallet_guard.is_mature(utxo))
             .filter(|utxo| {
                 utxo.confirmations >= min_confirmations && utxo.confirmations <= max_confirmations
             })
@@ -2439,9 +2450,8 @@ impl WalletRpcServer for WalletRpcImpl {
                     }
                 }
 
-                // Immature coinbase is listed but flagged non-spendable, the
-                // way Core's listunspent reports `spendable=false` for coins
-                // that fail IsSpendable (incl. coinbase under 100 confs).
+                // Immature coinbase only reaches here with
+                // include_immature_coinbase=true; it is flagged non-spendable.
                 let spendable = wallet_guard.is_spendable(utxo);
                 // Watched (descriptor-imported) coins report their
                 // descriptor's solvability — false for addr()/raw(), matching
