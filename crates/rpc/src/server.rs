@@ -4577,42 +4577,19 @@ impl RpcServerImpl {
             }
         }
 
-        // Condition 2: tip wallclock age must be < max_tip_age (24h).
+        // Condition 2: tip age must be < max_tip_age (24h).
         // Mirrors Core's `IsTipRecent`:
         //   tip->Time() >= Now<NodeSeconds>() - max_tip_age
-        let max_tip_age_secs: u64 = 24 * 60 * 60;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let tip_age = now.saturating_sub(tip_timestamp as u64);
+        // `Now` honors `setmocktime` (as in Core), so a regtest chain mined
+        // under a mock clock is "recent" only while the mock clock is near
+        // the tip. A regtest chain with old timestamps and no mock clock
+        // stays in IBD, exactly as Core reports it (core-regtest
+        // chain/info/*:initialblockdownload).
+        let max_tip_age_secs: i64 = 24 * 60 * 60;
+        let now = rustoshi_consensus::mempool::current_unix_seconds();
+        let tip_age = now.saturating_sub(tip_timestamp as i64);
 
-        if tip_age < max_tip_age_secs {
-            return true;
-        }
-
-        // Regtest parity: Core's `IsTipRecent` reads `Now<NodeSeconds>()`,
-        // which honors `-mocktime`. Regtest chains are mined under a pinned
-        // mocktime (e.g. 1700000000), so Core sees the freshly-mined tip as
-        // "recent" and latches IBD=false — even though the block timestamp is
-        // years behind real wall-clock. rustoshi has no mock clock, so the
-        // wall-clock gate above would never fire on a mocktime regtest chain.
-        //
-        // We match Core's effective regtest outcome WITHOUT a mock clock: a
-        // regtest node that has connected the most-work chain it knows about
-        // (block tip == best header tip, so there are no further headers to
-        // download) and that has met the chainwork bar (checked above; regtest
-        // min_chain_work == 0) is fully synced — nothing left to fetch — so it
-        // is not in IBD. This is scoped to regtest ONLY; mainnet/testnet keep
-        // the exact Core wall-clock tip-age gate (and their large
-        // min_chain_work keeps a genuinely-behind node in IBD via Condition 1).
-        if state.params.network_id == NetworkId::Regtest
-            && state.best_height == state.header_height
-        {
-            return true;
-        }
-
-        false
+        tip_age < max_tip_age_secs
     }
 }
 
@@ -30181,7 +30158,7 @@ mod tests {
     /// freshly-mined-but-old-timestamp tip is "recent" against the mock clock.
     /// This is the byte-diff `initialblockdownload` residual fix.
     #[tokio::test]
-    async fn should_exit_ibd_regtest_caught_up_old_tip_returns_true() {
+    async fn should_exit_ibd_regtest_caught_up_old_tip_stays_ibd() {
         use rustoshi_consensus::ChainParams;
         let params = ChainParams::regtest();
         let (_db, state, server) = make_test_server(params);
@@ -30194,7 +30171,7 @@ mod tests {
         }
         let st = state.read().await;
         // Tip timestamp ~30 days ago (mocktime-old) → wall-clock age gate
-        // would say "not recent", but the caught-up relaxation flips it.
+        // says "not recent" and there is no caught-up exemption.
         let thirty_days_ago = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -30206,13 +30183,12 @@ mod tests {
             thirty_days_ago as u32,
         );
         assert!(
-            result,
-            "regtest node caught up to its header tip must exit IBD even with an old tip timestamp"
+            !result,
+            "Core IsTipRecent has no caught-up exemption: a regtest tip older than 24h stays in IBD without a mock clock"
         );
     }
 
-    /// Counterpart: the regtest caught-up relaxation must NOT leak into
-    /// mainnet — a mainnet node with a 30-day-old tip stays in IBD even if
+    /// Counterpart: mainnet — a mainnet node with a 30-day-old tip stays in IBD even if
     /// block tip == header tip, because Core there uses the real wall clock.
     #[tokio::test]
     async fn should_exit_ibd_mainnet_caught_up_old_tip_stays_ibd() {
@@ -30239,7 +30215,7 @@ mod tests {
         );
         assert!(
             !result,
-            "mainnet must keep the wall-clock tip-age gate — the regtest caught-up relaxation must not apply"
+            "mainnet must keep the wall-clock tip-age gate (no regtest-only relaxation leaks into mainnet)"
         );
     }
 
