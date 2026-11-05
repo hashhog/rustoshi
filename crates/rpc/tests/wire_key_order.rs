@@ -271,18 +271,16 @@ fn gettxoutsetinfo_value_order_matches_core() {
     result.insert("txouts".into(), serde_json::json!(2));
     result.insert("bogosize".into(), serde_json::json!(3));
     result.insert("hash_serialized_3".into(), serde_json::json!("hs"));
-    result.insert("hash_serialized_2".into(), serde_json::json!("hs"));
     result.insert("total_amount".into(), serde_json::json!(0.0));
     result.insert("transactions".into(), serde_json::json!(4));
     result.insert("disk_size".into(), serde_json::json!(0));
     let s = serde_json::to_string(&serde_json::Value::Object(result)).unwrap();
     let got = top_level_keys(&s);
     // Core: height, bestblock, txouts, bogosize, hash_serialized_3, total_amount,
-    // transactions, disk_size. (hash_serialized_2 is a rustoshi-only alias kept
-    // adjacent to the canonical key.)
+    // transactions, disk_size.
     let want = [
         "height", "bestblock", "txouts", "bogosize", "hash_serialized_3",
-        "hash_serialized_2", "total_amount", "transactions", "disk_size",
+        "total_amount", "transactions", "disk_size",
     ];
     assert_eq!(got, want, "gettxoutsetinfo key order");
 }

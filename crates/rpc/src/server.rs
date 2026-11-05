@@ -2699,12 +2699,6 @@ impl RpcServerImpl {
         if let Some(hex_str) = hash_serialized_hex {
             result.insert(
                 "hash_serialized_3".to_string(),
-                serde_json::Value::String(hex_str.clone()),
-            );
-            // Back-compat alias for older clients / diff-test tolerance (not a
-            // Core field; kept adjacent to the canonical key).
-            result.insert(
-                "hash_serialized_2".to_string(),
                 serde_json::Value::String(hex_str),
             );
         }
@@ -31738,6 +31732,31 @@ mod tests {
         assert_eq!(after["height"], 2);
         assert_eq!(after["txouts"], 3);
         assert_ne!(after["hash_serialized_3"], before["hash_serialized_3"]);
+    }
+
+    /// Core v31.1 `gettxoutsetinfo` (rpc/blockchain.cpp) emits `hash_serialized_3`
+    /// and no `hash_serialized_2`; the core-regtest operator rows
+    /// `operator/gettxoutsetinfo/{default,hash_serialized_3}:hash_serialized_2`
+    /// flagged the extra back-compat alias.
+    #[tokio::test]
+    async fn gettxoutsetinfo_has_no_hash_serialized_2_alias() {
+        let server = setup_test_server();
+        {
+            let st = server.state.read().await;
+            let store = BlockStore::new(&st.db);
+            store
+                .put_utxo(
+                    &OutPoint { txid: Hash256([1; 32]), vout: 0 },
+                    &CoinEntry { height: 1, is_coinbase: false, value: 1000, script_pubkey: vec![0x51] },
+                )
+                .unwrap();
+            store.set_best_block(&Hash256([0xaa; 32]), 1).unwrap();
+        }
+        for ht in [None, Some("hash_serialized_3".to_string())] {
+            let r = server.get_tx_out_set_info(ht, None, None).await.unwrap();
+            assert!(r.get("hash_serialized_3").is_some(), "canonical key missing: {r}");
+            assert!(r.get("hash_serialized_2").is_none(), "non-Core alias present: {r}");
+        }
     }
 
     /// Mainnet restart of 9d231620, 2026-10-19: `getblockchaininfo` walked
