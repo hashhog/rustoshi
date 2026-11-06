@@ -12639,7 +12639,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             let _ = tx.send(());
         }
 
-        Ok("Rustoshi server stopping".to_string())
+        Ok("Bitcoin Core stopping".to_string())
     }
 
     async fn validate_address(&self, address: String) -> RpcResult<ValidateAddressResult> {
@@ -22158,7 +22158,8 @@ mod tests {
         assert!(rx.try_recv().is_err(), "a rejected stop must not request shutdown");
 
         let reply = RustoshiRpcServer::stop(&rpc, None).await.expect("stop ok");
-        assert!(reply.contains("stopping"), "reply: {reply}");
+        // Core rpc/server.cpp: CLIENT_NAME " stopping" ("Bitcoin Core stopping").
+        assert_eq!(reply, "Bitcoin Core stopping");
         assert!(rx.try_recv().is_ok(), "stop must fire the shutdown signal");
         assert!(state.read().await.shutdown_tx.is_none(), "sender consumed");
 
