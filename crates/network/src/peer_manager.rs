@@ -9712,6 +9712,10 @@ mod tests {
 /// `send_pings` and `maybe_send_feefilters` awaited the stuck peer's channel
 /// forever (no writer drains it here) → timeout → FAIL.
 #[cfg(test)]
+#[path = "sm_sweep_peer_tests.rs"]
+mod sm_sweep_peer_tests;
+
+#[cfg(test)]
 mod nonblocking_fanout_tests {
     use super::*;
     use crate::message::{InvType, InvVector};
