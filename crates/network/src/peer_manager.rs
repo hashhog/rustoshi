@@ -481,6 +481,34 @@ pub const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 /// = MAX_ADDR_TO_SEND = 1000).
 pub const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1000.0;
 
+/// The block hashes a message announces, in the order Core feeds them to
+/// `UpdateBlockAvailability` (net_processing.cpp): the last header of a
+/// `headers` message (`headers.back()`), every block `inv` whose type is
+/// MSG_BLOCK (`inv.IsMsgBlk()`, protocol.h: `type == MSG_BLOCK` only), and
+/// the header of a `cmpctblock`. Every other message announces nothing.
+pub fn announced_block_hashes(msg: &NetworkMessage) -> Vec<rustoshi_primitives::Hash256> {
+    use crate::message::InvType;
+    match msg {
+        NetworkMessage::Headers(headers) => {
+            headers.last().map(|h| vec![h.block_hash()]).unwrap_or_default()
+        }
+        NetworkMessage::Inv(items) => items
+            .iter()
+            .filter(|i| i.inv_type == InvType::MsgBlock)
+            .map(|i| i.hash)
+            .collect(),
+        NetworkMessage::CmpctBlock(data) => {
+            use rustoshi_primitives::serialize::Decodable;
+            // The header is the first 80 bytes of the payload.
+            let mut cur = std::io::Cursor::new(data.as_slice());
+            rustoshi_primitives::BlockHeader::decode(&mut cur)
+                .map(|h| vec![h.block_hash()])
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Compute the getaddr 23%-cap over an addrman of `size` entries: the number of
 /// addresses we are willing to return in a single getaddr response, i.e.
 /// min(MAX_ADDR, floor(23 * size / 100)). Mirrors Core's `GetAddr_` cap
@@ -5442,6 +5470,89 @@ impl PeerManager {
         &self.stale_detector
     }
 
+    /// Record that `peer_id` announced block `hash` (Core
+    /// `UpdateBlockAvailability`, net_processing.cpp). This is what keeps the
+    /// chain-sync eviction check (`check_for_stale_peers` ->
+    /// `StalePeerDetector::check_chain_sync`, Core `ConsiderEviction`) from
+    /// treating a peer that keeps up with our tip as one that never caught
+    /// up. Call it for the last header of every `headers` message, every
+    /// block `inv`, and every `cmpctblock`, before processing the message;
+    /// an announcement not yet in our index is resolved later by
+    /// [`PeerManager::process_block_availability`].
+    ///
+    /// `lookup_height` maps a hash to its height in our block index (Core
+    /// `LookupBlockIndex`; any indexed block counts, as in Core).
+    pub fn update_block_availability<F>(&mut self, peer_id: PeerId, hash: rustoshi_primitives::Hash256, lookup_height: F)
+    where
+        F: Fn(&rustoshi_primitives::Hash256) -> Option<u32>,
+    {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.stale_state.update_block_availability(hash, &lookup_height);
+        }
+    }
+
+    /// Core `ProcessBlockAvailability` for every peer: resolve each peer's
+    /// last unknown announced block against the index. Call before
+    /// `check_for_stale_peers` so headers that landed since the
+    /// announcement count (Core calls it from `UpdateBlockAvailability`,
+    /// `FindNextBlocksToDownload` and `SendMessages`, which runs
+    /// `ConsiderEviction`).
+    pub fn process_block_availability<F>(&mut self, lookup_height: F)
+    where
+        F: Fn(&rustoshi_primitives::Hash256) -> Option<u32>,
+    {
+        for peer in self.peers.values_mut() {
+            peer.stale_state.resolve_last_unknown_block(&lookup_height);
+        }
+    }
+
+    /// Send the chain-sync getheaders to each peer `check_for_stale_peers`
+    /// listed in `send_getheaders_to`. Core `ConsiderEviction` sends
+    /// `getheaders(GetLocator(m_work_header->pprev))`: the locator starts
+    /// one below the tip we benchmarked the peer against, so a peer that is
+    /// at that tip answers with at least that header, which raises its best
+    /// known block and clears the timeout. Without it a peer that is in
+    /// sync but has announced nothing since it connected (no new block for
+    /// 20 minutes) is disconnected. Returns how many requests were queued.
+    pub fn send_chain_sync_getheaders<F>(&self, peers: &[PeerId], get_hash_at_height: F) -> usize
+    where
+        F: Fn(u32) -> Option<rustoshi_primitives::Hash256>,
+    {
+        let mut sent = 0;
+        for peer_id in peers {
+            let Some(peer) = self.peers.get(peer_id) else { continue };
+            let Some(work_height) = peer.stale_state.chain_sync.work_header_height else {
+                continue;
+            };
+            let locator = crate::header_sync::block_locator_from_height(
+                work_height.saturating_sub(1),
+                &get_hash_at_height,
+            );
+            if locator.is_empty() {
+                tracing::info!(
+                    "Peer {} chain-sync getheaders not sent: no locator below height {}",
+                    peer_id.0,
+                    work_height
+                );
+                continue;
+            }
+            let msg = NetworkMessage::GetHeaders(crate::message::GetHeadersMessage {
+                version: PROTOCOL_VERSION as u32,
+                locator_hashes: locator,
+                hash_stop: rustoshi_primitives::Hash256::ZERO,
+            });
+            if self.try_send_to_peer(*peer_id, msg) {
+                sent += 1;
+            } else {
+                tracing::info!(
+                    "Peer {} chain-sync getheaders not sent: command queue full or closed",
+                    peer_id.0
+                );
+            }
+        }
+        sent
+    }
+
     /// Get a mutable reference to a peer's stale state (for testing).
     #[cfg(test)]
     pub fn get_peer_stale_state_mut(&mut self, peer_id: PeerId) -> Option<&mut StalePeerState> {
@@ -9714,6 +9825,10 @@ mod tests {
 #[cfg(test)]
 #[path = "sm_sweep_peer_tests.rs"]
 mod sm_sweep_peer_tests;
+
+#[cfg(test)]
+#[path = "chain_sync_availability_tests.rs"]
+mod chain_sync_availability_tests;
 
 #[cfg(test)]
 mod nonblocking_fanout_tests {

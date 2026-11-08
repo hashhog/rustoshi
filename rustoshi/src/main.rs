@@ -6572,6 +6572,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         {
                             continue;
                         }
+                        // Core UpdateBlockAvailability: note what this peer
+                        // announced (last header / block inv / cmpctblock)
+                        // so chain-sync eviction sees a peer that keeps up
+                        // with our tip. Before this, the best-known height
+                        // it reads stayed at 0 on the live node and every
+                        // outbound peer was dropped ~23 min after connecting.
+                        let announced = rustoshi_network::announced_block_hashes(&msg);
+                        if !announced.is_empty() {
+                            let mut ps = peer_state.write().await;
+                            if let Some(ref mut pm) = ps.peer_manager {
+                                for hash in announced {
+                                    pm.update_block_availability(peer_id, hash, |h| {
+                                        block_store.get_height(h).ok().flatten()
+                                    });
+                                }
+                            }
+                        }
                         match msg {
                             NetworkMessage::Headers(headers) => {
                                 // Issue #5: drop any header whose block already
@@ -9761,7 +9778,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     let mut ps = peer_state.write().await;
                     if let Some(ref mut pm) = ps.peer_manager {
                         pm.update_tip_height(validated_tip);
+                        // Core ProcessBlockAvailability: resolve announced
+                        // blocks whose headers have landed since.
+                        pm.process_block_availability(|h| {
+                            block_store.get_height(h).ok().flatten()
+                        });
                         let stale = pm.check_for_stale_peers(in_flight).await;
+                        // Core ConsiderEviction's getheaders from the
+                        // benchmark tip's parent, so an in-sync peer can
+                        // prove it before the 2-minute deadline.
+                        pm.send_chain_sync_getheaders(&stale.send_getheaders_to, |h| {
+                            block_store.get_hash_by_height(h).ok().flatten()
+                        });
                         pm.fill_outbound_connections().await;
                         if feeler_due {
                             pm.maybe_open_feeler().await;

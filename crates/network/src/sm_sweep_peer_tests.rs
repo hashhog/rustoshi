@@ -4,6 +4,8 @@
 //! Every test here fails on master by design: the sweep confirms gaps, it
 //! does not fix them. They are `#[ignore]`d so CI stays green; run with
 //! `cargo test -p rustoshi-network sm_sweep -- --include-ignored`.
+//! A test whose gap has been fixed drops its `#[ignore]` and runs normally
+//! (D-1b: peers-rustoshi-outbound).
 
 use super::*;
 use crate::stale_detection::{CHAIN_SYNC_TIMEOUT, HEADERS_RESPONSE_TIME};
@@ -109,7 +111,6 @@ async fn sm_sweep_manual_and_feeler_peers_are_not_chain_sync_evicted() {
 /// relayed block's height (101) by whatever call it adds; it then changes
 /// only the feed line, not the assertion.
 #[tokio::test]
-#[ignore = "sm-sweep-rustoshi gap D-1: fails on master until sm-fix-rustoshi-chain-sync-eviction"]
 async fn sm_sweep_peer_relaying_our_tip_is_not_chain_sync_evicted() {
     let (_d, mut mgr) = mgr();
     let params = ChainParams::testnet4();
@@ -119,12 +120,10 @@ async fn sm_sweep_peer_relaying_our_tip_is_not_chain_sync_evicted() {
     // Handshake said 100 (our tip at connect time).
     mgr.peers.get_mut(&peer).unwrap().info.start_height = 100;
     // The peer relays block 101, which becomes our tip (payload stands in,
-    // see the doc comment).
-    mgr.handle_event(PeerEvent::Message(
-        peer,
-        NetworkMessage::Block(params.genesis_block.clone()),
-    ))
-    .await;
+    // see the doc comment). Fed the way main.rs now feeds it: Core
+    // UpdateBlockAvailability with the relayed block's indexed height.
+    let relayed = params.genesis_block.block_hash();
+    mgr.update_block_availability(peer, relayed, |h| (*h == relayed).then_some(101));
     mgr.update_tip_height(101);
     assert!(
         !run_chain_sync_ticks(&mut mgr, peer).await,

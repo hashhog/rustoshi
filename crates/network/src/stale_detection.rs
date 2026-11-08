@@ -18,6 +18,7 @@
 //!   after another 2 minutes, disconnect (unless protected).
 
 use crate::peer::PeerId;
+use rustoshi_primitives::Hash256;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -155,6 +156,12 @@ pub struct StalePeerState {
 
     /// Time of last headers request sent to this peer.
     pub last_getheaders_time: Option<Instant>,
+
+    /// The last block this peer announced that we had no index entry for
+    /// yet (Core `CNodeState::hashLastUnknownBlock`). Resolved into
+    /// `best_known_height` once the header lands in our index, by
+    /// [`StalePeerState::resolve_last_unknown_block`].
+    pub last_unknown_block: Option<Hash256>,
 }
 
 impl Default for StalePeerState {
@@ -174,6 +181,40 @@ impl StalePeerState {
             ping_start: None,
             ping_nonce_sent: false,
             last_getheaders_time: None,
+            last_unknown_block: None,
+        }
+    }
+
+    /// Core `ProcessBlockAvailability` (net_processing.cpp): if the last
+    /// unknown block this peer announced is now in our index, raise
+    /// `best_known_height` to it and forget the hash. `lookup_height` maps a
+    /// block hash to its height in our index (None = not indexed; Core
+    /// `LookupBlockIndex`).
+    pub fn resolve_last_unknown_block<F>(&mut self, lookup_height: &F)
+    where
+        F: Fn(&Hash256) -> Option<u32>,
+    {
+        if let Some(hash) = self.last_unknown_block {
+            if let Some(height) = lookup_height(&hash) {
+                self.headers_received(height as i32);
+                self.last_unknown_block = None;
+            }
+        }
+    }
+
+    /// Core `UpdateBlockAvailability` (net_processing.cpp): the peer
+    /// announced `hash` (a `headers` message's last header, a block `inv`,
+    /// or a `cmpctblock`). A block we already index raises the peer's best
+    /// known height (never lowers it); an unknown one is remembered as
+    /// `last_unknown_block`, replacing any older unknown announcement.
+    pub fn update_block_availability<F>(&mut self, hash: Hash256, lookup_height: &F)
+    where
+        F: Fn(&Hash256) -> Option<u32>,
+    {
+        self.resolve_last_unknown_block(lookup_height);
+        match lookup_height(&hash) {
+            Some(height) => self.headers_received(height as i32),
+            None => self.last_unknown_block = Some(hash),
         }
     }
 
