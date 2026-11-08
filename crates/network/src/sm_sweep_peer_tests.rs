@@ -3,7 +3,7 @@
 //! Child module of `peer_manager` so it can reach the private peer table.
 //! Every test here fails on master by design: the sweep confirms gaps, it
 //! does not fix them. They are `#[ignore]`d so CI stays green; run with
-//! `cargo test -p rustoshi-network sm_sweep -- --ignored`.
+//! `cargo test -p rustoshi-network sm_sweep -- --include-ignored`.
 
 use super::*;
 use crate::stale_detection::{CHAIN_SYNC_TIMEOUT, HEADERS_RESPONSE_TIME};
@@ -101,10 +101,13 @@ async fn sm_sweep_manual_and_feeler_peers_are_not_chain_sync_evicted() {
 /// sends (`UpdateBlockAvailability`), and a peer that delivered our tip is never
 /// evicted by ConsiderEviction.
 ///
-/// This test feeds the manager the way it is fed today (a `block` message
-/// through `handle_event`) for a peer that connected at our tip and then
-/// relayed the next block. A fix may feed heights by another call; it must
-/// then change only the feed line, not the assertion.
+/// This test feeds the manager the only way it is fed today (a `block`
+/// message through `handle_event`) for a peer that connected at our tip (100)
+/// and then relayed the block that became our tip (101). The message payload
+/// stands in for block 101: the peer manager has no block index, and today's
+/// code ignores the payload and records `start_height`. A fix must feed the
+/// relayed block's height (101) by whatever call it adds; it then changes
+/// only the feed line, not the assertion.
 #[tokio::test]
 #[ignore = "sm-sweep-rustoshi gap D-1: fails on master until sm-fix-rustoshi-chain-sync-eviction"]
 async fn sm_sweep_peer_relaying_our_tip_is_not_chain_sync_evicted() {
@@ -115,7 +118,8 @@ async fn sm_sweep_peer_relaying_our_tip_is_not_chain_sync_evicted() {
     let _rx = mgr.insert_test_outbound_peer_old(peer, "192.0.2.20:8333".parse().unwrap());
     // Handshake said 100 (our tip at connect time).
     mgr.peers.get_mut(&peer).unwrap().info.start_height = 100;
-    // The peer relays block 101, which becomes our tip.
+    // The peer relays block 101, which becomes our tip (payload stands in,
+    // see the doc comment).
     mgr.handle_event(PeerEvent::Message(
         peer,
         NetworkMessage::Block(params.genesis_block.clone()),

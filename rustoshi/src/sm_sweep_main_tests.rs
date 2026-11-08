@@ -5,7 +5,7 @@
 //! `mark_connect_failed_block_invalid`. The test fails on master by design (the
 //! sweep confirms gaps, it does not fix them); it is `#[ignore]`d so CI stays
 //! green. Run with
-//! `cargo test -p rustoshi --bin rustoshi sm_sweep -- --ignored`.
+//! `cargo test -p rustoshi --bin rustoshi sm_sweep -- --include-ignored`.
 
 use super::*;
 use rustoshi_primitives::BlockHeader;

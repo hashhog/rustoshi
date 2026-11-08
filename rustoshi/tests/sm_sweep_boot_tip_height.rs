@@ -21,7 +21,7 @@
 //!
 //! Marked `#[ignore]`: it fails on master by design (the sweep confirms the
 //! gap, it does not fix it). Run with
-//! `cargo test -p rustoshi --test sm_sweep_boot_tip_height -- --ignored`.
+//! `cargo test -p rustoshi --test sm_sweep_boot_tip_height -- --include-ignored`.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use rustoshi_consensus::ChainParams;
 use rustoshi_primitives::Hash256;
-use rustoshi_storage::block_store::BlockStore;
+use rustoshi_storage::block_store::{BlockIndexEntry, BlockStatus, BlockStore};
 use rustoshi_storage::ChainDb;
 
 fn free_port() -> u16 {
@@ -64,6 +64,27 @@ fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
         for h in lo..=tip {
             store.put_height_index(h, &fake_hash(h)).unwrap();
         }
+        // The tip has a block-index entry at its real height, as on a real
+        // datadir: that is what Core's LoadChainTip reads the height from.
+        let mut status = BlockStatus::new();
+        status.set(BlockStatus::VALID_SCRIPTS);
+        status.set(BlockStatus::HAVE_DATA);
+        store
+            .put_block_index(
+                &fake_hash(tip),
+                &BlockIndexEntry {
+                    height: tip,
+                    status,
+                    n_tx: 1,
+                    timestamp: 1_700_000_000,
+                    bits: 0x207f_ffff,
+                    nonce: 0,
+                    version: 0x2000_0000,
+                    prev_hash: fake_hash(tip - 1),
+                    chain_work: [0u8; 32],
+                },
+            )
+            .unwrap();
         store.set_best_block(&fake_hash(tip), tip).unwrap();
     }
 

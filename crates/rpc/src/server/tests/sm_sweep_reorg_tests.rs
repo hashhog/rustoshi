@@ -5,7 +5,7 @@
 //! (`synth_append_with_work`, `synth_persist_side_block`, `mine_synth_block`).
 //! Every gap test fails on master by design (the sweep confirms gaps, it does
 //! not fix them); they are `#[ignore]`d so CI stays green. Run with
-//! `cargo test -p rustoshi-rpc sm_sweep -- --ignored`.
+//! `cargo test -p rustoshi-rpc sm_sweep -- --include-ignored`.
 
 use super::*;
 use rustoshi_storage::block_store::BlockStatus;
@@ -73,24 +73,46 @@ fn sm_sweep_reorg_clears_recently_rejected() {
 ///
 /// `try_attach_and_reorg_detailed` rewrites CF_HEIGHT_INDEX by walking from
 /// the new tip back to height 0 with no stop at the fork point (server.rs,
-/// "Update height index for the new branch"), and the disconnected-block
-/// collection first builds a hash set of the whole new chain back to genesis.
-/// On mainnet that is ~975k index reads and ~975k height-index writes in one
-/// batch, synchronously, under the RpcState write lock and the chain lock, on
-/// every reorg. Core only touches entries above the fork
-/// (CChain::SetTip walks back only while the entry differs).
+/// "Update height index for the new branch", loop breaks only at
+/// `walk_h == 0`), and the disconnected-block collection first builds a hash
+/// set of the whole new chain back to genesis. On mainnet that is ~975k index
+/// reads and ~975k height-index writes in one batch, synchronously, under the
+/// RpcState write lock and the chain lock, on every reorg. Core only touches
+/// entries above the fork (CChain::SetTip, chain.cpp, walks back only while
+/// the entry differs).
 ///
-/// Instrument: a sentinel planted at height 0 (below the fork at height 1)
-/// must survive the reorg; the walk overwrites it today.
+/// Fixture: G -> A1 -> A2 active; B2 -> B3 -> B4 branch off A1 (fork point A1
+/// at height 1, first differing height 2). A sentinel planted at height 0,
+/// strictly below the fork point, must survive the reorg. A walk that stops
+/// at the fork point (Core) never reaches height 0; the walk to genesis
+/// overwrites it today.
 #[test]
 #[ignore = "sm-sweep-rustoshi gap C-2: fails on master until sm-fix-rustoshi-reorg-index-walk"]
 fn sm_sweep_reorg_does_not_rewrite_height_index_below_fork() {
-    let (_t, db, mut st, b3, h3, _g) = reorg_fixture();
-    let sentinel = Hash256([0xEE; 32]);
-    BlockStore::new(&db).put_height_index(0, &sentinel).unwrap();
-    assert!(try_attach_and_reorg_detailed(&mut st, &b3, &h3).expect("reorg"));
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
+    let mut st = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
     let store = BlockStore::new(&db);
-    assert_eq!(store.get_hash_by_height(3).unwrap(), Some(h3), "control: index moved");
+    let (hash_g, _, work_g) = synth_append_with_work(&store, 0, Hash256::ZERO, [0u8; 32], 0xAA);
+    let (hash_a1, _, work_a1) = synth_append_with_work(&store, 1, hash_g, work_g, 0xA1);
+    let (hash_a2, _, _) = synth_append_with_work(&store, 2, hash_a1, work_a1, 0xA2);
+    st.best_hash = hash_a2;
+    st.best_height = 2;
+    let (hash_b2, _, work_b2) = synth_persist_side_block(&store, 2, hash_a1, work_a1, 0xB2);
+    let (hash_b3, _, _) = synth_persist_side_block(&store, 3, hash_b2, work_b2, 0xB3);
+    let b4 = mine_synth_block(4, hash_b3, 0xB4);
+    let h4 = b4.block_hash();
+    let sentinel = Hash256([0xEE; 32]);
+    store.put_height_index(0, &sentinel).unwrap();
+    drop(store);
+
+    assert!(try_attach_and_reorg_detailed(&mut st, &b4, &h4).expect("reorg"));
+    let store = BlockStore::new(&db);
+    // Controls: the reorg happened and the index moved above the fork.
+    assert_eq!((st.best_hash, st.best_height), (h4, 4));
+    assert_eq!(store.get_hash_by_height(2).unwrap(), Some(hash_b2));
+    assert_eq!(store.get_hash_by_height(4).unwrap(), Some(h4));
+    assert_eq!(store.get_hash_by_height(1).unwrap(), Some(hash_a1), "fork point kept");
     assert_eq!(
         store.get_hash_by_height(0).unwrap(),
         Some(sentinel),
