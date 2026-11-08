@@ -266,32 +266,7 @@ impl HeaderSync {
     where
         F: Fn(u32) -> Option<Hash256>,
     {
-        let mut locator = Vec::new();
-        let mut height = self.best_header_height;
-        let mut step = 1u32;
-
-        loop {
-            if let Some(hash) = get_hash_at_height(height) {
-                locator.push(hash);
-            }
-
-            if height == 0 {
-                break;
-            }
-
-            // Increase step size after first 10 entries
-            if locator.len() >= 10 {
-                step *= 2;
-            }
-
-            if height >= step {
-                height -= step;
-            } else {
-                height = 0;
-            }
-        }
-
-        locator
+        block_locator_from_height(self.best_header_height, get_hash_at_height)
     }
 
     /// Create a getheaders request message.
@@ -668,6 +643,43 @@ impl HeaderSync {
         self.best_header_height = height;
         self.best_header_hash = hash;
     }
+}
+
+/// Block locator starting at `start_height`: the 10 most recent hashes, then
+/// doubling steps back to genesis (Core `LocatorEntries`). Shared by
+/// [`HeaderSync::build_block_locator`] (from the best header) and the
+/// chain-sync eviction getheaders, which Core builds from the benchmark
+/// header's parent (`GetLocator(m_work_header->pprev)` in `ConsiderEviction`).
+pub fn block_locator_from_height<F>(start_height: u32, get_hash_at_height: F) -> Vec<Hash256>
+where
+    F: Fn(u32) -> Option<Hash256>,
+{
+    let mut locator = Vec::new();
+    let mut height = start_height;
+    let mut step = 1u32;
+
+    loop {
+        if let Some(hash) = get_hash_at_height(height) {
+            locator.push(hash);
+        }
+
+        if height == 0 {
+            break;
+        }
+
+        // Increase step size after first 10 entries
+        if locator.len() >= 10 {
+            step *= 2;
+        }
+
+        if height >= step {
+            height -= step;
+        } else {
+            height = 0;
+        }
+    }
+
+    locator
 }
 
 #[cfg(test)]
