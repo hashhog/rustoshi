@@ -21,6 +21,8 @@ use tokio::io::AsyncWriteExt;
 
 mod ops;
 mod swiftsync;
+#[cfg(test)]
+mod sm_sweep_main_tests;
 use ops::{
     daemonize, debug_categories_to_directives, notify_ready, remove_pid_file, write_pid_file,
     ConfFile, ReopenableLogFile,

@@ -21653,6 +21653,9 @@ mod tests {
     use super::*;
     use rustoshi_consensus::chain_manager::{block_status, get_ancestor, is_ancestor};
 
+    // State-machine sweep (sm-sweep-rustoshi): src/server/tests/sm_sweep_reorg_tests.rs
+    mod sm_sweep_reorg_tests;
+
     // ==================================================================
     // #81 round 2: RPC integer arguments must be read at CORE'S WIDTH.
     //
