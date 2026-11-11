@@ -6233,10 +6233,20 @@ pub fn try_attach_and_reorg_detailed(
     // that undo (so a later reorg back across these blocks can disconnect them)
     // and feed its spent-prevout scriptPubKeys into the block filter index below.
     //
-    // BlockStoreSeqLockCtx provides real MTP-at-height lookups (BUG-2/G17 fix)
-    // so that time-based BIP-68 relative lock-times are enforced on reorg-
-    // connected blocks, exactly as on the main process_block path.
-    let seq_ctx = BlockStoreSeqLockCtx { block_store: &store };
+    // Real MTP-at-height lookups (BUG-2/G17 fix) so that time-based BIP-68
+    // relative lock-times are enforced on reorg-connected blocks.
+    //
+    // The coin time must come from the CONNECTING block's ancestry (Core
+    // CalculateSequenceLocks, consensus/tx_verify.cpp:74:
+    // `block.GetAncestor(nCoinHeight - 1)->GetMedianTimePast()`). The side
+    // branch was stored above without height-index rows and the index is only
+    // rewritten in the commit batch below, so the index-only
+    // BlockStoreSeqLockCtx would time a coin created above the fork against
+    // the OLD branch's headers (false accept / false reject), or against no
+    // header at all when the new branch is longer (MissingAncestorHeader).
+    // Every block `reorganize` connects is an ancestor of `block_hash`, so
+    // resolve heights through that branch.
+    let seq_ctx = rustoshi_storage::StoreSeqLockCtx::for_branch(&store, *block_hash, new_height);
     let reorg_res = chain_state.reorganize_with_seq_ctx_detailed(
         *block_hash,
         &get_block,

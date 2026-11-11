@@ -36,13 +36,92 @@ use crate::block_store::BlockStore;
 /// below the block being connected is that block's ancestry); the 11-header
 /// window is then walked by `prev_block_hash`, so the window is hash-linked
 /// even if the index were stale above `height`.
+///
+/// That premise fails while a SIDE BRANCH is being connected by a reorg: the
+/// height index still maps the old branch above the fork point (it is only
+/// rewritten in the reorg's commit batch), so a coin created on the new
+/// branch would be timed against the OLD branch's headers, or (new branch
+/// longer than the old one) against no header at all. Use
+/// [`StoreSeqLockCtx::for_branch`] there; it resolves heights above the fork
+/// through the branch's own `prev_block_hash` links, as Core's
+/// `block.GetAncestor(nCoinHeight - 1)` does.
 pub struct StoreSeqLockCtx<'a> {
     store: &'a BlockStore<'a>,
+    branch: Option<BranchAncestry>,
+}
+
+/// Hash-linked ancestry of a branch tip down to the first height where the
+/// height index already agrees with it.
+struct BranchAncestry {
+    tip_height: u32,
+    /// Lowest height held in `hashes` (`hashes[i]` is at `floor + i`).
+    floor: u32,
+    hashes: Vec<Hash256>,
+    /// The walk reached a height where the index maps this ancestry, so
+    /// heights below `floor` may be read from the index. False when the walk
+    /// stopped on a missing header: those heights then fail closed.
+    joins_index: bool,
 }
 
 impl<'a> StoreSeqLockCtx<'a> {
     pub fn new(store: &'a BlockStore<'a>) -> Self {
-        Self { store }
+        Self { store, branch: None }
+    }
+
+    /// Context for connecting blocks that are ancestors of (or equal to)
+    /// `tip_hash` at `tip_height`, whether or not the height index maps them.
+    ///
+    /// Walks `tip_hash` back by `prev_block_hash` until the height index maps
+    /// the walked hash at its height (the fork point with the indexed chain,
+    /// or `tip_hash` itself when the index already follows this branch).
+    /// Lookups at or above that point use the walked hashes; lookups below it
+    /// use the index, whose chain there IS this branch's ancestry. A lookup
+    /// above `tip_height`, or below an unresolvable header, is `Err`
+    /// (`MissingAncestorHeader`, no verdict).
+    pub fn for_branch(store: &'a BlockStore<'a>, tip_hash: Hash256, tip_height: u32) -> Self {
+        let mut hashes = Vec::new();
+        let mut walk = tip_hash;
+        let mut h = tip_height;
+        let joins_index = loop {
+            if matches!(store.get_hash_by_height(h), Ok(Some(idx)) if idx == walk) {
+                break true;
+            }
+            hashes.push(walk);
+            if h == 0 {
+                // Walked to genesis without the index agreeing: every height
+                // is held in `hashes`.
+                break true;
+            }
+            match store.get_header(&walk) {
+                Ok(Some(hdr)) if hdr.prev_block_hash != Hash256::ZERO => {
+                    walk = hdr.prev_block_hash;
+                    h -= 1;
+                }
+                _ => break false,
+            }
+        };
+        hashes.reverse();
+        let floor = tip_height + 1 - hashes.len() as u32;
+        Self {
+            store,
+            branch: Some(BranchAncestry { tip_height, floor, hashes, joins_index }),
+        }
+    }
+
+    /// Hash of the ancestor at `height` (see [`Self::for_branch`]).
+    fn hash_at(&self, height: u32) -> Option<Hash256> {
+        if let Some(b) = &self.branch {
+            if height > b.tip_height {
+                return None;
+            }
+            if height >= b.floor {
+                return Some(b.hashes[(height - b.floor) as usize]);
+            }
+            if !b.joins_index {
+                return None;
+            }
+        }
+        self.store.get_hash_by_height(height).ok().flatten()
     }
 }
 
@@ -55,9 +134,9 @@ impl<'a> SequenceLockContext for StoreSeqLockCtx<'a> {
     }
 
     fn try_get_mtp_at_height(&self, height: u32) -> Result<u32, u32> {
-        let mut current = match self.store.get_hash_by_height(height) {
-            Ok(Some(h)) => h,
-            _ => return Err(height),
+        let mut current = match self.hash_at(height) {
+            Some(h) => h,
+            None => return Err(height),
         };
         let mut timestamps: Vec<u32> = Vec::with_capacity(MEDIAN_TIME_PAST_WINDOW);
         let mut h = height;
@@ -207,5 +286,127 @@ mod tests {
         let store = store_with(&db, 927_974);
         let ctx = StoreSeqLockCtx::new(&store);
         assert_eq!(ctx.try_get_mtp_at_height(900_000), Err(900_000));
+    }
+
+    /// `for_branch`: a side branch forking below a stale height index.
+    /// Heights 927966..=927975 are the indexed chain; the side branch forks at
+    /// 927975 with three synthetic headers (927976..=927978) whose timestamps
+    /// are EARLIER than every indexed one (so they move the median), while the
+    /// indexed 927976..=927978 stay in the index.
+    fn side_branch(store: &BlockStore<'_>) -> (Vec<Hash256>, Vec<u32>) {
+        let fork_hdr = BlockHeader::deserialize(&hex::decode(HEADERS[9]).unwrap()).unwrap();
+        let mut prev = fork_hdr.block_hash();
+        let mut hashes = Vec::new();
+        let mut stamps = Vec::new();
+        for i in 0..3u32 {
+            let hdr = BlockHeader {
+                version: 4,
+                prev_block_hash: prev,
+                merkle_root: Hash256([0xc0 + i as u8; 32]),
+                timestamp: 1_765_000_000 + i * 600,
+                bits: fork_hdr.bits,
+                nonce: i,
+            };
+            prev = hdr.block_hash();
+            store.put_header(&prev, &hdr).unwrap();
+            hashes.push(prev);
+            stamps.push(hdr.timestamp);
+        }
+        (hashes, stamps)
+    }
+
+    fn header_ts(i: usize) -> u32 {
+        BlockHeader::deserialize(&hex::decode(HEADERS[i]).unwrap()).unwrap().timestamp
+    }
+
+    fn median(mut v: Vec<u32>) -> u32 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+
+    #[test]
+    fn for_branch_times_side_heights_by_the_branch_not_the_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let store = store_with(&db, FIRST);
+        let (side, stamps) = side_branch(&store);
+        let tip = *side.last().unwrap();
+        let ctx = StoreSeqLockCtx::for_branch(&store, tip, 927_978);
+        let plain = StoreSeqLockCtx::new(&store);
+
+        // 927977 on the branch: window = side 927977, 927976 + indexed 927975..927967.
+        let mut want: Vec<u32> = (1..=9).map(header_ts).collect();
+        want.extend_from_slice(&stamps[..2]);
+        assert_eq!(ctx.try_get_mtp_at_height(927_977), Ok(median(want)));
+        // The index-only context times the OLD branch at that height.
+        let old: Vec<u32> = (1..=11).map(header_ts).collect();
+        assert_eq!(plain.try_get_mtp_at_height(927_977), Ok(median(old)));
+        assert_ne!(ctx.try_get_mtp_at_height(927_977), plain.try_get_mtp_at_height(927_977));
+
+        // At and below the fork point both contexts agree (index = ancestry).
+        assert_eq!(ctx.try_get_mtp_at_height(927_975), plain.try_get_mtp_at_height(927_975));
+        assert_eq!(ctx.try_get_mtp_at_height(927_976), Ok(median({
+            let mut v: Vec<u32> = (0..=9).map(header_ts).collect();
+            v.push(stamps[0]);
+            v
+        })));
+        // Above the branch tip there is no ancestor: no verdict.
+        assert_eq!(ctx.try_get_mtp_at_height(927_979), Err(927_979));
+    }
+
+    /// Branch LONGER than the indexed chain: heights with no index row are
+    /// resolved through the branch.
+    #[test]
+    fn for_branch_resolves_heights_above_the_indexed_tip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let store = store_with(&db, FIRST);
+        let (side, _) = side_branch(&store);
+        // Drop the index rows above the fork so the branch is the longer chain.
+        for h in 927_976..=927_979 {
+            store.delete_height_index(h).unwrap();
+        }
+        let plain = StoreSeqLockCtx::new(&store);
+        assert_eq!(plain.try_get_mtp_at_height(927_978), Err(927_978));
+        let ctx = StoreSeqLockCtx::for_branch(&store, side[2], 927_978);
+        assert!(ctx.try_get_mtp_at_height(927_978).is_ok());
+    }
+
+    /// When the index already follows the branch, `for_branch` is the plain
+    /// index lookup.
+    #[test]
+    fn for_branch_on_the_indexed_chain_equals_index_lookup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let store = store_with(&db, FIRST);
+        let tip = store.get_hash_by_height(927_979).unwrap().unwrap();
+        let ctx = StoreSeqLockCtx::for_branch(&store, tip, 927_979);
+        let plain = StoreSeqLockCtx::new(&store);
+        for h in [927_975u32, 927_978, 927_979] {
+            assert_eq!(ctx.try_get_mtp_at_height(h), plain.try_get_mtp_at_height(h));
+        }
+    }
+
+    /// A branch whose walk hits a missing header must not fall back to the
+    /// (other-branch) index below it: fail closed.
+    #[test]
+    fn for_branch_with_a_gap_fails_closed_below_the_gap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = ChainDb::open(dir.path()).unwrap();
+        let store = store_with(&db, FIRST);
+        let orphan_parent = Hash256([0x77; 32]);
+        let hdr = BlockHeader {
+            version: 4,
+            prev_block_hash: orphan_parent,
+            merkle_root: Hash256([0x99; 32]),
+            timestamp: 1_765_990_000,
+            bits: 0x1d00ffff,
+            nonce: 0,
+        };
+        let h = hdr.block_hash();
+        store.put_header(&h, &hdr).unwrap();
+        let ctx = StoreSeqLockCtx::for_branch(&store, h, 927_979);
+        assert_eq!(ctx.try_get_mtp_at_height(927_978), Err(927_978));
+        assert_eq!(ctx.try_get_mtp_at_height(927_970), Err(927_970));
     }
 }
