@@ -21656,6 +21656,9 @@ mod tests {
     // State-machine sweep (sm-sweep-rustoshi): src/server/tests/sm_sweep_reorg_tests.rs
     mod sm_sweep_reorg_tests;
 
+    // cffix-rustoshi-reorg-bip68-coin-mtp: src/server/tests/cffix_reorg_bip68_tests.rs
+    mod cffix_reorg_bip68_tests;
+
     // ==================================================================
     // #81 round 2: RPC integer arguments must be read at CORE'S WIDTH.
     //
