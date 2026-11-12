@@ -844,11 +844,68 @@ pub struct TapscriptCtx<'a> {
     pub annex: Option<&'a [u8]>,
 }
 
+/// IF/NOTIF/ELSE/ENDIF condition stack with O(1) operations.
+///
+/// Mirrors Core's `class ConditionStack` (src/script/interpreter.cpp).
+/// Only the stack size and the position of the first `false` entry are
+/// needed: a branch executes iff there is no `false` entry, and toggling
+/// the top only matters when the top is the first `false` (or there is
+/// none). Tapscript has no script-size or op-count limit, so a
+/// `Vec<bool>` scanned on every opcode made deep nesting quadratic.
+#[derive(Debug, Default)]
+struct ConditionStack {
+    size: usize,
+    /// Index of the first `false` entry, or `None` if all are true.
+    first_false_pos: Option<usize>,
+}
+
+impl ConditionStack {
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    fn all_true(&self) -> bool {
+        self.first_false_pos.is_none()
+    }
+
+    fn push(&mut self, f: bool) {
+        if self.first_false_pos.is_none() && !f {
+            // The stack consists of all-true values and a false is added.
+            self.first_false_pos = Some(self.size);
+        }
+        self.size += 1;
+    }
+
+    /// Caller must check `is_empty()` first.
+    fn pop(&mut self) {
+        debug_assert!(self.size > 0);
+        self.size -= 1;
+        if self.first_false_pos == Some(self.size) {
+            // The first false value is popped; everything left is true.
+            self.first_false_pos = None;
+        }
+    }
+
+    /// Caller must check `is_empty()` first.
+    fn toggle_top(&mut self) {
+        debug_assert!(self.size > 0);
+        match self.first_false_pos {
+            // All true: the top becomes the first false.
+            None => self.first_false_pos = Some(self.size - 1),
+            // The top is the first false: it toggles to true.
+            Some(p) if p == self.size - 1 => self.first_false_pos = None,
+            // A false below the top: toggling the top changes nothing
+            // observable.
+            Some(_) => {}
+        }
+    }
+}
+
 /// Execution context for script evaluation.
 struct ExecContext<'a> {
     stack: Stack,
     altstack: Stack,
-    exec_stack: Vec<bool>, // IF/ELSE nesting state
+    exec_stack: ConditionStack, // IF/ELSE nesting state
     op_count: usize,
     flags: &'a ScriptFlags,
     checker: &'a dyn SignatureChecker,
@@ -892,7 +949,7 @@ impl<'a> ExecContext<'a> {
         ExecContext {
             stack,
             altstack: Vec::new(),
-            exec_stack: Vec::new(),
+            exec_stack: ConditionStack::default(),
             op_count: 0,
             flags,
             checker,
@@ -915,7 +972,7 @@ impl<'a> ExecContext<'a> {
         ExecContext {
             stack,
             altstack: Vec::new(),
-            exec_stack: Vec::new(),
+            exec_stack: ConditionStack::default(),
             op_count: 0,
             flags,
             checker,
@@ -946,7 +1003,7 @@ impl<'a> ExecContext<'a> {
 
     /// Check if we're in an executing branch.
     fn executing(&self) -> bool {
-        self.exec_stack.iter().all(|&b| b)
+        self.exec_stack.all_true()
     }
 
     /// Check stack size limits.
@@ -1177,14 +1234,9 @@ fn eval_script_internal(
                     if ctx.exec_stack.is_empty() {
                         return Err(ScriptError::UnbalancedConditional);
                     }
-                    // Only flip if we're in the active branch of the parent
-                    let parent_executing = ctx.exec_stack[..ctx.exec_stack.len() - 1]
-                        .iter()
-                        .all(|&b| b);
-                    if parent_executing {
-                        let last = ctx.exec_stack.last_mut().unwrap();
-                        *last = !*last;
-                    }
+                    // Core toggles unconditionally; ConditionStack makes a
+                    // toggle under a false parent a no-op.
+                    ctx.exec_stack.toggle_top();
                 }
                 Opcode::OP_ENDIF => {
                     if ctx.exec_stack.is_empty() {
@@ -1285,8 +1337,7 @@ fn eval_script_internal(
                 if ctx.exec_stack.is_empty() {
                     return Err(ScriptError::UnbalancedConditional);
                 }
-                let last = ctx.exec_stack.last_mut().unwrap();
-                *last = !*last;
+                ctx.exec_stack.toggle_top();
             }
             Opcode::OP_ENDIF => {
                 if ctx.exec_stack.is_empty() {
