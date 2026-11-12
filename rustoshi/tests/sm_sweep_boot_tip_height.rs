@@ -242,4 +242,8 @@ fn boot_tip_corrupt_index_entry_is_not_guessed() {
         persisted, 1_000_005,
         "boot overwrote the stored tip height past an unreadable block-index entry"
     );
+    assert!(
+        log.contains("BlockIndexEntry: expected"),
+        "boot must stop on the block-index decode error, not for another reason:\n{log}"
+    );
 }
