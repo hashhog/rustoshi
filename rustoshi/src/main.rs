@@ -2138,9 +2138,35 @@ fn default_rpc_port(network_id: NetworkId) -> u16 {
     }
 }
 
+/// Consensus-required nBits for `header` as a child of our tip at
+/// `tip_height` (the `bad-diffbits` gate the header path runs), for
+/// [`UnsolicitedBlockView::expected_bits`].
+fn tip_child_required_bits(
+    block_store: &BlockStore,
+    cache: &std::cell::RefCell<rustoshi_storage::HeaderCache>,
+    header: &rustoshi_primitives::BlockHeader,
+    tip_height: u32,
+    params: &ChainParams,
+) -> Result<Option<u32>, String> {
+    let height = tip_height.saturating_add(1);
+    match rustoshi_storage::diffbits_gate_for_header(
+        block_store,
+        &mut cache.borrow_mut(),
+        &header.prev_block_hash,
+        header.bits,
+        header.timestamp,
+        height,
+        Some(tip_height),
+        params,
+    )? {
+        rustoshi_storage::DiffBitsGate::Required(bits) => Ok(Some(bits)),
+        rustoshi_storage::DiffBitsGate::DegradedSnapshotBase => Ok(None),
+    }
+}
+
 /// What the chain knows about an unrequested block, for
 /// [`unsolicited_block_gate`].
-struct UnsolicitedBlockView<H: Fn(&Hash256) -> bool> {
+struct UnsolicitedBlockView<H: Fn(&Hash256) -> bool, B: Fn() -> Result<Option<u32>, String>> {
     /// Our active tip.
     tip_hash: Hash256,
     /// The header tree: `true` if a header with this hash is stored.
@@ -2149,40 +2175,51 @@ struct UnsolicitedBlockView<H: Fn(&Hash256) -> bool> {
     have_body: bool,
     /// The hash is a known-invalid block (Core `BLOCK_FAILED_*`).
     known_invalid: bool,
+    /// Consensus-required nBits for a child of our tip (Core
+    /// `ContextualCheckBlockHeader` "bad-diffbits"): `Ok(Some(bits))`,
+    /// `Ok(None)` for the documented snapshot-base carve-out, `Err` when it
+    /// cannot be computed. Called only for a header not on the tree.
+    expected_bits: B,
 }
 
-/// Admission gate for a `block` message whose hash we neither requested nor
-/// are waiting to connect. Mirrors Core's `ChainstateManager::AcceptBlock`
-/// (validation.cpp): `AcceptBlockHeader` first, then the unrequested-block
-/// anti-DoS test, with header failures punished through `BlockChecked` ->
-/// `MaybePunishNodeForBlock` (net_processing.cpp).
+/// Admission gate for a body (`block`, or a `cmpctblock` before it is
+/// reconstructed) whose hash we neither requested nor are waiting to connect.
+/// Mirrors Core's `ChainstateManager::AcceptBlock` (validation.cpp), which
+/// runs `AcceptBlockHeader` on the block itself and then the unrequested-block
+/// anti-DoS test; header failures are punished through `BlockChecked` ->
+/// `MaybePunishNodeForBlock` (net_processing.cpp). Every `misbehaving` call
+/// discourages at once (Core #25974 model, `MisbehaviorTracker::add_score`).
 ///
-/// * `Err(None)`, drop silently: we already have the body (`fAlreadyHave`),
-///   the block is known invalid, or the block does not extend our active
-///   tip. Core processes an unrequested block only with
-///   `fHasMoreOrSameWork && !fTooFarAhead` and enough chain work for the
-///   anti-DoS threshold; extending the active tip is the case that is sure
-///   to pass all three, and anything else is fetched again by getdata once
-///   its header is in the download order.
-/// * `Err(Some(InvalidBlockHeader))`: header not known and its PoW fails
-///   (`CheckBlockHeader` "high-hash", `BLOCK_INVALID_HEADER`).
-/// * `Err(Some(ProtocolViolation("prev-blk-not-found")))`: header not known
-///   and its parent unknown (`BLOCK_MISSING_PREV`). Like every
-///   `misbehaving` call this discourages at once (Core #25974 model,
-///   `MisbehaviorTracker::add_score`).
-/// * `Ok(())`: a body extending our tip, e.g. a block that beat its own
-///   header (audit RU-5). It is buffered, bounded by the downloader's
-///   `MAX_UNSOLICITED_BLOCKS` caps.
-fn unsolicited_block_gate<H: Fn(&Hash256) -> bool>(
+/// * `Err(None)`, ignore: we already have the body (`fAlreadyHave`), the
+///   block is known invalid, or it does not extend our active tip. Core
+///   processes an unrequested block only with `fHasMoreOrSameWork &&
+///   !fTooFarAhead` and enough work for the anti-DoS threshold; extending
+///   the active tip is the case sure to pass all three, and anything else is
+///   fetched by getdata once its header is in the download order.
+/// * `Err(Some(InvalidBlockHeader))`: a header not on the tree whose PoW
+///   fails ("high-hash"), or whose nBits is not the consensus-required value
+///   for a child of our tip ("bad-diffbits"), both `BLOCK_INVALID_HEADER`.
+/// * `Err(Some(ProtocolViolation("prev-blk-not-found")))`: a header not on
+///   the tree whose parent is unknown (`BLOCK_MISSING_PREV`).
+/// * `Ok(())`: a body extending our tip whose header is on the tree, or
+///   passes the checks above (a block that beat its own header, audit RU-5;
+///   a compact block announced before its header). It is buffered, bounded
+///   by the downloader's `MAX_UNSOLICITED_BLOCKS` caps.
+fn unsolicited_block_gate<H, B>(
     header: &rustoshi_primitives::BlockHeader,
     params: &ChainParams,
-    view: &UnsolicitedBlockView<H>,
-) -> Result<(), Option<MisbehaviorReason>> {
+    view: &UnsolicitedBlockView<H, B>,
+) -> Result<(), Option<MisbehaviorReason>>
+where
+    H: Fn(&Hash256) -> bool,
+    B: Fn() -> Result<Option<u32>, String>,
+{
     let hash = header.block_hash();
     if view.have_body || view.known_invalid {
         return Err(None);
     }
-    if !(view.have_header)(&hash) {
+    let on_tree = (view.have_header)(&hash);
+    if !on_tree {
         if !rustoshi_consensus::check_proof_of_work(hash.as_bytes(), header.bits, params) {
             return Err(Some(MisbehaviorReason::InvalidBlockHeader));
         }
@@ -2194,6 +2231,15 @@ fn unsolicited_block_gate<H: Fn(&Hash256) -> bool>(
     }
     if header.prev_block_hash != view.tip_hash {
         return Err(None);
+    }
+    if !on_tree {
+        match (view.expected_bits)() {
+            Ok(Some(bits)) if bits != header.bits => {
+                return Err(Some(MisbehaviorReason::InvalidBlockHeader));
+            }
+            Ok(_) => {}
+            Err(_) => return Err(None),
+        }
     }
     Ok(())
 }
@@ -7305,13 +7351,26 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 let admit = if block_downloader.is_solicited(&hist_hash) {
                                     true
                                 } else {
+                                    let (tip_hash, tip_height) = {
+                                        let cs = chain_state.read().await;
+                                        (cs.tip_hash(), cs.tip_height())
+                                    };
                                     let view = UnsolicitedBlockView {
-                                        tip_hash: chain_state.read().await.tip_hash(),
+                                        tip_hash,
                                         have_header: |h: &Hash256| {
                                             matches!(block_store.get_header(h), Ok(Some(_)))
                                         },
                                         have_body: block_store.has_block(&hist_hash).unwrap_or(false),
                                         known_invalid: invalid_block_hashes.contains(&hist_hash),
+                                        expected_bits: || {
+                                            tip_child_required_bits(
+                                                &block_store,
+                                                &header_diffbits_cache,
+                                                &block.header,
+                                                tip_height,
+                                                &params,
+                                            )
+                                        },
                                     };
                                     match unsolicited_block_gate(&block.header, &params, &view) {
                                         Ok(()) => true,
@@ -9104,6 +9163,55 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                 false
                                             }
                                         };
+                                        // A compact block we did not ask for takes a buffer
+                                        // slot only under the same rules as an unrequested
+                                        // `block` (blocktxn completes only partials started
+                                        // here, so this covers it too).
+                                        let accepted = accepted
+                                            && (block_downloader.is_solicited(&block_hash) || {
+                                                let (tip_hash, tip_height) = {
+                                                    let cs = chain_state.read().await;
+                                                    (cs.tip_hash(), cs.tip_height())
+                                                };
+                                                let view = UnsolicitedBlockView {
+                                                    tip_hash,
+                                                    have_header: |h: &Hash256| {
+                                                        block_store.has_header(h).unwrap_or(false)
+                                                    },
+                                                    have_body: block_store.has_block(&block_hash).unwrap_or(false),
+                                                    known_invalid: invalid_block_hashes.contains(&block_hash),
+                                                    expected_bits: || {
+                                                        tip_child_required_bits(
+                                                            &block_store,
+                                                            &header_diffbits_cache,
+                                                            &cmpct.header,
+                                                            tip_height,
+                                                            &params,
+                                                        )
+                                                    },
+                                                };
+                                                match unsolicited_block_gate(&cmpct.header, &params, &view) {
+                                                    Ok(()) => true,
+                                                    Err(None) => {
+                                                        tracing::debug!(
+                                                            "ignoring unrequested cmpctblock {block_hash} from peer {}",
+                                                            peer_id.0
+                                                        );
+                                                        false
+                                                    }
+                                                    Err(Some(reason)) => {
+                                                        tracing::debug!(
+                                                            "dropping unrequested cmpctblock {block_hash} from peer {}: {reason}",
+                                                            peer_id.0
+                                                        );
+                                                        let mut ps = peer_state.write().await;
+                                                        if let Some(ref mut pm) = ps.peer_manager {
+                                                            pm.misbehaving(peer_id, reason).await;
+                                                        }
+                                                        false
+                                                    }
+                                                }
+                                            });
                                         if accepted {
                                             let (init, segwit_active) = {
                                                 let rpc = rpc_state.read().await;
@@ -12373,21 +12481,22 @@ mod tests {
         assert_eq!(historical_backfill_drive_mode(&hs, &idle, 0, &w), Some(false));
     }
 
-    /// cfaudit 2026-11-09 (unrequested block buffer): an unrequested `block`
-    /// passes Core's AcceptBlockHeader gate and its unrequested-block test
+    /// cfaudit 2026-11-09 (unrequested block buffer): an unrequested body
+    /// passes Core's AcceptBlockHeader checks and its unrequested-block test
     /// before it may take a buffer slot.
     #[test]
     fn cffix_unsolicited_block_gate_matches_accept_block() {
         let params = ChainParams::regtest();
         let tip = Hash256([0x11; 32]);
         let side = Hash256([0x22; 32]); // a stored header that is not our tip
+        const BITS: u32 = 0x207fffff;
         let mine = |prev: Hash256, want_pow: bool| {
             let mut h = rustoshi_primitives::BlockHeader {
                 version: 4,
                 prev_block_hash: prev,
                 merkle_root: Hash256::ZERO,
                 timestamp: 1_700_000_000,
-                bits: 0x207fffff,
+                bits: BITS,
                 nonce: 0,
             };
             while rustoshi_consensus::check_proof_of_work(
@@ -12400,24 +12509,52 @@ mod tests {
             }
             h
         };
-        let gate = |hdr: &rustoshi_primitives::BlockHeader,
-                    known: Vec<Hash256>,
-                    have_body: bool,
-                    known_invalid: bool| {
+        let gate_bits = |hdr: &rustoshi_primitives::BlockHeader,
+                         known: Vec<Hash256>,
+                         have_body: bool,
+                         known_invalid: bool,
+                         required: Result<Option<u32>, String>| {
             let view = UnsolicitedBlockView {
                 tip_hash: tip,
                 have_header: move |h: &Hash256| known.contains(h),
                 have_body,
                 known_invalid,
+                expected_bits: move || required.clone(),
             };
             unsolicited_block_gate(hdr, &params, &view)
         };
+        let gate = |hdr: &rustoshi_primitives::BlockHeader,
+                    known: Vec<Hash256>,
+                    have_body: bool,
+                    known_invalid: bool| {
+            gate_bits(hdr, known, have_body, known_invalid, Ok(Some(BITS)))
+        };
 
-        // Extends our tip, header not yet seen (audit RU-5): admitted.
+        // Extends our tip, header not yet seen, right nBits (audit RU-5, a
+        // compact block announced before its header): admitted.
         let good = mine(tip, true);
         assert_eq!(gate(&good, vec![tip, side], false, false), Ok(()));
-        // ...and with its header already stored: admitted.
+        // ...and with its header already on the tree: admitted.
         assert_eq!(gate(&good, vec![tip, good.block_hash()], false, false), Ok(()));
+        // Snapshot-base carve-out (required bits unknown by design): admitted.
+        assert_eq!(gate_bits(&good, vec![tip], false, false, Ok(None)), Ok(()));
+
+        // Off the tree with nBits that is not the required value (a
+        // difficulty-1 block on mainnet): dropped and punished, bad-diffbits.
+        assert_eq!(
+            gate_bits(&good, vec![tip], false, false, Ok(Some(0x1d00ffff))),
+            Err(Some(MisbehaviorReason::InvalidBlockHeader))
+        );
+        // Required nBits cannot be computed: ignored, not buffered.
+        assert_eq!(
+            gate_bits(&good, vec![tip], false, false, Err("ancestor gap".into())),
+            Err(None)
+        );
+        // On the tree it already passed bad-diffbits: not re-checked.
+        assert_eq!(
+            gate_bits(&good, vec![tip, good.block_hash()], false, false, Ok(Some(0x1d00ffff))),
+            Ok(())
+        );
 
         // Unknown parent: dropped and punished, prev-blk-not-found.
         let orphan = mine(Hash256([0x33; 32]), true);
