@@ -52,6 +52,13 @@ fn fake_hash(h: u32) -> Hash256 {
 /// logs its chain tip, then stop it. Returns (height in the boot log line,
 /// height persisted in CF_META after boot).
 fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
+    boot_with(lo, tip, tip, true)
+}
+
+/// Like `boot_with_tip`, but the stored best-block height is `stored` (which
+/// may differ from the tip's real height `tip`), and the tip's block-index
+/// entry is written only when `with_index_entry` is set.
+fn boot_with(lo: u32, tip: u32, stored: u32, with_index_entry: bool) -> (u32, u32) {
     let params = ChainParams::regtest();
     let tmp = tempfile::tempdir().unwrap();
     let datadir = tmp.path().join("node");
@@ -69,23 +76,25 @@ fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
         let mut status = BlockStatus::new();
         status.set(BlockStatus::VALID_SCRIPTS);
         status.set(BlockStatus::HAVE_DATA);
-        store
-            .put_block_index(
-                &fake_hash(tip),
-                &BlockIndexEntry {
-                    height: tip,
-                    status,
-                    n_tx: 1,
-                    timestamp: 1_700_000_000,
-                    bits: 0x207f_ffff,
-                    nonce: 0,
-                    version: 0x2000_0000,
-                    prev_hash: fake_hash(tip - 1),
-                    chain_work: [0u8; 32],
-                },
-            )
-            .unwrap();
-        store.set_best_block(&fake_hash(tip), tip).unwrap();
+        if with_index_entry {
+            store
+                .put_block_index(
+                    &fake_hash(tip),
+                    &BlockIndexEntry {
+                        height: tip,
+                        status,
+                        n_tx: 1,
+                        timestamp: 1_700_000_000,
+                        bits: 0x207f_ffff,
+                        nonce: 0,
+                        version: 0x2000_0000,
+                        prev_hash: fake_hash(tip - 1),
+                        chain_work: [0u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+        store.set_best_block(&fake_hash(tip), stored).unwrap();
     }
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustoshi"))
@@ -170,4 +179,29 @@ fn boot_tip_height_above_one_million_is_kept() {
         "boot derived the wrong tip height (Core LoadChainTip uses the tip's index entry)"
     );
     assert_eq!(persisted, 1_000_005, "boot persisted the wrong tip height");
+}
+
+/// The stored height is a stale counter (the "cumulative counter" case the
+/// legacy scan guessed at) and disagrees with the tip's block-index entry.
+/// Boot must take the entry's height, not guess from the height index.
+#[test]
+fn boot_tip_height_comes_from_block_index_not_stored_counter() {
+    let (logged, persisted) = boot_with(995_000, 1_000_005, 3_000_000, true);
+    assert_eq!(
+        logged, 1_000_005,
+        "boot must use the tip's block-index height"
+    );
+    assert_eq!(
+        persisted, 1_000_005,
+        "boot must persist the tip's block-index height"
+    );
+}
+
+/// Control for the kept fallback: a tip with no block-index entry is still
+/// found by the legacy height-index scan below 1,000,000.
+#[test]
+fn boot_tip_without_index_entry_keeps_legacy_scan() {
+    let (logged, persisted) = boot_with(490_000, 500_000, 500_000, false);
+    assert_eq!(logged, 500_000);
+    assert_eq!(persisted, 500_000);
 }
