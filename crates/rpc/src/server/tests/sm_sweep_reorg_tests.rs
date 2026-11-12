@@ -54,7 +54,6 @@ fn sm_sweep_control_reorg_fixture_switches_tip() {
 /// against the old chain (e.g. missing inputs that the new branch creates)
 /// stays rejected after the reorg, so it is not re-requested from peers.
 #[test]
-#[ignore = "sm-sweep-rustoshi gap C-1: fails on master until sm-fix-rustoshi-reorg-tip-housekeeping"]
 fn sm_sweep_reorg_clears_recently_rejected() {
     let (_t, _db, mut st, b3, h3, _g) = reorg_fixture();
     st.recently_rejected.insert(Hash256([0x42; 32]));
@@ -65,6 +64,87 @@ fn sm_sweep_reorg_clears_recently_rejected() {
         "recently_rejected survived a tip change by reorg ({} entries); Core resets it \
          on ActiveTipChange",
         st.recently_rejected.len()
+    );
+}
+
+/// Gap C-1 (orphanage arm): the reorg connects B1..B3, and Core erases
+/// orphans per connected block (PeerManagerImpl::BlockConnected ->
+/// TxOrphanage::EraseForBlock). An orphan the new branch confirms must leave
+/// the orphanage; an unrelated orphan must stay (control: the erase is
+/// selective, not a wholesale clear).
+#[test]
+fn sm_sweep_reorg_erases_orphans_confirmed_by_new_branch() {
+    let (_t, _db, mut st, b3, h3, _g) = reorg_fixture();
+    let confirmed = Arc::new(b3.transactions[0].clone());
+    let unrelated = Arc::new(Transaction {
+        version: 2,
+        inputs: vec![TxIn {
+            previous_output: OutPoint { txid: Hash256([0x77; 32]), vout: 0 },
+            script_sig: Vec::new(),
+            sequence: 0xffff_ffff,
+            witness: Vec::new(),
+        }],
+        outputs: vec![TxOut { value: 1_000, script_pubkey: vec![0x6a, 0x00] }],
+        lock_time: 0,
+    });
+    st.orphanage
+        .add(confirmed.clone(), 1, confirmed.serialized_size())
+        .expect("insert confirmed orphan");
+    st.orphanage
+        .add(unrelated.clone(), 1, unrelated.serialized_size())
+        .expect("insert unrelated orphan");
+    assert_eq!(st.orphanage.len(), 2, "control: both orphans held");
+
+    assert!(try_attach_and_reorg_detailed(&mut st, &b3, &h3).expect("reorg"));
+    assert_eq!(st.best_hash, h3, "control: the tip changed");
+    assert!(
+        !st.orphanage.contains(&confirmed.wtxid()),
+        "orphan confirmed by the new branch survived the reorg; Core erases it on \
+         BlockConnected"
+    );
+    assert!(
+        st.orphanage.contains(&unrelated.wtxid()),
+        "control: an orphan the new branch does not touch must stay"
+    );
+}
+
+/// Gap C-1 (fee-estimator arm): Core calls
+/// CBlockPolicyEstimator::processBlock for every connected block and ignores
+/// heights it has already seen. The estimator saw the old tip A2 (height 2);
+/// the reorg connects B1, B2, B3, so it must advance to height 3. Unfixed it
+/// stays at 2, and every tx it tracks is later scored against a stale height.
+#[test]
+fn sm_sweep_reorg_feeds_fee_estimator() {
+    let (_t, _db, mut st, b3, h3, _g) = reorg_fixture();
+    // The linear connect of A1, A2 fed the estimator.
+    st.fee_estimator.process_block(1, &[]);
+    st.fee_estimator.process_block(2, &[]);
+    assert_eq!(st.fee_estimator.current_height(), 2, "control: estimator at old tip");
+
+    assert!(try_attach_and_reorg_detailed(&mut st, &b3, &h3).expect("reorg"));
+    assert_eq!((st.best_hash, st.best_height), (h3, 3), "control: the tip changed");
+    assert_eq!(
+        st.fee_estimator.current_height(),
+        3,
+        "fee estimator not told about the blocks the reorg connected"
+    );
+}
+
+/// Guard for the fee-estimator arm: Core processBlock ignores a height at or
+/// below the best it has seen ("Ignore side chains and re-orgs"). An
+/// estimator already at height 5 must not be pulled back to 3, nor decayed
+/// again, by a reorg that connects heights 1..3. Passes on master (the reorg
+/// never fed the estimator); fails if the fix feeds it unconditionally.
+#[test]
+fn sm_sweep_reorg_fee_estimator_ignores_seen_heights() {
+    let (_t, _db, mut st, b3, h3, _g) = reorg_fixture();
+    st.fee_estimator.process_block(5, &[]);
+    assert!(try_attach_and_reorg_detailed(&mut st, &b3, &h3).expect("reorg"));
+    assert_eq!((st.best_hash, st.best_height), (h3, 3), "control: the tip changed");
+    assert_eq!(
+        st.fee_estimator.current_height(),
+        5,
+        "reorg fed the fee estimator heights it had already seen"
     );
 }
 

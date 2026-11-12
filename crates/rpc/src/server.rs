@@ -6800,7 +6800,22 @@ pub fn try_attach_and_reorg_detailed(
     // reconsiderblock putting a previously invalidated tip back. Txs that
     // returned to the mempool on the disconnect must leave again once those
     // blocks are active.
-    for (hash, _height, _undo) in &connected_blocks {
+    //
+    // The same per-block housekeeping the linear connect runs (main.rs P2P
+    // connect, submitblock's tip-extend arm) belongs here too, or a tip change
+    // by reorg leaves it undone:
+    //   * mempool.on_block_connected: rolling-min-fee decay + 2-week expiry
+    //     (Core removeForBlock / LimitMempoolSize);
+    //   * orphanage.erase_for_block: Core PeerManagerImpl::BlockConnected ->
+    //     TxDownloadManager::BlockConnected -> TxOrphanage::EraseForBlock,
+    //     per connected block;
+    //   * fee_estimator.process_block: Core
+    //     CBlockPolicyEstimator::processBlock per connected block, which
+    //     ignores heights at or below the best height already seen ("Ignore
+    //     side chains and re-orgs"), so a reorg that only re-connects heights
+    //     the estimator has counted does not decay it twice.
+    let fee_seen_height = state.fee_estimator.current_height();
+    for (hash, height, _undo) in &connected_blocks {
         if let Some(block) = store.get_block(hash).ok().flatten() {
             let txids: Vec<Hash256> = block.transactions.iter().map(|tx| tx.txid()).collect();
             let spent: Vec<OutPoint> = block
@@ -6809,6 +6824,16 @@ pub fn try_attach_and_reorg_detailed(
                 .flat_map(|tx| tx.inputs.iter().map(|input| input.previous_output.clone()))
                 .collect();
             state.mempool.remove_for_block(&txids, &spent);
+            state
+                .mempool
+                .on_block_connected(rustoshi_consensus::mempool::current_unix_seconds());
+            state.orphanage.erase_for_block(&txids, &spent);
+            if *height > fee_seen_height {
+                // Skip coinbase (index 0), as the linear paths do.
+                state
+                    .fee_estimator
+                    .process_block(*height, txids.get(1..).unwrap_or(&[]));
+            }
         }
         if let Ok(Some(mut entry)) = store.get_block_index(hash) {
             entry.status.set(BlockStatus::VALID_SCRIPTS);
@@ -6823,6 +6848,12 @@ pub fn try_attach_and_reorg_detailed(
             }
         }
     }
+
+    // Core PeerManagerImpl::ActiveTipChange -> TxDownloadManager::
+    // ActiveTipChange resets the recent-rejects filter on every tip change: a
+    // tx rejected against the old chain (e.g. inputs only the new branch
+    // creates) must be fetchable again. The linear connect clears it per block.
+    state.recently_rejected.clear();
 
     Ok(true)
 }
