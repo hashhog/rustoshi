@@ -19,9 +19,9 @@
 //! height index and a tip, waits for the boot log line `Chain tip: <hash>
 //! (height N)`, stops the child, and reads back the persisted tip.
 //!
-//! Marked `#[ignore]`: it fails on master by design (the sweep confirms the
-//! gap, it does not fix it). Run with
-//! `cargo test -p rustoshi --test sm_sweep_boot_tip_height -- --include-ignored`.
+//! Fixed by sm-fix-rustoshi-boot-tip-height: boot now takes the height from
+//! the tip's block-index entry, so the test runs by default. Run with
+//! `cargo test -p rustoshi --test sm_sweep_boot_tip_height`.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -160,9 +160,9 @@ fn boot_tip_height_below_one_million_is_kept() {
 }
 
 /// The gap: a tip above 1,000,000 is re-derived to a wrong height and that
-/// wrong height is written back to disk. Fails on master.
+/// wrong height is written back to disk. Failed before
+/// sm-fix-rustoshi-boot-tip-height.
 #[test]
-#[ignore = "sm-sweep-rustoshi gap B-1: fails on master until sm-fix-rustoshi-boot-tip-height"]
 fn boot_tip_height_above_one_million_is_kept() {
     let (logged, persisted) = boot_with_tip(995_000, 1_000_005);
     assert_eq!(

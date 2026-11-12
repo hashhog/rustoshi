@@ -4403,8 +4403,21 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let mut best_hash = block_store.get_best_block_hash()?.unwrap();
     let stored_height = block_store.get_best_height()?.unwrap();
 
-    // Try to find the actual height by looking up the best hash in the height index
-    let mut best_height = {
+    // Take the tip height from the best hash's own block-index entry, as Core's
+    // `Chainstate::LoadChainTip` does (validation.cpp: the height comes from
+    // the coins tip's CBlockIndex, never from a cap or a guess). The legacy
+    // height-index scan below is kept only as a fallback for a datadir whose
+    // tip has no block-index entry; it used to run unconditionally and, with
+    // its scans capped at 1,000,000, re-derived a wrong height for every real
+    // tip above 1,000,000 and wrote it back to disk.
+    let index_height = block_store
+        .get_block_index(&best_hash)
+        .ok()
+        .flatten()
+        .map(|entry| entry.height);
+    let mut best_height = if let Some(h) = index_height {
+        h
+    } else {
         let mut found = stored_height;
         // Scan backwards from stored height to find the hash
         for h in (0..=std::cmp::min(stored_height, 1_000_000)).rev() {
