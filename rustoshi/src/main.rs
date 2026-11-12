@@ -8316,12 +8316,16 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 }
                                 if !tx_requests.is_empty() {
                                     let ps = peer_state.read().await;
+                                    // Non-blocking (Core fPauseSend): an awaited send
+                                    // on a peer that stopped reading would park the
+                                    // main loop, with peer_state held, for up to
+                                    // PEER_SEND_TIMEOUT. A dropped tx getdata is
+                                    // harmless; the tx is re-announced.
                                     if let Some(ref pm) = ps.peer_manager {
-                                        let _ = pm.send_to_peer(
+                                        let _ = pm.try_send_to_peer(
                                             peer_id,
                                             NetworkMessage::GetData(tx_requests),
-                                        )
-                                        .await;
+                                        );
                                     }
                                 }
                                 // Reorg Unit E (E1/Gap-3): discover an inv-announced chain
@@ -9343,7 +9347,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                                             let resp = BlockTxn::from_arcs(req.block_hash, txns);
                                                             let ps = peer_state.read().await;
                                                             if let Some(ref pm) = ps.peer_manager {
-                                                                let _ = pm.send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize())).await;
+                                                                // Non-blocking, like the full-block fallback below.
+                                                                pm.try_send_to_peer(peer_id, NetworkMessage::BlockTxn(resp.serialize()));
                                                             }
                                                         }
                                                         None => {
