@@ -92,7 +92,21 @@ const DOWNLOAD_WINDOW_SIZE: u32 = 1024;
 /// starved the download pipeline: out-of-order blocks filled received_blocks,
 /// leaving no room for new in_flight requests (observed as 0 getdata after
 /// enqueueing 131K blocks, with only periodic retries of 2-8 blocks).
-const MAX_RECEIVED_BLOCKS: usize = 512;
+pub const MAX_RECEIVED_BLOCKS: usize = 512;
+
+/// Cap on buffered bodies nobody asked for: a block whose hash was neither
+/// in flight nor in the validation order when it arrived. Such a body is
+/// kept only so a block that beats its own header (audit RU-5) is not lost.
+/// Core keeps no in-memory body buffer at all (`ProcessMessage` "block"
+/// hands the block straight to `AcceptBlock`, which drops an unrequested
+/// block unless it has more work and is not too far ahead), so without this
+/// cap any peer could park 4 MB bodies with fresh nonces until restart
+/// (cfaudit 2026-11-09).
+pub const MAX_UNSOLICITED_BLOCKS: usize = 64;
+
+/// Per-peer share of [`MAX_UNSOLICITED_BLOCKS`], so one peer cannot use the
+/// whole budget and crowd out another peer's early-arriving tip block.
+pub const MAX_UNSOLICITED_BLOCKS_PER_PEER: usize = 8;
 
 /// A block that has been requested but not yet received.
 #[derive(Debug, Clone)]
@@ -175,6 +189,12 @@ pub struct BlockDownloader {
     /// without waiting for the 10s retry tick (or the post-validation
     /// `assign_requests` call, which runs only after up to 8 slow connects).
     pending_refill: Vec<(PeerId, NetworkMessage)>,
+    /// Buffered bodies that were unsolicited on arrival, with their
+    /// deliverer. Bounded by [`MAX_UNSOLICITED_BLOCKS`] (and per peer by
+    /// [`MAX_UNSOLICITED_BLOCKS_PER_PEER`]); an entry leaves this map when
+    /// the hash is enqueued (it is then solicited), consumed, forgotten, or
+    /// its deliverer disconnects.
+    unsolicited: HashMap<Hash256, PeerId>,
     /// Blocks whose request timed out, mapped to the peer that failed to
     /// deliver. The re-request goes to a different peer when one has
     /// capacity (Core reaches the same end by disconnecting the peer on a
@@ -477,6 +497,7 @@ impl BlockDownloader {
             timed_out_from: HashMap::new(),
             announced_by: HashMap::new(),
             block_source: HashMap::new(),
+            unsolicited: HashMap::new(),
         }
     }
 
@@ -522,6 +543,8 @@ impl BlockDownloader {
             // FindNextBlocksToDownload / ProcessNewBlock never let a stored
             // body block the next connect.
             if self.received_blocks.contains_key(&item.0) || self.in_flight.contains_key(&item.0) {
+                // Now part of the validation order: no longer unsolicited.
+                self.unsolicited.remove(&item.0);
                 self.pending_set.insert(item.0);
                 self.pending_hashes.push_back(item.0);
                 continue;
@@ -546,6 +569,7 @@ impl BlockDownloader {
         self.pending_hashes.clear();
         self.pending_set.clear();
         self.received_blocks.clear();
+        self.unsolicited.clear();
         for (_, f) in self.in_flight.drain() {
             if let Some(state) = self.peer_states.get_mut(&f.peer) {
                 state.blocks_in_flight = state.blocks_in_flight.saturating_sub(1);
@@ -598,6 +622,17 @@ impl BlockDownloader {
         self.received_blocks.len()
     }
 
+    /// Number of buffered bodies that were unsolicited on arrival.
+    pub fn unsolicited_blocks_count(&self) -> usize {
+        self.unsolicited.len()
+    }
+
+    /// True if `hash` is one we asked for or are waiting to connect: in
+    /// flight, or in the validation order.
+    pub fn is_solicited(&self, hash: &Hash256) -> bool {
+        self.in_flight.contains_key(hash) || self.pending_set.contains(hash)
+    }
+
     pub fn pending_hashes_count(&self) -> usize {
         self.pending_hashes.len()
     }
@@ -614,6 +649,21 @@ impl BlockDownloader {
     /// download from other peers.
     pub fn remove_peer(&mut self, peer_id: PeerId) {
         self.peer_states.remove(&peer_id);
+
+        // Free every body this peer pushed at us unasked. Nothing waits on
+        // them (they are not in the validation order), so a later header
+        // simply re-requests the block from whoever announces it.
+        let theirs: Vec<Hash256> = self
+            .unsolicited
+            .iter()
+            .filter(|(_, p)| **p == peer_id)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in theirs {
+            self.unsolicited.remove(&h);
+            self.received_blocks.remove(&h);
+            self.block_source.remove(&h);
+        }
 
         // Re-queue any blocks that were assigned to this peer
         let to_requeue: Vec<(Hash256, u32)> = self
@@ -759,12 +809,31 @@ impl BlockDownloader {
 
     /// Handle a received block from a peer.
     ///
-    /// Returns the block hash if the block was expected. Frees the in-flight
+    /// Returns the block hash if the block was buffered, `None` if it was
+    /// dropped: an unsolicited body (hash neither in flight nor in the
+    /// validation order) over [`MAX_UNSOLICITED_BLOCKS`] or its peer's
+    /// [`MAX_UNSOLICITED_BLOCKS_PER_PEER`] share, or a repeat of a body
+    /// already buffered. Frees the in-flight
     /// slot and immediately refills from the download queue — the caller must
     /// send [`Self::take_refill_requests`] (or a subsequent
     /// [`Self::assign_requests`]) without waiting for the retry tick.
     pub fn block_received(&mut self, peer_id: PeerId, block: Block) -> Option<Hash256> {
         let hash = block.block_hash();
+
+        let requested = self.in_flight.contains_key(&hash);
+        if !requested && !self.pending_set.contains(&hash) {
+            // Unsolicited. Never let it grow the buffer without bound.
+            if self.received_blocks.contains_key(&hash) {
+                return None;
+            }
+            let from_peer = self.unsolicited.values().filter(|p| **p == peer_id).count();
+            if self.unsolicited.len() >= MAX_UNSOLICITED_BLOCKS
+                || from_peer >= MAX_UNSOLICITED_BLOCKS_PER_PEER
+            {
+                return None;
+            }
+            self.unsolicited.insert(hash, peer_id);
+        }
 
         if let Some(in_flight) = self.in_flight.remove(&hash) {
             // Free the slot of the peer the block was REQUESTED from. It used
@@ -823,6 +892,7 @@ impl BlockDownloader {
         removed += before - self.pending_hashes.len();
         for h in hashes {
             self.pending_set.remove(h);
+            self.unsolicited.remove(h);
             if self.received_blocks.remove(h).is_some() {
                 removed += 1;
             }
