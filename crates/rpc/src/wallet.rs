@@ -356,12 +356,6 @@ pub struct WalletInfo {
     pub walletversion: u32,
     /// Wallet format.
     pub format: String,
-    /// Confirmed balance in BTC.
-    pub balance: f64,
-    /// Unconfirmed balance in BTC.
-    pub unconfirmed_balance: f64,
-    /// Immature (coinbase) balance in BTC.
-    pub immature_balance: f64,
     /// Total number of transactions.
     pub txcount: usize,
     /// Deprecated, always 0.
@@ -3023,10 +3017,7 @@ impl WalletRpcServer for WalletRpcImpl {
             Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
         })?;
 
-        // getwalletinfo.balance is getbalances' mine.trusted (immature excluded).
-        let balance = Self::sats_to_btc(wallet_guard.spendable_balance());
-        let unconfirmed_balance = Self::sats_to_btc(wallet_guard.unconfirmed_balance());
-        let immature_balance = Self::sats_to_btc(wallet_guard.immature_balance());
+        // Core v31 getwalletinfo has no balance fields; see getbalances.
         // Core getwalletinfo.txcount is mapWallet.size() (confirmed + mempool
         // wallet txs), not the live UTXO count.
         let tx_count = wallet_guard.history().len();
@@ -3039,9 +3030,6 @@ impl WalletRpcServer for WalletRpcImpl {
             walletname: wallet_name,
             walletversion: 169900,
             format: "sqlite".to_string(),
-            balance,
-            unconfirmed_balance,
-            immature_balance,
             txcount: tx_count,
             keypoololdest: 0,
             keypoolsize: if private_keys_enabled { 1000 } else { 0 },
