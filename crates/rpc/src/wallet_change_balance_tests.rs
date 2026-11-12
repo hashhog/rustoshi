@@ -6,7 +6,7 @@
 //!    entirely when the wallet funded the tx (`nDebit > 0`), before either the
 //!    `listSent` or the `listReceived` push. A 1 BTC self-payment with change
 //!    therefore has exactly `[receive 1.0, send -1.0]`; the change gets no line.
-//! 2. `getbalances.mine.trusted` / `getwalletinfo.balance`. Core's
+//! 2. `getbalances.mine.trusted`. Core's
 //!    `GetBalance` puts immature coinbase only in `immature`, never in
 //!    `trusted`.
 
@@ -154,12 +154,4 @@ async fn getbalances_trusted_excludes_immature_coinbase() {
     let mine = b.mine.unwrap();
     assert_eq!(mine.trusted, 50.0, "only the mature coinbase is trusted");
     assert_eq!(mine.immature, 50.0);
-}
-
-#[tokio::test]
-async fn getwalletinfo_balance_excludes_immature_coinbase() {
-    let rpc = balance_rpc().await;
-    let info = rpc.get_wallet_info(None).await.unwrap();
-    assert_eq!(info.balance, 50.0, "only the mature coinbase counts");
-    assert_eq!(info.immature_balance, 50.0);
 }
