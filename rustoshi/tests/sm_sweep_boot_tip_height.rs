@@ -59,6 +59,21 @@ fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
 /// may differ from the tip's real height `tip`), and the tip's block-index
 /// entry is written only when `with_index_entry` is set.
 fn boot_with(lo: u32, tip: u32, stored: u32, with_index_entry: bool) -> (u32, u32) {
+    let (logged, persisted, log) = boot_raw(lo, tip, stored, with_index_entry, false);
+    let logged = logged.unwrap_or_else(|| panic!("no `Chain tip:` boot line in:\n{log}"));
+    (logged, persisted)
+}
+
+/// Prepare and boot as `boot_with`; with `corrupt_index_entry` the tip's
+/// block-index entry is replaced by undecodable bytes. Returns (height in the
+/// boot log line if one was printed, height persisted after boot, boot log).
+fn boot_raw(
+    lo: u32,
+    tip: u32,
+    stored: u32,
+    with_index_entry: bool,
+    corrupt_index_entry: bool,
+) -> (Option<u32>, u32, String) {
     let params = ChainParams::regtest();
     let tmp = tempfile::tempdir().unwrap();
     let datadir = tmp.path().join("node");
@@ -93,6 +108,14 @@ fn boot_with(lo: u32, tip: u32, stored: u32, with_index_entry: bool) -> (u32, u3
                     },
                 )
                 .unwrap();
+        }
+        if corrupt_index_entry {
+            db.put_cf(
+                rustoshi_storage::CF_BLOCK_INDEX,
+                fake_hash(tip).as_bytes(),
+                &[0xff, 0xff, 0xff],
+            )
+            .unwrap();
         }
         store.set_best_block(&fake_hash(tip), stored).unwrap();
     }
@@ -152,11 +175,10 @@ fn boot_with(lo: u32, tip: u32, stored: u32, with_index_entry: bool) -> (u32, u3
     // This is the test's own child process on a scratch regtest datadir.
     let _ = child.kill();
     let _ = child.wait();
-    let logged = logged.unwrap_or_else(|| panic!("no `Chain tip:` boot line in:\n{log}"));
 
     let db = ChainDb::open(&chainstate).expect("reopen chainstate");
     let persisted = BlockStore::new(&db).get_best_height().unwrap().unwrap();
-    (logged, persisted)
+    (logged, persisted, log)
 }
 
 /// Control: below the 1,000,000 cap the boot scan finds the tip, so the
@@ -204,4 +226,20 @@ fn boot_tip_without_index_entry_keeps_legacy_scan() {
     let (logged, persisted) = boot_with(490_000, 500_000, 500_000, false);
     assert_eq!(logged, 500_000);
     assert_eq!(persisted, 500_000);
+}
+
+/// A tip whose block-index entry cannot be read must not be treated as "no
+/// entry": that would run the capped legacy scan and write a wrong height to
+/// disk. Boot must stop before choosing a tip and leave the stored height alone.
+#[test]
+fn boot_tip_corrupt_index_entry_is_not_guessed() {
+    let (logged, persisted, log) = boot_raw(995_000, 1_000_005, 1_000_005, false, true);
+    assert_eq!(
+        logged, None,
+        "boot guessed a tip height past an unreadable block-index entry:\n{log}"
+    );
+    assert_eq!(
+        persisted, 1_000_005,
+        "boot overwrote the stored tip height past an unreadable block-index entry"
+    );
 }

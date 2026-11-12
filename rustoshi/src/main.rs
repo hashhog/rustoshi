@@ -4410,10 +4410,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     // tip has no block-index entry; it used to run unconditionally and, with
     // its scans capped at 1,000,000, re-derived a wrong height for every real
     // tip above 1,000,000 and wrote it back to disk.
+    // A read or decode error aborts boot (as LoadChainTip fails the load):
+    // treating it as "no entry" would send a real tip back into the capped
+    // legacy scan and write its wrong height to disk.
     let index_height = block_store
-        .get_block_index(&best_hash)
-        .ok()
-        .flatten()
+        .get_block_index(&best_hash)?
         .map(|entry| entry.height);
     let mut best_height = if let Some(h) = index_height {
         h
