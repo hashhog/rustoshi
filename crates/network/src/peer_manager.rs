@@ -2594,6 +2594,28 @@ struct PeerHandle {
     next_local_addr_send: Option<Instant>,
 }
 
+/// Queue a `Disconnect` for a peer without ever awaiting its command channel.
+///
+/// Core's `fDisconnect` is a flag the socket thread checks; it never waits on
+/// the peer. Here the disconnect travels through the same bounded queue as
+/// outgoing messages, so a peer that stopped reading (writer parked in
+/// `write_all` for up to `PEER_SEND_TIMEOUT`) has a full queue and an awaited
+/// send would park the main P2P loop behind it. On a full queue the send is
+/// handed to a detached task instead: the caller returns at once, and the
+/// Disconnect is delivered as soon as one slot frees (or the task ends with
+/// the channel when the peer task exits on its own send timeout).
+fn queue_disconnect(tx: &mpsc::Sender<PeerCommand>) {
+    match tx.try_send(PeerCommand::Disconnect) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(cmd)) => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(cmd).await;
+            });
+        }
+    }
+}
+
 /// Result of a non-blocking fan-out (tx relay, broadcast).
 ///
 /// Fan-outs never await a peer's command channel: `queued` peers got the
@@ -4408,7 +4430,7 @@ impl PeerManager {
     /// Disconnect from a specific peer.
     pub async fn disconnect_peer(&mut self, peer_id: PeerId) {
         if let Some(peer) = self.peers.get(&peer_id) {
-            let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
+            queue_disconnect(&peer.command_tx);
         }
     }
 
@@ -4522,7 +4544,7 @@ impl PeerManager {
                 addr,
                 reason
             );
-            let _ = peer.command_tx.send(PeerCommand::Disconnect).await;
+            queue_disconnect(&peer.command_tx);
         } else {
             // Regular inbound/outbound: discourage + disconnect. Core keeps
             // discouragement in a rolling in-memory filter; it is never
@@ -4533,10 +4555,7 @@ impl PeerManager {
             self.addr_manager.ban(&addr, self.config.ban_duration);
             self.discouraged
                 .discourage(addr.ip(), self.config.ban_duration);
-            let _ = self.peers[&peer_id]
-                .command_tx
-                .send(PeerCommand::Disconnect)
-                .await;
+            queue_disconnect(&self.peers[&peer_id].command_tx);
         }
     }
 
@@ -5024,10 +5043,12 @@ impl PeerManager {
                             .unwrap_or(false);
                         if peer_supports_addrv2 {
                             let entries = self.addr_manager.get_addrv2_for_sharing(cap);
+                            // Non-blocking: a getaddr reply is best-effort and
+                            // must not park the main loop on a peer that is not
+                            // reading (Core: fPauseSend, never a blocking send).
                             if !entries.is_empty() {
                                 let _ = self
-                                    .send_to_peer(*id, NetworkMessage::AddrV2(entries))
-                                    .await;
+                                    .try_send_to_peer(*id, NetworkMessage::AddrV2(entries));
                             }
                         } else {
                             let addrs = self.addr_manager.get_addresses_for_sharing(cap);
@@ -5045,8 +5066,7 @@ impl PeerManager {
                                 .collect();
                             if !timestamped_addrs.is_empty() {
                                 let _ = self
-                                    .send_to_peer(*id, NetworkMessage::Addr(timestamped_addrs))
-                                    .await;
+                                    .try_send_to_peer(*id, NetworkMessage::Addr(timestamped_addrs));
                             }
                         }
                     }
