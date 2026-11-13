@@ -13685,6 +13685,63 @@ impl RustoshiRpcServer for RpcServerImpl {
             ));
         }
 
+        // If the invalidated block is on the active chain, disconnect down to
+        // its parent. `disconnect_to` rewinds the UTXO set with the stored
+        // undo (a tip-pointer update alone leaves height H-1 with height-H
+        // coins). Core then calls ActivateBestChain.
+        //
+        // The disconnect runs BEFORE anything is marked failed, as in Core's
+        // Chainstate::InvalidateBlock, which marks each block only after
+        // DisconnectTip succeeded and returns false without marking when it
+        // fails. `disconnect_to` commits all-or-nothing, so when it fails
+        // (lost undo, prune depth cap, missing body) the chain is untouched
+        // and nothing may be flagged: marking first left the still-active tip
+        // FAILED_VALIDITY and told the P2P loop to drop every header building
+        // on it until someone ran reconsiderblock.
+        let mut check_hash = state.best_hash;
+        let mut needs_reorg = false;
+
+        while check_hash != Hash256::ZERO {
+            if check_hash == hash {
+                needs_reorg = true;
+                break;
+            }
+            if let Some(entry) = store.get_block_index(&check_hash).ok().flatten() {
+                check_hash = entry.prev_hash;
+            } else {
+                break;
+            }
+        }
+
+        let parent_tip = if needs_reorg {
+            Some((
+                block_entry.prev_hash,
+                block_entry.height.saturating_sub(1),
+            ))
+        } else {
+            None
+        };
+        drop(store);
+
+        if let Some((parent_hash, parent_height)) = parent_tip {
+            disconnect_to(&mut state, parent_hash, parent_height).map_err(|e| {
+                Self::rpc_error(
+                    rpc_error::RPC_DATABASE_ERROR,
+                    format!("invalidateblock: disconnect failed: {}", e),
+                )
+            })?;
+
+            tracing::info!(
+                "Chain tip rolled back to {} at height {}",
+                parent_hash,
+                parent_height
+            );
+        }
+
+        // Only now that the chain no longer contains the block (or never did)
+        // is it marked failed.
+        let store = BlockStore::new(&state.db);
+
         // Mark the block as invalid
         store.mark_block_invalid(&hash).map_err(|e| {
             Self::rpc_error(
@@ -13747,50 +13804,7 @@ impl RustoshiRpcServer for RpcServerImpl {
             inv.extend(descendants.iter().copied());
             state.push_event(crate::chain_lock::ChainEvent::Invalidated(inv));
         }
-
-        // If the invalidated block is on the active chain, disconnect down to
-        // its parent. `disconnect_to` rewinds the UTXO set with the stored
-        // undo (a tip-pointer update alone leaves height H-1 with height-H
-        // coins). Core then calls ActivateBestChain.
-        let mut check_hash = state.best_hash;
-        let mut needs_reorg = false;
-
-        while check_hash != Hash256::ZERO {
-            if check_hash == hash {
-                needs_reorg = true;
-                break;
-            }
-            if let Some(entry) = store.get_block_index(&check_hash).ok().flatten() {
-                check_hash = entry.prev_hash;
-            } else {
-                break;
-            }
-        }
-
-        let parent_tip = if needs_reorg {
-            Some((
-                block_entry.prev_hash,
-                block_entry.height.saturating_sub(1),
-            ))
-        } else {
-            None
-        };
         drop(store);
-
-        if let Some((parent_hash, parent_height)) = parent_tip {
-            disconnect_to(&mut state, parent_hash, parent_height).map_err(|e| {
-                Self::rpc_error(
-                    rpc_error::RPC_DATABASE_ERROR,
-                    format!("invalidateblock: disconnect failed: {}", e),
-                )
-            })?;
-
-            tracing::info!(
-                "Chain tip rolled back to {} at height {}",
-                parent_hash,
-                parent_height
-            );
-        }
 
         // Core InvalidateBlock -> InvalidChainFound re-adds every non-failed
         // block with data and at least as much work as the new tip, then the
@@ -21668,6 +21682,9 @@ mod tests {
 
     // cffix-rustoshi-reorg-bip68-coin-mtp: src/server/tests/cffix_reorg_bip68_tests.rs
     mod cffix_reorg_bip68_tests;
+
+    // sm-fix-rustoshi-invalidate-mark-order: src/server/tests/sm_fix_invalidate_mark_order_tests.rs
+    mod sm_fix_invalidate_mark_order_tests;
 
     // ==================================================================
     // #81 round 2: RPC integer arguments must be read at CORE'S WIDTH.
