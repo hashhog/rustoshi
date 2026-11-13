@@ -168,3 +168,41 @@ fn reorg_index_walk_ignores_matching_stale_row_above_old_tip() {
     assert_eq!((f.st.best_hash, f.st.best_height), (h, 4));
     assert_index_is_new_chain(&f, 0, 2);
 }
+
+/// The disconnect set the fork search returns sizes the prune-mode depth gate
+/// (`disconnect + connect > MAX_REORG_DEPTH` is refused). A shallow fork deep
+/// in a long chain must be measured as shallow: G..A150 active, fork at A140,
+/// B141..B152 arrive (disconnect 10 + connect 12). A fork search that missed
+/// the fork and collected the old chain down to genesis would count ~150
+/// disconnects and refuse the reorg in prune mode.
+#[test]
+fn reorg_index_walk_prune_gate_sees_only_blocks_above_fork() {
+    let mut f = build_fork(150, 140, 152);
+    f.st.prune_mode = true;
+    let (b, h) = (f.tip_block.clone(), f.tip_hash);
+    let r = try_attach_and_reorg_detailed(&mut f.st, &b, &h);
+    assert!(
+        matches!(r, Ok(true)),
+        "a 10-deep reorg must pass the prune-mode depth gate, got {:?}",
+        r.err().map(|e| e.reason)
+    );
+    assert_eq!((f.st.best_hash, f.st.best_height), (h, 152));
+    assert_index_is_new_chain(&f, 140, 150);
+}
+
+/// Control for the test above: the gate is live in this fixture. A fork at
+/// genesis under a 150-block chain really is deeper than MAX_REORG_DEPTH
+/// (disconnect 150 + connect 152), so prune mode refuses it.
+#[test]
+fn reorg_index_walk_prune_gate_control_refuses_deep_fork() {
+    let mut f = build_fork(150, 0, 152);
+    f.st.prune_mode = true;
+    let (b, h) = (f.tip_block.clone(), f.tip_hash);
+    let r = try_attach_and_reorg_detailed(&mut f.st, &b, &h);
+    let reason = r.err().map(|e| e.reason).unwrap_or_default();
+    assert!(
+        reason.contains("MAX_REORG_DEPTH"),
+        "expected the depth gate, got {reason:?}"
+    );
+    assert_eq!(f.st.best_height, 150, "tip unchanged");
+}
