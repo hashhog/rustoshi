@@ -206,3 +206,49 @@ fn reorg_index_walk_prune_gate_control_refuses_deep_fork() {
     );
     assert_eq!(f.st.best_height, 150, "tip unchanged");
 }
+
+/// The height index tracks the HEADER chain (header sync writes a row for
+/// every accepted header, `block_store.rs` `put_height_index`), so rows at or
+/// below the old tip can name blocks that are not active. Active G..A5;
+/// header sync has written B2..B6 (fork at A1), then a competing header
+/// branch C2, C3 (also off A1) over rows 2..3. B7 arrives and the reorg
+/// connects B2..B7. Row 5 already names B5, but rows 2..3 still name C: a
+/// walk that stopped on the first matching row would leave them. Every row
+/// above the fork must name B.
+#[test]
+fn reorg_index_walk_rewrites_header_branch_rows_above_fork() {
+    let mut f = build_fork(5, 1, 7);
+    {
+        let store = BlockStore::new(&f.db);
+        for (h, hash, _) in f.side.iter().filter(|(h, _, _)| *h <= 6) {
+            store.put_height_index(*h, hash).unwrap();
+        }
+        store.put_height_index(2, &Hash256([0xC2; 32])).unwrap();
+        store.put_height_index(3, &Hash256([0xC3; 32])).unwrap();
+    }
+    let (b, h) = (f.tip_block.clone(), f.tip_hash);
+    assert!(try_attach_and_reorg_detailed(&mut f.st, &b, &h).expect("reorg"));
+    assert_eq!((f.st.best_hash, f.st.best_height), (h, 7));
+    assert_index_is_new_chain(&f, 1, 5);
+}
+
+/// A header branch that forked BELOW the reorg's fork has left rows on the
+/// shared prefix: active G..A5, headers C2, C3 (off A1) over rows 2..3, and
+/// the reorg forks at A3 (B4..B6). At and below the fork the walk rewrites
+/// rows that differ and stops at the first one that matches (Core SetTip),
+/// so rows 3 and 2 are put back to A3 and A2, as the old walk to genesis
+/// did. (Only rows contiguous with the fork are reached: a differing row
+/// under a matching one is left, as it is between reorgs on master.)
+#[test]
+fn reorg_index_walk_repairs_differing_rows_below_fork() {
+    let mut f = build_fork(5, 3, 6);
+    {
+        let store = BlockStore::new(&f.db);
+        store.put_height_index(2, &Hash256([0xC2; 32])).unwrap();
+        store.put_height_index(3, &Hash256([0xC3; 32])).unwrap();
+    }
+    let (b, h) = (f.tip_block.clone(), f.tip_hash);
+    assert!(try_attach_and_reorg_detailed(&mut f.st, &b, &h).expect("reorg"));
+    assert_eq!((f.st.best_hash, f.st.best_height), (h, 6));
+    assert_index_is_new_chain(&f, 3, 5);
+}
