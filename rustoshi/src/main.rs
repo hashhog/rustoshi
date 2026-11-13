@@ -2575,11 +2575,30 @@ impl Drop for EventTiming<'_> {
 /// connects as a normal extension, `put_height_index` overwrites the invalid
 /// block at `height`, and the gap-fill downloader requests the sibling body.
 ///
-/// Only rewinds when the failed block IS the header tip — it never discards
-/// valid headers stacked above an invalid ancestor (that needs full
-/// `FAILED_CHILD` propagation, which the issue #5 sibling-adoption scenario
-/// does not exercise). Returns the height the header chain was rewound to, if
-/// any, so the caller can lower the reported RPC header height to match.
+/// (c) When the header tip is ABOVE the failed block (all of IBD and
+/// catch-up) and descends from it, every header between the failed block and
+/// the tip is marked `FAILED_CHILD` and the header chain is taken off the
+/// invalid branch, back to the failed block's parent. This is Core's
+/// `InvalidBlockFound` -> `InvalidChainFound` -> `SetBlockFailureFlags`
+/// (every descendant gets a failure flag; Core v31 writes BLOCK_FAILED_VALID,
+/// rustoshi's descendant sites write `FAILED_CHILD`, which every validity
+/// check treats the same) + `RecalculateBestHeader` (the best
+/// header leaves the invalid branch) (`src/validation.cpp`). Before this only
+/// the failed block was flagged: its header-only descendants stayed unflagged
+/// and the header tip stayed on the invalid branch, so an honest sibling with
+/// less header work than the invalid branch was "not heavier" and ignored.
+/// Descent is proven by walking `prev_block_hash` links down from the header
+/// tip; if the walk cannot reach the failed block's height on stored headers
+/// (or lands on a different block there) nothing beyond the failed block is
+/// marked. Descendants on side branches the header tip is not on are not
+/// walked: rustoshi tracks one linear header chain.
+///
+/// Callers must only call this for an invalid-block VERDICT
+/// (`connect_error_is_verdict`): a descendant marked on a non-verdict error
+/// would turn a valid chain invalid. Returns the height the header chain was
+/// rewound to, if any, so the caller can lower the reported RPC header height
+/// to match, and the `(child, parent)` pairs it marked `FAILED_CHILD` so the
+/// caller can add them to its session caches.
 fn mark_connect_failed_block_invalid(
     block_store: &BlockStore,
     header_sync: &mut HeaderSync,
@@ -2587,7 +2606,7 @@ fn mark_connect_failed_block_invalid(
     block: &rustoshi_primitives::Block,
     block_hash: Hash256,
     height: u32,
-) -> Option<u32> {
+) -> ConnectFailMark {
     // (a) Persist a BLOCK_FAILED_VALID-equivalent index entry. The connect
     //     path drops the block before its success-path `put_block_index`, so we
     //     synthesize the entry here (preserving any status bits an earlier
@@ -2647,9 +2666,134 @@ fn mark_connect_failed_block_invalid(
              parent {} (height {}) so an honest sibling can connect",
             block_hash, height, block.header.prev_block_hash, parent_height
         );
-        return Some(parent_height);
+        return ConnectFailMark {
+            rewound_to: Some(parent_height),
+            failed_children: Vec::new(),
+        };
     }
-    None
+
+    // (c) The header tip is above the failed block: flag the descendants the
+    //     header chain holds and take the header tip off them.
+    let tip_height = header_sync.best_header_height();
+    if height > 0 && tip_height > height {
+        if let Some(children) = header_chain_descendants(
+            block_store,
+            header_sync.best_header_hash(),
+            tip_height,
+            block_hash,
+            height,
+        ) {
+            for (child, _) in &children {
+                match block_store.get_block_index(child) {
+                    Ok(Some(mut e)) => {
+                        e.status.set(BlockStatus::FAILED_CHILD);
+                        if let Err(err) = block_store.put_block_index(child, &e) {
+                            tracing::error!(
+                                "failed to persist FAILED_CHILD for descendant {} of invalid block {}: {}",
+                                child, block_hash, err
+                            );
+                        }
+                    }
+                    // Not indexed: the caller's session cache holds it.
+                    Ok(None) => {}
+                    Err(err) => tracing::error!(
+                        "get_block_index({}) while marking descendants of {}: {}",
+                        child, block_hash, err
+                    ),
+                }
+            }
+            let mut invalid: std::collections::HashSet<Hash256> =
+                children.iter().map(|(c, _)| *c).collect();
+            invalid.insert(block_hash);
+            let rewound_to = rewind_headers_off_invalid_branch(
+                block_store,
+                header_sync,
+                block_downloader,
+                &invalid,
+                (block.header.prev_block_hash, height - 1),
+            );
+            tracing::warn!(
+                "invalid block {} at height {}: marked {} header-chain descendant(s) FAILED_CHILD \
+                 up to header tip height {} (Core InvalidChainFound / SetBlockFailureFlags)",
+                block_hash,
+                height,
+                children.len(),
+                tip_height
+            );
+            return ConnectFailMark {
+                rewound_to,
+                failed_children: children,
+            };
+        }
+    }
+    ConnectFailMark {
+        rewound_to: None,
+        failed_children: Vec::new(),
+    }
+}
+
+/// What [`mark_connect_failed_block_invalid`] did beyond flagging the failed
+/// block itself.
+#[derive(Debug, Default)]
+struct ConnectFailMark {
+    /// Height the header chain was rewound to, if it was.
+    rewound_to: Option<u32>,
+    /// `(child, parent)` for every header-chain descendant marked
+    /// `FAILED_CHILD`, lowest first.
+    failed_children: Vec<(Hash256, Hash256)>,
+}
+
+/// Session-cache bound shared with `filter_incoming_headers`: the block index
+/// stays the source of truth past it.
+const FAILED_CHILD_SESSION_CAP: usize = 100_000;
+
+/// Add a [`ConnectFailMark`]'s descendants to the connect loop's session
+/// caches, so the header filter drops them in O(1) and `reconsiderblock`'s
+/// child -> parent walk can clear them again.
+fn note_failed_children(
+    mark: &ConnectFailMark,
+    invalid_block_hashes: &mut std::collections::HashSet<Hash256>,
+    failed_child_parent: &mut std::collections::HashMap<Hash256, Hash256>,
+) {
+    for (child, parent) in &mark.failed_children {
+        if invalid_block_hashes.len() < FAILED_CHILD_SESSION_CAP {
+            invalid_block_hashes.insert(*child);
+        }
+        if failed_child_parent.len() < FAILED_CHILD_SESSION_CAP {
+            failed_child_parent.insert(*child, *parent);
+        }
+    }
+}
+
+/// The header-chain blocks above `ancestor` (at `ancestor_height`), as
+/// `(child, parent)` pairs ordered lowest first, when the header tip
+/// (`tip_hash` at `tip_height`) descends from `ancestor`. Proven by walking
+/// stored headers' `prev_block_hash` links down from the tip. `None` when the
+/// tip does not descend from `ancestor`, or the walk cannot be completed
+/// (missing header, read error): the caller then marks nothing.
+fn header_chain_descendants(
+    block_store: &BlockStore,
+    tip_hash: Hash256,
+    tip_height: u32,
+    ancestor: Hash256,
+    ancestor_height: u32,
+) -> Option<Vec<(Hash256, Hash256)>> {
+    if tip_height <= ancestor_height {
+        return None;
+    }
+    let mut out = Vec::with_capacity((tip_height - ancestor_height) as usize);
+    let (mut walk, mut walk_h) = (tip_hash, tip_height);
+    while walk_h > ancestor_height {
+        let header = block_store.get_header(&walk).ok().flatten()?;
+        out.push((walk, header.prev_block_hash));
+        walk = header.prev_block_hash;
+        walk_h -= 1;
+    }
+    if walk != ancestor {
+        return None;
+    }
+    out.reverse();
+    Some(out)
 }
 
 /// After an attach-and-reorg attempt proved a side branch invalid, take the
@@ -6222,14 +6366,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     // re-pinning the invalid block forever.
                     if connect_invalid {
                         invalid_block_hashes.insert(block_hash);
-                        if let Some(parent_height) = mark_connect_failed_block_invalid(
+                        let mark = mark_connect_failed_block_invalid(
                             &block_store,
                             &mut header_sync,
                             &mut block_downloader,
                             &block,
                             block_hash,
                             height,
-                        ) {
+                        );
+                        note_failed_children(
+                            &mark,
+                            &mut invalid_block_hashes,
+                            &mut failed_child_parent,
+                        );
+                        if let Some(parent_height) = mark.rewound_to {
                             let mut rpc = rpc_state.write().await;
                             if rpc.header_height > parent_height {
                                 rpc.header_height = parent_height;
@@ -7673,14 +7823,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                     // invalid block forever.
                                     if connect_invalid {
                                         invalid_block_hashes.insert(block_hash);
-                                        if let Some(parent_height) = mark_connect_failed_block_invalid(
+                                        let mark = mark_connect_failed_block_invalid(
                                             &block_store,
                                             &mut header_sync,
                                             &mut block_downloader,
                                             &block,
                                             block_hash,
                                             height,
-                                        ) {
+                                        );
+                                        note_failed_children(
+                                            &mark,
+                                            &mut invalid_block_hashes,
+                                            &mut failed_child_parent,
+                                        );
+                                        if let Some(parent_height) = mark.rewound_to {
                                             let mut rpc = rpc_state.write().await;
                                             if rpc.header_height > parent_height {
                                                 rpc.header_height = parent_height;
