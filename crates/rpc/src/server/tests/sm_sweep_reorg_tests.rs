@@ -87,7 +87,6 @@ fn sm_sweep_reorg_clears_recently_rejected() {
 /// at the fork point (Core) never reaches height 0; the walk to genesis
 /// overwrites it today.
 #[test]
-#[ignore = "sm-sweep-rustoshi gap C-2: fails on master until sm-fix-rustoshi-reorg-index-walk"]
 fn sm_sweep_reorg_does_not_rewrite_height_index_below_fork() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(ChainDb::open(tmp.path()).unwrap());

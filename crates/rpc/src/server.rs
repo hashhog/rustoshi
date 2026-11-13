@@ -21665,6 +21665,8 @@ mod tests {
 
     // State-machine sweep (sm-sweep-rustoshi): src/server/tests/sm_sweep_reorg_tests.rs
     mod sm_sweep_reorg_tests;
+    // sm-fix-rustoshi-reorg-index-walk: src/server/tests/sm_fix_reorg_index_walk_tests.rs
+    mod sm_fix_reorg_index_walk_tests;
 
     // cffix-rustoshi-reorg-bip68-coin-mtp: src/server/tests/cffix_reorg_bip68_tests.rs
     mod cffix_reorg_bip68_tests;
