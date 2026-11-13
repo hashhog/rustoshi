@@ -6165,39 +6165,67 @@ pub fn try_attach_and_reorg_detailed(
     // Cross-impl reference: camlcoin lib/sync.ml::reorganize (commit 22667c2),
     // which collects `disconnected_txs` during its disconnect pass and then
     // calls `Mempool.add_transaction` per tx after the UTXO flush.
-    let disconnected_blocks: Vec<Block> = {
-        // Build a set of new-chain ancestor hashes up to/including the genesis
-        // walk-distance bounded by the new height (cheap; tens of entries for
-        // typical reorgs, capped well under 1k for adversarial inputs).
-        let mut new_chain_set: std::collections::HashSet<Hash256> =
-            std::collections::HashSet::new();
-        let mut walk = *block_hash;
-        let mut steps = new_height + 16;
-        while walk != Hash256::ZERO && steps > 0 {
-            new_chain_set.insert(walk);
-            steps -= 1;
-            match get_block_index(&walk) {
-                Some(e) => walk = e.prev_hash,
-                None => break,
+    let (disconnected_blocks, fork_height): (Vec<Block>, Option<u32>) = {
+        // Find the fork point by stepping two cursors back by height, like
+        // Core's LastCommonAncestor (chain.cpp) / CChain::FindFork: the
+        // deeper cursor steps first, then both step together until they
+        // meet. This touches only the blocks above the fork on each side,
+        // O(reorg depth). (Previously this built a hash set of the whole new
+        // chain back to genesis: ~975k index reads per reorg on mainnet.)
+        // Uses only prev_hash links, never the height index (which tracks
+        // the header chain, not the active chain). `fork_height` is None when
+        // a lookup failed and the cursors never met.
+        let prev_of = |h: &Hash256| -> Option<Hash256> {
+            if h == block_hash {
+                // The arriving block may not be in the index yet; its parent
+                // is in the header.
+                Some(block.header.prev_block_hash)
+            } else {
+                get_block_index(h).map(|e| e.prev_hash)
             }
-        }
+        };
         let mut collected: Vec<Block> = Vec::new();
+        let mut new_walk = *block_hash;
+        let mut new_h = new_height;
         let mut old_walk = state.best_hash;
-        let mut old_steps = state.best_height + 16;
-        while old_walk != Hash256::ZERO && old_steps > 0 {
-            if new_chain_set.contains(&old_walk) {
-                break; // hit fork point
+        let mut old_h = state.best_height;
+        'fork: {
+            while new_h > old_h {
+                match prev_of(&new_walk) {
+                    Some(p) => new_walk = p,
+                    None => break 'fork,
+                }
+                new_h -= 1;
             }
-            old_steps -= 1;
-            if let Some(b) = get_block(&old_walk) {
-                collected.push(b);
-            }
-            match get_block_index(&old_walk) {
-                Some(e) => old_walk = e.prev_hash,
-                None => break,
+            while old_walk != Hash256::ZERO && old_walk != new_walk {
+                // Old cursor at or above the new one: this old block is on
+                // the soon-to-be-disconnected suffix.
+                if let Some(b) = get_block(&old_walk) {
+                    collected.push(b);
+                }
+                match get_block_index(&old_walk) {
+                    Some(e) => old_walk = e.prev_hash,
+                    None => break 'fork,
+                }
+                if old_h == 0 {
+                    break 'fork;
+                }
+                old_h -= 1;
+                if old_h < new_h {
+                    match prev_of(&new_walk) {
+                        Some(p) => new_walk = p,
+                        None => break 'fork,
+                    }
+                    new_h -= 1;
+                }
             }
         }
-        collected
+        let fork_height = if old_walk != Hash256::ZERO && old_walk == new_walk {
+            Some(old_h)
+        } else {
+            None
+        };
+        (collected, fork_height)
     };
 
     let original_tip_height = state.best_height;
@@ -6361,9 +6389,18 @@ pub fn try_attach_and_reorg_detailed(
         .flush_into_batch(&mut batch)
         .map_err(|e| format!("flush utxo view into batch (reorg): {}", e))?;
 
-    // Update height index for the new branch. Walk back from the new tip
-    // overwriting old entries until we reach genesis or run out of index
-    // entries. Stale entries above the new tip are explicitly deleted below.
+    // Update height index for the new branch. Walk back from the new tip.
+    // Above the fork every row is written without reading it: this index
+    // tracks the HEADER chain (block_store.rs put_height_index), so a row
+    // there may already name a new-branch block while the rows under it name
+    // a competing header branch, and a match proves nothing. At and below the
+    // fork the blocks are shared by both chains; rewrite only rows that
+    // differ and stop at the first one that already names the block, like
+    // Core CChain::SetTip (chain.cpp), which walks back only
+    // `while (pindex && vChain[pindex->nHeight] != pindex)`. Walking to
+    // genesis wrote ~975k unchanged rows per reorg on mainnet. With no fork
+    // height (a lookup failed above) the walk goes to genesis as before.
+    // Stale entries above the new tip are explicitly deleted below.
     {
         let mut walk = new_tip_hash;
         let mut walk_h = new_tip_height;
@@ -6373,6 +6410,16 @@ pub fn try_attach_and_reorg_detailed(
                 break;
             }
             steps -= 1;
+            // The fork was found for `block_hash`; only trust it for that tip.
+            if new_tip_hash == *block_hash
+                && fork_height.is_some_and(|f| walk_h <= f)
+                && store
+                .get_hash_by_height(walk_h)
+                .map_err(|e| format!("get_hash_by_height walk: {}", e))?
+                == Some(walk)
+            {
+                break;
+            }
             store
                 .batch_put_height_index(&mut batch, walk_h, &walk)
                 .map_err(|e| format!("batch_put_height_index: {}", e))?;
