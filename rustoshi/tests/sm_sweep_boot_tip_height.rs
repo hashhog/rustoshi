@@ -19,9 +19,9 @@
 //! height index and a tip, waits for the boot log line `Chain tip: <hash>
 //! (height N)`, stops the child, and reads back the persisted tip.
 //!
-//! Marked `#[ignore]`: it fails on master by design (the sweep confirms the
-//! gap, it does not fix it). Run with
-//! `cargo test -p rustoshi --test sm_sweep_boot_tip_height -- --include-ignored`.
+//! Fixed by sm-fix-rustoshi-boot-tip-height: boot now takes the height from
+//! the tip's block-index entry, so the test runs by default. Run with
+//! `cargo test -p rustoshi --test sm_sweep_boot_tip_height`.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
@@ -52,6 +52,28 @@ fn fake_hash(h: u32) -> Hash256 {
 /// logs its chain tip, then stop it. Returns (height in the boot log line,
 /// height persisted in CF_META after boot).
 fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
+    boot_with(lo, tip, tip, true)
+}
+
+/// Like `boot_with_tip`, but the stored best-block height is `stored` (which
+/// may differ from the tip's real height `tip`), and the tip's block-index
+/// entry is written only when `with_index_entry` is set.
+fn boot_with(lo: u32, tip: u32, stored: u32, with_index_entry: bool) -> (u32, u32) {
+    let (logged, persisted, log) = boot_raw(lo, tip, stored, with_index_entry, false);
+    let logged = logged.unwrap_or_else(|| panic!("no `Chain tip:` boot line in:\n{log}"));
+    (logged, persisted)
+}
+
+/// Prepare and boot as `boot_with`; with `corrupt_index_entry` the tip's
+/// block-index entry is replaced by undecodable bytes. Returns (height in the
+/// boot log line if one was printed, height persisted after boot, boot log).
+fn boot_raw(
+    lo: u32,
+    tip: u32,
+    stored: u32,
+    with_index_entry: bool,
+    corrupt_index_entry: bool,
+) -> (Option<u32>, u32, String) {
     let params = ChainParams::regtest();
     let tmp = tempfile::tempdir().unwrap();
     let datadir = tmp.path().join("node");
@@ -69,23 +91,33 @@ fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
         let mut status = BlockStatus::new();
         status.set(BlockStatus::VALID_SCRIPTS);
         status.set(BlockStatus::HAVE_DATA);
-        store
-            .put_block_index(
-                &fake_hash(tip),
-                &BlockIndexEntry {
-                    height: tip,
-                    status,
-                    n_tx: 1,
-                    timestamp: 1_700_000_000,
-                    bits: 0x207f_ffff,
-                    nonce: 0,
-                    version: 0x2000_0000,
-                    prev_hash: fake_hash(tip - 1),
-                    chain_work: [0u8; 32],
-                },
+        if with_index_entry {
+            store
+                .put_block_index(
+                    &fake_hash(tip),
+                    &BlockIndexEntry {
+                        height: tip,
+                        status,
+                        n_tx: 1,
+                        timestamp: 1_700_000_000,
+                        bits: 0x207f_ffff,
+                        nonce: 0,
+                        version: 0x2000_0000,
+                        prev_hash: fake_hash(tip - 1),
+                        chain_work: [0u8; 32],
+                    },
+                )
+                .unwrap();
+        }
+        if corrupt_index_entry {
+            db.put_cf(
+                rustoshi_storage::CF_BLOCK_INDEX,
+                fake_hash(tip).as_bytes(),
+                &[0xff, 0xff, 0xff],
             )
             .unwrap();
-        store.set_best_block(&fake_hash(tip), tip).unwrap();
+        }
+        store.set_best_block(&fake_hash(tip), stored).unwrap();
     }
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_rustoshi"))
@@ -143,11 +175,10 @@ fn boot_with_tip(lo: u32, tip: u32) -> (u32, u32) {
     // This is the test's own child process on a scratch regtest datadir.
     let _ = child.kill();
     let _ = child.wait();
-    let logged = logged.unwrap_or_else(|| panic!("no `Chain tip:` boot line in:\n{log}"));
 
     let db = ChainDb::open(&chainstate).expect("reopen chainstate");
     let persisted = BlockStore::new(&db).get_best_height().unwrap().unwrap();
-    (logged, persisted)
+    (logged, persisted, log)
 }
 
 /// Control: below the 1,000,000 cap the boot scan finds the tip, so the
@@ -160,9 +191,9 @@ fn boot_tip_height_below_one_million_is_kept() {
 }
 
 /// The gap: a tip above 1,000,000 is re-derived to a wrong height and that
-/// wrong height is written back to disk. Fails on master.
+/// wrong height is written back to disk. Failed before
+/// sm-fix-rustoshi-boot-tip-height.
 #[test]
-#[ignore = "sm-sweep-rustoshi gap B-1: fails on master until sm-fix-rustoshi-boot-tip-height"]
 fn boot_tip_height_above_one_million_is_kept() {
     let (logged, persisted) = boot_with_tip(995_000, 1_000_005);
     assert_eq!(
@@ -170,4 +201,49 @@ fn boot_tip_height_above_one_million_is_kept() {
         "boot derived the wrong tip height (Core LoadChainTip uses the tip's index entry)"
     );
     assert_eq!(persisted, 1_000_005, "boot persisted the wrong tip height");
+}
+
+/// The stored height is a stale counter (the "cumulative counter" case the
+/// legacy scan guessed at) and disagrees with the tip's block-index entry.
+/// Boot must take the entry's height, not guess from the height index.
+#[test]
+fn boot_tip_height_comes_from_block_index_not_stored_counter() {
+    let (logged, persisted) = boot_with(995_000, 1_000_005, 3_000_000, true);
+    assert_eq!(
+        logged, 1_000_005,
+        "boot must use the tip's block-index height"
+    );
+    assert_eq!(
+        persisted, 1_000_005,
+        "boot must persist the tip's block-index height"
+    );
+}
+
+/// Control for the kept fallback: a tip with no block-index entry is still
+/// found by the legacy height-index scan below 1,000,000.
+#[test]
+fn boot_tip_without_index_entry_keeps_legacy_scan() {
+    let (logged, persisted) = boot_with(490_000, 500_000, 500_000, false);
+    assert_eq!(logged, 500_000);
+    assert_eq!(persisted, 500_000);
+}
+
+/// A tip whose block-index entry cannot be read must not be treated as "no
+/// entry": that would run the capped legacy scan and write a wrong height to
+/// disk. Boot must stop before choosing a tip and leave the stored height alone.
+#[test]
+fn boot_tip_corrupt_index_entry_is_not_guessed() {
+    let (logged, persisted, log) = boot_raw(995_000, 1_000_005, 1_000_005, false, true);
+    assert_eq!(
+        logged, None,
+        "boot guessed a tip height past an unreadable block-index entry:\n{log}"
+    );
+    assert_eq!(
+        persisted, 1_000_005,
+        "boot overwrote the stored tip height past an unreadable block-index entry"
+    );
+    assert!(
+        log.contains("BlockIndexEntry: expected"),
+        "boot must stop on the block-index decode error, not for another reason:\n{log}"
+    );
 }
