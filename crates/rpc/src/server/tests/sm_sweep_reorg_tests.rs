@@ -134,7 +134,6 @@ fn sm_sweep_reorg_does_not_rewrite_height_index_below_fork() {
 /// marking anything when DisconnectTip fails (validation.cpp
 /// Chainstate::InvalidateBlock).
 #[tokio::test]
-#[ignore = "sm-sweep-rustoshi gap C-3: fails on master until sm-fix-rustoshi-invalidate-mark-order"]
 async fn sm_sweep_invalidate_with_failed_disconnect_leaves_no_marks() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
