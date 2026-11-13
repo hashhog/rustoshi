@@ -5,7 +5,7 @@
 //! does not fix them. They are `#[ignore]`d so CI stays green; run with
 //! `cargo test -p rustoshi-network sm_sweep -- --include-ignored`.
 //! A test whose gap has been fixed drops its `#[ignore]` and runs normally
-//! (D-1b: peers-rustoshi-outbound).
+//! (D-1b: peers-rustoshi-outbound; D-1a: sm-fix-rustoshi-chain-sync-eviction).
 
 use super::*;
 use crate::stale_detection::{CHAIN_SYNC_TIMEOUT, HEADERS_RESPONSE_TIME};
@@ -69,7 +69,6 @@ async fn sm_sweep_control_lagging_full_relay_peer_is_evicted() {
 /// (net.h `CNode::IsOutboundOrBlockRelayConn`). A `--connect`-pinned node
 /// therefore drops its only configured peers every ~23 minutes.
 #[tokio::test]
-#[ignore = "sm-sweep-rustoshi gap D-1: fails on master until sm-fix-rustoshi-chain-sync-eviction"]
 async fn sm_sweep_manual_and_feeler_peers_are_not_chain_sync_evicted() {
     for (i, ct) in [ConnectionType::Manual, ConnectionType::Feeler].into_iter().enumerate() {
         let (_d, mut mgr) = mgr();
@@ -88,6 +87,56 @@ async fn sm_sweep_manual_and_feeler_peers_are_not_chain_sync_evicted() {
             "{ct:?} peer was disconnected for chain-sync timeout; Core exempts it \
              (IsOutboundOrBlockRelayConn is false)"
         );
+    }
+}
+
+/// Control for D-1a: the exemption is not wider than Core's. A lagging
+/// BLOCK-RELAY-ONLY outbound peer is still chain-sync evicted, because
+/// `IsOutboundOrBlockRelayConn` is true for BLOCK_RELAY.
+#[tokio::test]
+async fn sm_sweep_control_lagging_block_relay_only_peer_is_evicted() {
+    let (_d, mut mgr) = mgr();
+    mgr.update_tip_height(100);
+    let peer = PeerId(12);
+    let _rx = mgr.insert_test_peer_with_flags(
+        peer,
+        "192.0.2.12:8333".parse().unwrap(),
+        ConnectionType::BlockRelayOnly,
+        false,
+    );
+    backdate_connect(&mut mgr, peer);
+    mgr.get_peer_stale_state_mut(peer).unwrap().best_known_height = 50;
+    assert!(
+        run_chain_sync_ticks(&mut mgr, peer).await,
+        "lagging block-relay-only peer was not chain-sync evicted; Core evicts it"
+    );
+}
+
+/// D-1a reaches production: the dial paths for operator-named peers open
+/// them as `Manual`, as Core does (`ConnectionType::MANUAL` for `-connect` in
+/// net.cpp `ThreadOpenConnections` and for `addnode onetry` in rpc/net.cpp).
+/// If they dialed `FullRelay`, the chain-sync exemption above would never
+/// apply to a live `-connect` / `addnode` peer.
+#[tokio::test]
+async fn sm_sweep_connect_and_onetry_peers_dial_as_manual() {
+    let onetry: SocketAddr = "192.0.2.20:8333".parse().unwrap();
+    let pinned: SocketAddr = "192.0.2.21:8333".parse().unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut config = PeerManagerConfig::testnet4().with_data_dir(dir.path().to_path_buf());
+    config.connect_peers = vec![pinned];
+    let mut mgr = PeerManager::new(config, ChainParams::testnet4());
+
+    mgr.connect_to_peer(onetry).await;
+    mgr.maintain_connect_peers().await;
+
+    for addr in [onetry, pinned] {
+        let ct = mgr
+            .peers
+            .values()
+            .find(|p| p.info.addr == addr)
+            .map(|p| p.conn_type)
+            .unwrap_or_else(|| panic!("{addr} was not dialed"));
+        assert_eq!(ct, ConnectionType::Manual, "{addr} dialed as {ct:?}, Core uses MANUAL");
     }
 }
 

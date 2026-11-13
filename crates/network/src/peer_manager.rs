@@ -2497,6 +2497,18 @@ pub enum ConnectionType {
     Feeler,
 }
 
+impl ConnectionType {
+    /// Core `CNode::IsOutboundOrBlockRelayConn` (net.h): true only for
+    /// full-relay and block-relay-only outbound connections. MANUAL, FEELER
+    /// and INBOUND are false. Gates chain-sync eviction (ConsiderEviction).
+    pub fn is_outbound_or_block_relay(self) -> bool {
+        match self {
+            ConnectionType::FullRelay | ConnectionType::BlockRelayOnly => true,
+            ConnectionType::Inbound | ConnectionType::Manual | ConnectionType::Feeler => false,
+        }
+    }
+}
+
 /// Result of checking for stale peers.
 #[derive(Debug, Clone, Default)]
 pub struct StalePeerCheckResult {
@@ -3491,8 +3503,11 @@ impl PeerManager {
     }
 
     /// Immediately initiate an outbound connection to a peer (for addnode "onetry").
+    ///
+    /// Core opens it as `ConnectionType::MANUAL` (rpc/net.cpp `addnode`
+    /// onetry -> `OpenNetworkConnection(..., ConnectionType::MANUAL, ...)`).
     pub async fn connect_to_peer(&mut self, addr: SocketAddr) {
-        self.dial(addr, ConnectionType::FullRelay, true).await;
+        self.dial(addr, ConnectionType::Manual, true).await;
     }
 
     /// Connect to anchor peers (block-relay-only connections from previous session).
@@ -3768,8 +3783,10 @@ impl PeerManager {
     /// connected or connecting. Used in place of the addrman-driven
     /// `fill_outbound_connections` when `config.connect_peers` is non-empty.
     ///
-    /// Each pinned peer is dialed as a `FullRelay` outbound (Core treats
-    /// `-connect` peers as manual full-relay connections). A pinned peer is
+    /// Each pinned peer is dialed as a `Manual` outbound: Core opens
+    /// `-connect` peers as `ConnectionType::MANUAL` (net.cpp
+    /// `ThreadOpenConnections` with `connect` set), which relays blocks and
+    /// transactions but is exempt from chain-sync eviction and ban/discourage. A pinned peer is
     /// considered "already handled" if there is an outbound `PeerHandle` to
     /// the same `SocketAddr` in `Connecting` or `Established` state; otherwise
     /// we open a fresh connection. This gives Core/clearbit reconnect
@@ -3799,7 +3816,7 @@ impl PeerManager {
             }
             self.connect_attempt_at.insert(addr, now);
             tracing::info!("Connecting to pinned -connect peer {}", addr);
-            self.dial(addr, ConnectionType::FullRelay, true).await;
+            self.dial(addr, ConnectionType::Manual, true).await;
         }
     }
 
@@ -5322,7 +5339,11 @@ impl PeerManager {
             .iter()
             .filter(|(_, p)| p.info.state == PeerState::Established)
             .map(|(id, p)| {
-                let is_outbound = p.conn_type != ConnectionType::Inbound;
+                // Core runs ConsiderEviction only for
+                // IsOutboundOrBlockRelayConn() (net.h): full-relay and
+                // block-relay-only outbound. Inbound, MANUAL (-connect /
+                // -addnode) and FEELER peers are never chain-sync evicted.
+                let is_outbound = p.conn_type.is_outbound_or_block_relay();
                 let is_protected = p.stale_state.chain_sync.protected;
                 (*id, is_outbound, is_protected)
             })
