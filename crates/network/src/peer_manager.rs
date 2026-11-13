@@ -3045,19 +3045,20 @@ impl PeerManager {
         sent
     }
 
-    /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS |
-    /// NODE_NETWORK_LIMITED, plus NODE_BLOOM when `peer_bloom_filters` is
-    /// enabled — Bitcoin Core's `g_local_services` after `init.cpp`'s
-    /// `-peerbloomfilters` gate).
+    /// Service flags advertised by this node (NODE_WITNESS |
+    /// NODE_NETWORK_LIMITED, plus NODE_NETWORK when not pruning and NODE_BLOOM
+    /// when `peer_bloom_filters` is enabled — Bitcoin Core's
+    /// `g_local_services` after `init.cpp`'s prune and `-peerbloomfilters`
+    /// gates).
     ///
     /// NODE_NETWORK_LIMITED (BIP-159, bit 10) is advertised UNCONDITIONALLY,
     /// matching Core: `init.cpp:863` seeds `g_local_services` with
     /// `NODE_NETWORK_LIMITED | NODE_WITNESS` and `init.cpp:1950` adds
     /// `NODE_NETWORK` in non-prune mode. A full non-pruned node serves the
     /// whole chain, so it can always serve the recent-288-block window the bit
-    /// promises. (It is NOT prune-gated — a prune node would advertise
-    /// NODE_NETWORK_LIMITED *without* NODE_NETWORK, but the LIMITED bit itself
-    /// is set in both cases.)
+    /// promises. The LIMITED bit is set in both cases; NODE_NETWORK is
+    /// prune-gated: a pruned node advertises NODE_NETWORK_LIMITED *without*
+    /// NODE_NETWORK, so peers do not ask it for blocks it has deleted.
     ///
     /// NODE_COMPACT_FILTERS (BIP-157, bit 6) is gated through
     /// [`should_advertise_compact_filters`]; as of FIX-82 the gate returns
@@ -3072,7 +3073,14 @@ impl PeerManager {
         // non-pruned node always carries NODE_NETWORK_LIMITED — the bit means
         // "can serve >=288 recent blocks", which is trivially true when the
         // node serves the entire chain. It is NOT prune-only.
-        let mut s = NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED;
+        let mut s = NODE_WITNESS | NODE_NETWORK_LIMITED;
+        // NODE_NETWORK ("can serve the full chain") only in non-prune mode,
+        // matching Core's `init.cpp:1947-1950` ("Setting NODE_NETWORK in
+        // non-prune mode"). A pruned node that set it would draw getdata for
+        // blocks it has already deleted.
+        if !self.config.prune_mode {
+            s |= NODE_NETWORK;
+        }
         if self.config.peer_bloom_filters {
             s |= NODE_BLOOM;
         }
@@ -7795,9 +7803,9 @@ mod tests {
     }
 
     /// BIP-159: when prune mode is enabled the version handshake must
-    /// advertise NODE_NETWORK_LIMITED so peers don't request pre-prune-horizon
-    /// blocks. Core also advertises NODE_NETWORK alongside it (the node still
-    /// has the recent-288 archive), so we keep NODE_NETWORK set as well.
+    /// advertise NODE_NETWORK_LIMITED and NOT NODE_NETWORK, so peers don't
+    /// request pre-prune-horizon blocks. Core only adds NODE_NETWORK in
+    /// non-prune mode (`init.cpp:1947-1950`).
     #[test]
     fn test_node_network_limited_advertised_when_prune_on() {
         let mut config = PeerManagerConfig::testnet4();
@@ -7810,14 +7818,16 @@ mod tests {
             services & NODE_NETWORK_LIMITED != 0,
             "NODE_NETWORK_LIMITED must be advertised when prune_mode=true"
         );
-        // Core keeps NODE_NETWORK set in the auto-prune case too.
-        assert!(services & NODE_NETWORK != 0);
+        // Core does not set NODE_NETWORK in prune mode.
+        assert_eq!(services & NODE_NETWORK, 0);
         assert!(services & NODE_WITNESS != 0);
 
         let addr: SocketAddr = "192.168.1.1:48333".parse().unwrap();
         let version = mgr.build_version_message(addr);
         assert!(version.services & NODE_NETWORK_LIMITED != 0);
         assert!(version.addr_from.services & NODE_NETWORK_LIMITED != 0);
+        assert_eq!(version.services & NODE_NETWORK, 0);
+        assert_eq!(version.addr_from.services & NODE_NETWORK, 0);
     }
 
     #[test]

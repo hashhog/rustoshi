@@ -184,14 +184,14 @@ async fn sm_sweep_peer_relaying_our_tip_is_not_chain_sync_evicted() {
 
 /// Gap D-4: NODE_NETWORK is advertised in prune mode.
 ///
-/// `local_services` sets NODE_NETWORK unconditionally. Core only adds it when
+/// `local_services` set NODE_NETWORK unconditionally (fixed by
+/// sm-fix-rustoshi-prune-node-network). Core only adds it when
 /// not pruning and with no historical (background) chainstate (init.cpp,
 /// "Setting NODE_NETWORK in non-prune mode"); a pruned node advertises
 /// NODE_NETWORK_LIMITED only, so peers do not ask it for blocks it deleted.
-/// The existing `test_node_network_limited_advertised_when_prune_on` asserts
-/// the current (wrong) behaviour and must be flipped by the fix.
+/// `test_node_network_limited_advertised_when_prune_on` was flipped with the
+/// fix; it asserted the old behaviour.
 #[test]
-#[ignore = "sm-sweep-rustoshi gap D-4: fails on master until sm-fix-rustoshi-prune-node-network"]
 fn sm_sweep_prune_mode_does_not_advertise_node_network() {
     let mut config = PeerManagerConfig::testnet4();
     config.prune_mode = true;
