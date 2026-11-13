@@ -3033,10 +3033,11 @@ impl PeerManager {
         sent
     }
 
-    /// Service flags advertised by this node (NODE_NETWORK | NODE_WITNESS |
-    /// NODE_NETWORK_LIMITED, plus NODE_BLOOM when `peer_bloom_filters` is
-    /// enabled — Bitcoin Core's `g_local_services` after `init.cpp`'s
-    /// `-peerbloomfilters` gate).
+    /// Service flags advertised by this node (NODE_WITNESS |
+    /// NODE_NETWORK_LIMITED, plus NODE_NETWORK when not pruning and NODE_BLOOM
+    /// when `peer_bloom_filters` is enabled — Bitcoin Core's
+    /// `g_local_services` after `init.cpp`'s prune and `-peerbloomfilters`
+    /// gates).
     ///
     /// NODE_NETWORK_LIMITED (BIP-159, bit 10) is advertised UNCONDITIONALLY,
     /// matching Core: `init.cpp:863` seeds `g_local_services` with
