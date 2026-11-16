@@ -2588,6 +2588,19 @@ impl WalletRpcServer for WalletRpcImpl {
         // "Amount out of range", before CreateTransaction.
         let amount_sats = Self::amount_from_value(&amount)?;
 
+        // Core ParseOutputs (rpc/rawtransaction_util.cpp:117-121), reached
+        // from sendtoaddress via CreateRecipients(ParseOutputs(...)): the
+        // amount is parsed first, then an undecodable destination is -5
+        // "Invalid Bitcoin address: <addr>", before coin selection. Without
+        // this check the wallet's own "invalid address: <addr>" text leaked out.
+        let network = state.wallet_manager.network();
+        if rustoshi_crypto::address::Address::from_string(&address, Some(network)).is_err() {
+            return Err(Self::rpc_error(
+                wallet_error::RPC_WALLET_INVALID_ADDRESS_OR_KEY,
+                format!("Invalid Bitcoin address: {address}"),
+            ));
+        }
+
         // Build + sign the transaction under the wallet lock, then DROP the
         // wallet guard before touching the node mempool. The mining /
         // block-connect path takes node-write THEN wallet-lock; doing the
