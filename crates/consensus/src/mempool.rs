@@ -440,6 +440,84 @@ impl Cluster {
     }
 }
 
+thread_local! {
+    static CHUNK_SEARCH_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Subset visits one [`DepGraph::linearize`] call may spend searching for
+/// chunks. Core bounds the same work (txmempool.h `ACCEPTABLE_COST = 75'000`,
+/// cluster_linearize.h `Linearize` `max_iterations`); the units differ, the
+/// purpose is the same: a cluster's shape cannot buy unbounded work, and the
+/// RBF diagram check (which relinearizes every touched cluster before the
+/// script checks) stays cheap for a replacement that is then rejected. The
+/// whole diagram check for a 17-tx chain needs under 1,000 visits; only wide
+/// clusters with tens of thousands of ancestor-closed subsets reach the
+/// budget, and they fall back to the best chunk found so far.
+pub const LINEARIZE_SEARCH_BUDGET: u64 = 75_000;
+
+/// Depth-first walk over the ancestor-closed subsets of one `remaining` set,
+/// see [`DepGraph::find_best_chunk`]. Bit `p` of a mask is `idxs[p]`.
+struct ClosedSetSearch<'a> {
+    graph: &'a DepGraph,
+    idxs: &'a [usize],
+    anc_mask: &'a [u32],
+    desc_mask: &'a [u32],
+    best_chunk: HashSet<usize>,
+    best_feefrac: FeeFrac,
+    budget: &'a mut u64,
+}
+
+impl ClosedSetSearch<'_> {
+    /// Decide positions `pos-1` down to 0. `inc` is ancestor-closed, `exc`
+    /// descendant-closed, and they are disjoint.
+    fn visit(&mut self, pos: usize, inc: u32, exc: u32) {
+        if *self.budget == 0 {
+            return;
+        }
+        *self.budget -= 1;
+        CHUNK_SEARCH_VISITS.with(|c| c.set(c.get() + 1));
+        if pos == 0 {
+            if inc != 0 {
+                self.consider(inc);
+            }
+            return;
+        }
+        let p = pos - 1;
+        let bit = 1u32 << p;
+        if (inc | exc) & bit != 0 {
+            self.visit(p, inc, exc);
+        } else {
+            self.visit(p, inc, exc | self.desc_mask[p]);
+            self.visit(p, inc | self.anc_mask[p], exc);
+        }
+    }
+
+    /// Keep `mask` if it beats the best chunk by `DepGraph::is_better_chunk`'s
+    /// order (feerate, then smaller size, then lower largest txid). The fee
+    /// sum and the txid tie-break are read off the mask; a `HashSet` is only
+    /// built for a winner.
+    fn consider(&mut self, mask: u32) {
+        let members = || (0..self.idxs.len()).filter(move |&p| mask & (1u32 << p) != 0).map(|p| self.idxs[p]);
+        let mut feefrac = FeeFrac::default();
+        for i in members() {
+            feefrac += self.graph.feerates[i];
+        }
+        let best = &self.best_feefrac;
+        let order = ((feefrac.fee as i128) * (best.size as i128))
+            .cmp(&((best.fee as i128) * (feefrac.size as i128)))
+            .then_with(|| best.size.cmp(&feefrac.size))
+            .then_with(|| {
+                let cand_max = members().map(|i| self.graph.idx_to_txid[i]).max();
+                self.graph.max_txid(&self.best_chunk).cmp(&cand_max)
+            });
+        if order.is_gt() {
+            let chunk: HashSet<usize> = members().collect();
+            self.best_feefrac = feefrac;
+            self.best_chunk = chunk;
+        }
+    }
+}
+
 /// Dependency graph for cluster linearization.
 /// Maps transaction indices to their fee/size and ancestor/descendant relationships.
 #[derive(Clone, Debug)]
@@ -457,6 +535,14 @@ pub struct DepGraph {
 }
 
 impl DepGraph {
+    /// Subsets the chunk search has visited on this thread, summed over every
+    /// [`DepGraph::linearize`] call. Monotone; take a difference around the
+    /// call being measured. It is how tests bound the search's work without
+    /// timing it.
+    pub fn search_visits() -> u64 {
+        CHUNK_SEARCH_VISITS.with(|c| c.get())
+    }
+
     /// Create a new dependency graph from mempool entries.
     pub fn from_cluster(
         txids: &HashSet<Hash256>,
@@ -570,10 +656,14 @@ impl DepGraph {
 
         let mut remaining: HashSet<usize> = (0..n).collect();
         let mut chunks = Vec::new();
+        // Shared by every chunk of this linearization, so one call costs at
+        // most LINEARIZE_SEARCH_BUDGET subset visits however the cluster is
+        // shaped (Core: `Linearize(..., max_iterations, ...)`).
+        let mut budget = LINEARIZE_SEARCH_BUDGET;
 
         while !remaining.is_empty() {
             // Find the highest feerate topological prefix
-            let best_chunk = self.find_best_chunk(&remaining);
+            let best_chunk = self.find_best_chunk(&remaining, &mut budget);
 
             if best_chunk.is_empty() {
                 // Fallback: take any transaction with all ancestors in remaining
@@ -639,33 +729,43 @@ impl DepGraph {
     ///
     /// Core's chunk is that subset (txgraph `FindBestChunk`), not only the
     /// ancestor set of one transaction. Clusters of at most 16 transactions
-    /// are searched exactly. Larger clusters keep the ancestor-set heuristic.
-    fn find_best_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
-        let mut best_chunk = self.find_best_ancestor_chunk(remaining);
-        if remaining.len() > 16 || best_chunk.is_empty() {
+    /// are searched exactly while `budget` lasts; larger clusters, and any
+    /// search the budget cuts short, keep the best set found so far (at
+    /// worst the ancestor-set heuristic), which is always ancestor-closed.
+    ///
+    /// The search visits only ancestor-closed subsets: deciding positions
+    /// from the highest down, excluding a transaction also excludes its
+    /// descendants and including one also includes its ancestors, so no
+    /// branch dead-ends. Exclude is tried first, so complete sets come out
+    /// in increasing mask order -- the order of the exhaustive 2^n scan this
+    /// replaced -- and the result is identical whenever the budget suffices.
+    fn find_best_chunk(&self, remaining: &HashSet<usize>, budget: &mut u64) -> HashSet<usize> {
+        let best_chunk = self.find_best_ancestor_chunk(remaining);
+        if remaining.len() > 16 || best_chunk.is_empty() || *budget == 0 {
             return best_chunk;
         }
-        let mut best_feefrac = self.set_feefrac(&best_chunk);
         let mut idxs: Vec<usize> = remaining.iter().copied().collect();
         idxs.sort_unstable();
-        let n = idxs.len();
-        for mask in 1u32..(1u32 << n) {
-            let mut chunk = HashSet::with_capacity(n);
-            for bit in 0..n {
-                if mask & (1u32 << bit) != 0 {
-                    chunk.insert(idxs[bit]);
-                }
-            }
-            if !self.is_ancestor_closed(&chunk, remaining) {
-                continue;
-            }
-            let feefrac = self.set_feefrac(&chunk);
-            if self.is_better_chunk(&chunk, &feefrac, &best_chunk, &best_feefrac) {
-                best_feefrac = feefrac;
-                best_chunk = chunk;
-            }
-        }
-        best_chunk
+        let pos: HashMap<usize, usize> = idxs.iter().enumerate().map(|(p, &i)| (i, p)).collect();
+        let to_mask = |set: &HashSet<usize>| {
+            set.iter()
+                .filter_map(|i| pos.get(i))
+                .fold(0u32, |m, &p| m | (1u32 << p))
+        };
+        let anc_mask: Vec<u32> = idxs.iter().map(|&i| to_mask(&self.ancestors[i])).collect();
+        let desc_mask: Vec<u32> = idxs.iter().map(|&i| to_mask(&self.descendants[i])).collect();
+        let best_feefrac = self.set_feefrac(&best_chunk);
+        let mut search = ClosedSetSearch {
+            graph: self,
+            idxs: &idxs,
+            anc_mask: &anc_mask,
+            desc_mask: &desc_mask,
+            best_chunk,
+            best_feefrac,
+            budget,
+        };
+        search.visit(idxs.len(), 0, 0);
+        search.best_chunk
     }
 
     /// Ancestor set of each remaining transaction; the previous chunk picker.
@@ -722,18 +822,6 @@ impl DepGraph {
     /// Largest txid in `set`, in Core's `uint256` (memcmp) order.
     fn max_txid(&self, set: &HashSet<usize>) -> Option<Hash256> {
         set.iter().map(|&idx| self.idx_to_txid[idx]).max()
-    }
-
-    /// Every in-`remaining` ancestor of every member is itself a member.
-    fn is_ancestor_closed(&self, chunk: &HashSet<usize>, remaining: &HashSet<usize>) -> bool {
-        for &idx in chunk {
-            for &anc in &self.ancestors[idx] {
-                if remaining.contains(&anc) && !chunk.contains(&anc) {
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     /// Topologically sort a set of transaction indices.
