@@ -677,6 +677,10 @@ pub const ADDRMAN_MIN_FAIL_SECS: u64 = 7 * 24 * 60 * 60;
 pub const ADDRMAN_CEILING: usize = ADDRMAN_NEW_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE
     + ADDRMAN_TRIED_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE;
 
+/// How many entries `AddressManager`'s flat-store eviction samples to pick a
+/// victim once a store reaches ADDRMAN_CEILING.
+const FLAT_EVICT_SAMPLE: usize = 8;
+
 /// On-disk format version for the peers.dat-equiv. Bumping invalidates older
 /// files (they load as an empty cold start, never a hard-down).
 pub const ADDRMAN_DAT_VERSION: u32 = 1;
@@ -1541,8 +1545,13 @@ pub struct AddressManager {
     known_addrs: HashMap<SocketAddr, AddrInfo>,
     /// BIP155 addresses (supports all network types including privacy networks).
     known_addrv2: HashMap<AddrV2Key, AddrV2Info>,
-    /// Addresses to try next (prioritized queue).
+    /// Addresses to try next (prioritized queue). Each address appears at
+    /// most once (`queued` mirrors membership) and the queue never holds more
+    /// than ADDRMAN_CEILING entries.
     try_queue: VecDeque<SocketAddr>,
+    /// Membership set for `try_queue`, so a re-announced address is not
+    /// queued a second time.
+    queued: HashSet<SocketAddr>,
     /// Banned addresses with unban time.
     banned: HashMap<SocketAddr, Instant>,
     /// Currently connected addresses (to avoid duplicates).
@@ -1571,6 +1580,7 @@ impl AddressManager {
             known_addrs: HashMap::new(),
             known_addrv2: HashMap::new(),
             try_queue: VecDeque::new(),
+            queued: HashSet::new(),
             banned: HashMap::new(),
             connected: HashSet::new(),
             connected_outbound_netgroups: HashSet::new(),
@@ -1625,6 +1635,7 @@ impl AddressManager {
     pub fn add_dns_addresses(&mut self, addrs: Vec<SocketAddr>) {
         for addr in addrs {
             if !self.known_addrs.contains_key(&addr) && !self.is_banned(&addr) {
+                self.make_room_legacy(&addr);
                 self.known_addrs.insert(
                     addr,
                     AddrInfo {
@@ -1638,7 +1649,7 @@ impl AddressManager {
                         source: AddrSource::Dns,
                     },
                 );
-                self.try_queue.push_back(addr);
+                self.enqueue_back(addr);
                 // Mirror into the bucketed addrman. DNS seeds are self-sourced
                 // (no announcing peer), matching Core's CAddress source==addr.
                 self.bucket_add(
@@ -1666,6 +1677,91 @@ impl AddressManager {
         }
     }
 
+    /// Queue `addr` at the back of the try queue unless it is already queued
+    /// or the queue is full (ADDRMAN_CEILING). The queue is only a hint;
+    /// `next_addr_to_try` falls back to the persistent store, so a dropped
+    /// hint never loses the address.
+    fn enqueue_back(&mut self, addr: SocketAddr) {
+        if self.queued.contains(&addr) || self.try_queue.len() >= ADDRMAN_CEILING {
+            return;
+        }
+        self.queued.insert(addr);
+        self.try_queue.push_back(addr);
+    }
+
+    /// Queue `addr` at the front of the try queue (manual peers). An existing
+    /// queue entry is moved, not duplicated; a full queue drops its back.
+    fn enqueue_front(&mut self, addr: SocketAddr) {
+        if self.queued.contains(&addr) {
+            self.try_queue.retain(|a| *a != addr);
+        } else if self.try_queue.len() >= ADDRMAN_CEILING {
+            if let Some(dropped) = self.try_queue.pop_back() {
+                self.queued.remove(&dropped);
+            }
+        }
+        self.queued.insert(addr);
+        self.try_queue.push_front(addr);
+    }
+
+    /// Make room for a new `known_addrs` key once the store holds
+    /// ADDRMAN_CEILING entries, by evicting one entry. Core never holds more
+    /// than its new/tried table geometry (`AddrManImpl::Add_`,
+    /// src/addrman.cpp) and evicts via `IsTerrible`; this flat store mirrors
+    /// that bound. The victim is the worst of a small sample taken from the
+    /// map's (SipHash-randomised, so unpredictable to a peer) iteration
+    /// order: never a connected or manual entry if the sample has another,
+    /// then never-succeeded before succeeded, then least recently seen. If all
+    /// sampled entries are connected or manual one of them still goes: the
+    /// bound wins (with ~125 connections out of 81,920 entries this is rare).
+    /// A queued hint for the victim stays in `try_queue` and is skipped when
+    /// popped.
+    fn make_room_legacy(&mut self, incoming: &SocketAddr) {
+        if self.known_addrs.len() < ADDRMAN_CEILING || self.known_addrs.contains_key(incoming) {
+            return;
+        }
+        let victim = self
+            .known_addrs
+            .iter()
+            .take(FLAT_EVICT_SAMPLE)
+            .min_by_key(|(a, i)| {
+                (
+                    self.connected.contains(a) || matches!(i.source, AddrSource::Manual),
+                    i.last_success.is_some(),
+                    i.last_seen,
+                )
+            })
+            .map(|(a, _)| *a);
+        if let Some(v) = victim {
+            self.known_addrs.remove(&v);
+        }
+    }
+
+    /// `known_addrv2` counterpart of `make_room_legacy`.
+    fn make_room_v2(&mut self, incoming: &AddrV2Key) {
+        if self.known_addrv2.len() < ADDRMAN_CEILING || self.known_addrv2.contains_key(incoming) {
+            return;
+        }
+        let victim = self
+            .known_addrv2
+            .iter()
+            .take(FLAT_EVICT_SAMPLE)
+            .min_by_key(|(k, i)| {
+                let connected = k
+                    .to_socket_addr()
+                    .map(|sa| self.connected.contains(&sa))
+                    .unwrap_or(false);
+                (
+                    connected || matches!(i.source, AddrSource::Manual),
+                    i.last_success.is_some(),
+                    i.last_seen,
+                )
+            })
+            .map(|(k, _)| k.clone());
+        if let Some(v) = victim {
+            self.known_addrv2.remove(&v);
+        }
+    }
+
     /// Add addresses from an addr message from a peer.
     pub fn add_peer_addresses(&mut self, addrs: &[TimestampedNetAddress], from: SocketAddr) {
         for taddr in addrs {
@@ -1679,6 +1775,7 @@ impl AddressManager {
                     // Clamp timestamp: mirrors Core net_processing.cpp:5678-5680.
                     // Pre-2001 (<=100_000_000) or >10 min future → 5 days ago.
                     let clamped_ts = clamp_addr_timestamp(taddr.timestamp, now_unix_secs());
+                    self.make_room_legacy(&socket_addr);
                     let entry = self
                         .known_addrs
                         .entry(socket_addr)
@@ -1700,7 +1797,7 @@ impl AddressManager {
 
                     // Add to try queue if not already connected
                     if !self.connected.contains(&socket_addr) {
-                        self.try_queue.push_back(socket_addr);
+                        self.enqueue_back(socket_addr);
                     }
                     // Mirror into the bucketed addrman, keyed by the announcing
                     // peer's address as the source group (Core AddSingle source).
@@ -1712,6 +1809,7 @@ impl AddressManager {
 
     /// Add a manually specified address.
     pub fn add_manual_address(&mut self, addr: SocketAddr) {
+        self.make_room_legacy(&addr);
         self.known_addrs.entry(addr).or_insert_with(|| AddrInfo {
             addr,
             services: NODE_NETWORK | NODE_WITNESS,
@@ -1723,7 +1821,7 @@ impl AddressManager {
             source: AddrSource::Manual,
         });
         // Manual addresses go to the front of the queue
-        self.try_queue.push_front(addr);
+        self.enqueue_front(addr);
         // Manual peers are self-sourced in the bucketed addrman.
         self.bucket_add(
             addr,
@@ -1762,6 +1860,12 @@ impl AddressManager {
         self.bind_netgroup(netgroup_manager);
         // Stage 1: fast path over the preferred-order hint queue.
         while let Some(addr) = self.try_queue.pop_front() {
+            self.queued.remove(&addr);
+            // Evicted from the store (make_room_legacy) after it was queued:
+            // the hint is stale, so do not dial it.
+            if !self.known_addrs.contains_key(&addr) {
+                continue;
+            }
             if !self.is_addr_eligible(&addr, netgroup_manager) {
                 continue;
             }
@@ -1918,6 +2022,7 @@ impl AddressManager {
     #[cfg(test)]
     pub(crate) fn test_seed_new(&mut self, addr: SocketAddr, ng: &NetGroupManager) {
         self.bind_netgroup(ng);
+        self.make_room_legacy(&addr);
         self.known_addrs.entry(addr).or_insert_with(|| AddrInfo {
             addr,
             services: NODE_NETWORK | NODE_WITNESS,
@@ -2129,6 +2234,7 @@ impl AddressManager {
                     continue;
                 }
                 if !self.is_banned(&socket_addr) {
+                    self.make_room_legacy(&socket_addr);
                     let addr_entry =
                         self.known_addrs
                             .entry(socket_addr)
@@ -2148,12 +2254,13 @@ impl AddressManager {
 
                     // Add to try queue if not already connected
                     if !self.connected.contains(&socket_addr) {
-                        self.try_queue.push_back(socket_addr);
+                        self.enqueue_back(socket_addr);
                     }
                 }
             }
 
             // Store in addrv2 storage
+            self.make_room_v2(&key);
             let v2_entry = self.known_addrv2.entry(key).or_insert_with(|| AddrV2Info {
                 addr: entry.addr.clone(),
                 port: entry.port,
@@ -2176,6 +2283,9 @@ impl AddressManager {
     /// Returns addresses that have been successfully connected to recently,
     /// including privacy network addresses.
     pub fn get_addrv2_for_sharing(&self, count: usize) -> Vec<crate::addr::AddrV2Entry> {
+        if count == 0 {
+            return Vec::new();
+        }
         self.known_addrv2
             .values()
             .filter(|info| info.last_success.is_some())
@@ -2248,6 +2358,7 @@ impl AddressManager {
         if self.known_addrs.contains_key(&addr) {
             return false;
         }
+        self.make_room_legacy(&addr);
         self.known_addrs.insert(
             addr,
             AddrInfo {
