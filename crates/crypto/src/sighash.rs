@@ -12,7 +12,8 @@
 //! - OP_CODESEPARATOR handling: scriptCode starts after the last separator
 
 use crate::hashes::sha256d;
-use rustoshi_primitives::{write_compact_size, Encodable, Hash256, OutPoint, Transaction};
+use crate::precomputed::PrecomputedTransactionData;
+use rustoshi_primitives::{write_compact_size, Encodable, Hash256, Transaction};
 use std::io::Write;
 
 /// OP_CODESEPARATOR opcode value.
@@ -496,35 +497,49 @@ pub fn segwit_v0_sighash(
     value: u64,
     hash_type: u32,
 ) -> Hash256 {
+    let txdata = PrecomputedTransactionData::new(tx, &[], &[]);
+    segwit_v0_sighash_precomputed(&txdata, input_index, script_code, value, hash_type)
+}
+
+/// BIP-143 sighash reading `hashPrevouts` / `hashSequence` / `hashOutputs`
+/// from a per-transaction cache (Core `SignatureHash` with
+/// `PrecomputedTransactionData`, interpreter.cpp).
+///
+/// Build one [`PrecomputedTransactionData`] per transaction and pass it to
+/// every input's signature check, so the whole-transaction digests are
+/// hashed once instead of once per signature. Byte-identical to
+/// [`segwit_v0_sighash`], which is this function on a fresh cache.
+pub fn segwit_v0_sighash_precomputed(
+    txdata: &PrecomputedTransactionData<'_>,
+    input_index: usize,
+    script_code: &[u8],
+    value: u64,
+    hash_type: u32,
+) -> Hash256 {
+    let tx = txdata.tx();
     let sighash_type = SigHashType(hash_type);
     let input = &tx.inputs[input_index];
 
-    // Compute hashPrevouts
+    // hashPrevouts: zero if ANYONECANPAY.
     let hash_prevouts = if sighash_type.anyone_can_pay() {
         Hash256::ZERO
     } else {
-        let mut buf = Vec::with_capacity(tx.inputs.len() * OutPoint::SIZE);
-        for inp in &tx.inputs {
-            inp.previous_output.encode(&mut buf).unwrap();
-        }
-        sha256d(&buf)
+        txdata.bip143().hash_prevouts
     };
 
-    // Compute hashSequence
+    // hashSequence: zero if ANYONECANPAY, SINGLE or NONE.
     let hash_sequence = if sighash_type.anyone_can_pay()
         || sighash_type.is_single()
         || sighash_type.is_none()
     {
         Hash256::ZERO
     } else {
-        let mut buf = Vec::with_capacity(tx.inputs.len() * 4);
-        for inp in &tx.inputs {
-            buf.write_all(&inp.sequence.to_le_bytes()).unwrap();
-        }
-        sha256d(&buf)
+        txdata.bip143().hash_sequence
     };
 
-    // Compute hashOutputs
+    // hashOutputs: all outputs for ALL; the matching output for SINGLE (zero
+    // if there is none); zero for NONE. The SINGLE hash is per input, so it
+    // is not cached (Core does not cache it either).
     let hash_outputs = if sighash_type.is_none() {
         Hash256::ZERO
     } else if sighash_type.is_single() {
@@ -536,12 +551,7 @@ pub fn segwit_v0_sighash(
             Hash256::ZERO
         }
     } else {
-        // SIGHASH_ALL
-        let mut buf = Vec::new();
-        for output in &tx.outputs {
-            output.encode(&mut buf).unwrap();
-        }
-        sha256d(&buf)
+        txdata.bip143().hash_outputs
     };
 
     // Build the preimage

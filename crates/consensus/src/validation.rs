@@ -38,6 +38,7 @@ use crate::script::{
 };
 use rayon::prelude::*;
 use rustoshi_crypto::sha256d;
+pub use rustoshi_crypto::PrecomputedTransactionData;
 use rustoshi_primitives::{compact_size_len, Block, BlockHeader, Hash256, OutPoint, Transaction};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -2918,6 +2919,18 @@ fn validate_scripts_on_pool(
         })
         .collect();
 
+    // One sighash cache per transaction (Core: `PrecomputedTransactionData`
+    // per tx in ConnectBlock, shared by that tx's CScriptChecks). The BIP-143
+    // and BIP-341 whole-tx digests are hashed at most once per tx, lazily, by
+    // whichever input's worker needs them first.
+    let per_tx_txdata: Vec<PrecomputedTransactionData<'_>> = block
+        .transactions
+        .iter()
+        .skip(1)
+        .zip(per_tx_prevouts.iter())
+        .map(|(tx, (amounts, scripts))| PrecomputedTransactionData::new(tx, amounts, scripts))
+        .collect();
+
     // Pre-compute wtxids for each non-coinbase tx exactly once.  The wtxid
     // is part of the SigCache key (W160 BUG-9): it binds a cache entry to
     // the exact witness-bearing transaction that produced the successful
@@ -2998,14 +3011,10 @@ fn validate_scripts_on_pool(
                 }
 
                 // Verify script
-                let (spent_amounts, spent_scripts) = &per_tx_prevouts[*tx_coin_idx];
-                let checker = TransactionSignatureChecker::new(
-                    tx,
-                    *input_idx,
-                    coin.value,
-                    spent_amounts,
-                    spent_scripts,
-                );
+                let txdata = &per_tx_txdata[*tx_coin_idx];
+                debug_assert!(std::ptr::eq(txdata.tx(), *tx));
+                let checker =
+                    TransactionSignatureChecker::with_txdata(txdata, *input_idx, coin.value);
                 let result = verify_script(
                     script_sig,
                     script_pubkey,
@@ -3460,6 +3469,15 @@ fn lax_der_parse(data: &[u8]) -> Result<secp256k1::ecdsa::Signature, secp256k1::
 /// Implements the SignatureChecker trait to verify signatures
 /// against a specific transaction input.
 ///
+/// The whole-transaction sighash digests (BIP-143 `hashPrevouts` /
+/// `hashSequence` / `hashOutputs`, BIP-341 `sha_*`) are read from a
+/// [`PrecomputedTransactionData`], Core's per-transaction cache. Callers
+/// that check several inputs of one transaction (block connect, mempool
+/// accept) build one cache per transaction and hand it to every input's
+/// checker with [`Self::with_txdata`], so those digests are hashed once per
+/// transaction instead of once per signature. [`Self::new`] builds a
+/// private cache for a single checker.
+///
 /// `spent_amounts` and `spent_scripts` carry the per-input prevouts
 /// the *whole* transaction is spending; they are required for
 /// BIP-341 Taproot sighash computation (`sha_amounts` and
@@ -3469,8 +3487,22 @@ pub struct TransactionSignatureChecker<'a> {
     tx: &'a Transaction,
     input_index: usize,
     amount: u64,
-    spent_amounts: &'a [u64],
-    spent_scripts: &'a [Vec<u8>],
+    txdata: TxDataRef<'a>,
+}
+
+/// The checker's sighash cache: its own, or one shared across a transaction's inputs.
+enum TxDataRef<'a> {
+    Owned(PrecomputedTransactionData<'a>),
+    Shared(&'a PrecomputedTransactionData<'a>),
+}
+
+impl<'a> TxDataRef<'a> {
+    fn get(&self) -> &PrecomputedTransactionData<'a> {
+        match self {
+            TxDataRef::Owned(t) => t,
+            TxDataRef::Shared(t) => t,
+        }
+    }
 }
 
 impl<'a> TransactionSignatureChecker<'a> {
@@ -3480,6 +3512,10 @@ impl<'a> TransactionSignatureChecker<'a> {
     /// caller knows Taproot won't be exercised (e.g. legacy script
     /// unit tests). For mainnet block validation, pass slices covering
     /// every input's prevout.
+    ///
+    /// The checker gets its own sighash cache. To check several inputs of
+    /// one transaction, build one [`PrecomputedTransactionData`] and use
+    /// [`Self::with_txdata`] instead.
     pub fn new(
         tx: &'a Transaction,
         input_index: usize,
@@ -3491,8 +3527,27 @@ impl<'a> TransactionSignatureChecker<'a> {
             tx,
             input_index,
             amount,
-            spent_amounts,
-            spent_scripts,
+            txdata: TxDataRef::Owned(PrecomputedTransactionData::new(
+                tx,
+                spent_amounts,
+                spent_scripts,
+            )),
+        }
+    }
+
+    /// Checker for input `input_index` of `txdata.tx()`, reading the
+    /// transaction-wide sighash digests from the shared `txdata`
+    /// (Core `CachingTransactionSignatureChecker(&tx, i, amount, ..., txdata)`).
+    pub fn with_txdata(
+        txdata: &'a PrecomputedTransactionData<'a>,
+        input_index: usize,
+        amount: u64,
+    ) -> Self {
+        Self {
+            tx: txdata.tx(),
+            input_index,
+            amount,
+            txdata: TxDataRef::Shared(txdata),
         }
     }
 }
@@ -3527,8 +3582,8 @@ impl<'a> SignatureChecker for TransactionSignatureChecker<'a> {
             SigVersion::WitnessV0 => {
                 // For SegWit v0, FindAndDelete is NOT applied (BIP-143).
                 // The subscript should already be the scriptCode.
-                rustoshi_crypto::segwit_v0_sighash(
-                    self.tx,
+                rustoshi_crypto::segwit_v0_sighash_precomputed(
+                    self.txdata.get(),
                     self.input_index,
                     subscript,
                     self.amount,
@@ -3698,7 +3753,7 @@ impl<'a> TransactionSignatureChecker<'a> {
         script_path: Option<crate::script::taproot_sighash::TapscriptContext<'_>>,
     ) -> bool {
         use crate::script::taproot_sighash::{
-            compute_taproot_sighash, TaprootPrevouts, SIGHASH_DEFAULT,
+            compute_taproot_sighash_precomputed, SIGHASH_DEFAULT,
         };
 
         // BIP-341: signature is 64B (SIGHASH_DEFAULT) or 65B (with hash_type at byte 64).
@@ -3717,23 +3772,14 @@ impl<'a> TransactionSignatureChecker<'a> {
         };
 
         // Need full prevouts; if the caller didn't supply them, fail closed.
-        if self.spent_amounts.len() != self.tx.inputs.len()
-            || self.spent_scripts.len() != self.tx.inputs.len()
-        {
+        let txdata = self.txdata.get();
+        if !txdata.spent_outputs_ready() {
             return false;
         }
 
-        let scripts_refs: Vec<&[u8]> =
-            self.spent_scripts.iter().map(|s| s.as_slice()).collect();
-        let prevouts = TaprootPrevouts {
-            amounts: self.spent_amounts,
-            scripts: &scripts_refs,
-        };
-
-        let sighash = match compute_taproot_sighash(
-            self.tx,
+        let sighash = match compute_taproot_sighash_precomputed(
+            txdata,
             self.input_index,
-            prevouts,
             hash_type,
             annex,
             script_path,

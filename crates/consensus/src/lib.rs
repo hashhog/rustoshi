@@ -75,7 +75,8 @@ pub use validation::{
     resolve_script_check_threads, script_check_thread_count, script_flags_for_height,
     should_skip_scripts, validate_scripts_parallel_with_cache,
     validate_scripts_parallel_with_n_workers, BlockIndexEntry, ChainContext, CoinEntry,
-    DisconnectResult, SequenceLockContext, SequenceLocks, StubChainContext,
+    DisconnectResult, PrecomputedTransactionData, SequenceLockContext, SequenceLocks,
+    StubChainContext,
     TransactionSignatureChecker, TxValidationError, UndoData, UtxoView, ValidationError,
     DEFAULT_SCRIPTCHECK_THREADS, MAX_SCRIPTCHECK_THREADS, SCRIPT_CHECK_BATCH_SIZE,
 };

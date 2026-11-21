@@ -40,7 +40,7 @@ use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, Scrip
 use crate::validation::{
     check_sequence_locks, check_transaction, CoinEntry,
     count_script_sigops, get_transaction_sigop_cost, SequenceLockContext,
-    TransactionSignatureChecker, TxValidationError,
+    PrecomputedTransactionData, TransactionSignatureChecker, TxValidationError,
 };
 use rustoshi_primitives::{Hash256, OutPoint, Transaction, TxOut};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -7953,14 +7953,16 @@ impl Mempool {
             spent_amounts.push(val);
         }
 
+        // One sighash cache for every input and both passes (Core: one
+        // `PrecomputedTransactionData` per tx in MemPoolAccept, ws.m_precomputed_txdata).
+        let txdata = PrecomputedTransactionData::new(tx, &spent_amounts, prevout_scripts);
+
         let std_flags = ScriptFlags::standard_flags();
         for (input_idx, input) in tx.inputs.iter().enumerate() {
-            let checker = TransactionSignatureChecker::new(
-                tx,
+            let checker = TransactionSignatureChecker::with_txdata(
+                &txdata,
                 input_idx,
                 spent_amounts[input_idx],
-                &spent_amounts,
-                prevout_scripts,
             );
             if let Err(e) = verify_script(
                 &input.script_sig,
@@ -7987,12 +7989,10 @@ impl Mempool {
             ..Default::default()
         };
         for (input_idx, input) in tx.inputs.iter().enumerate() {
-            let checker = TransactionSignatureChecker::new(
-                tx,
+            let checker = TransactionSignatureChecker::with_txdata(
+                &txdata,
                 input_idx,
                 spent_amounts[input_idx],
-                &spent_amounts,
-                prevout_scripts,
             );
             if let Err(e) = verify_script(
                 &input.script_sig,
