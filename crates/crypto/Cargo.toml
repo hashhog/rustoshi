@@ -11,3 +11,6 @@ ripemd.workspace = true
 secp256k1.workspace = true
 rand.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
