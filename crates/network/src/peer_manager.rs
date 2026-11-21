@@ -466,6 +466,15 @@ pub const FEELER_INTERVAL: Duration = Duration::from_secs(120);
 /// MAX_FEELER_CONNECTIONS = 1).
 pub const MAX_FEELER_CONNECTIONS: usize = 1;
 
+/// Core `ProcessAddrs` (net_processing.cpp): only an addr message holding at
+/// most this many entries is relayed (`vAddr.size() <= 10`).
+const ADDR_RELAY_MAX_MSG_SIZE: usize = 10;
+/// Core `ProcessAddrs`: an address is relayed only if its time is within the
+/// last 10 minutes (`addr.nTime > current_time - 10min`).
+const ADDR_RELAY_FRESH_SECS: u64 = 10 * 60;
+/// Core `ProcessAddrs`: times at or below this are treated as bogus.
+const ADDR_MIN_PLAUSIBLE_TIME: u64 = 100_000_000;
+
 /// Percentage of the addrman shared in a getaddr response (Core
 /// MAX_PCT_ADDR_TO_SEND = 23, net_processing.cpp:188). The getaddr response is
 /// capped at min(MAX_ADDR_TO_SEND, floor(23 * addrman_size / 100)) — primary
@@ -4980,8 +4989,31 @@ impl PeerManager {
                             self.addr_manager
                                 .add_peer_addresses(admitted, peer.info.addr);
                         }
-                        // BIP155: Relay a random subset of new addresses to 2 other peers
-                        self.relay_addresses_to_peers(*id).await;
+                        // Relay only addresses taken from THIS message, under
+                        // Core's ProcessAddrs rules (never our own history).
+                        let relay: Vec<crate::addr::AddrV2Entry> = if addrs.len()
+                            <= ADDR_RELAY_MAX_MSG_SIZE
+                        {
+                            admitted
+                                .iter()
+                                .filter_map(|t| {
+                                    let sa = net_address_to_socket_addr(&t.address)?;
+                                    let na = match sa.ip() {
+                                        IpAddr::V4(v4) => crate::addr::NetworkAddr::Ipv4(v4),
+                                        IpAddr::V6(v6) => crate::addr::NetworkAddr::Ipv6(v6),
+                                    };
+                                    Some(crate::addr::AddrV2Entry::new(
+                                        t.timestamp,
+                                        t.address.services,
+                                        na,
+                                        sa.port(),
+                                    ))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        self.relay_addresses_to_peers(*id, &relay).await;
                     }
                 }
 
@@ -5011,8 +5043,15 @@ impl PeerManager {
                                 .map(|p| p.info.addr)
                                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                         );
-                        // Relay to 2 other peers
-                        self.relay_addresses_to_peers(*id).await;
+                        // Relay only addresses taken from THIS message, under
+                        // Core's ProcessAddrs rules (never our own history).
+                        let relay: Vec<crate::addr::AddrV2Entry> =
+                            if entries.len() <= ADDR_RELAY_MAX_MSG_SIZE {
+                                admitted.to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                        self.relay_addresses_to_peers(*id, &relay).await;
                     }
                 }
 
@@ -5147,11 +5186,44 @@ impl PeerManager {
         Some(event)
     }
 
-    /// Relay addresses to up to 2 random peers (excluding the source).
-    /// This implements Bitcoin Core's RelayAddress behavior.
-    async fn relay_addresses_to_peers(&mut self, source_id: PeerId) {
+    /// Relay addresses received from `source_id` to other peers, following
+    /// Bitcoin Core's `ProcessAddrs` (net_processing.cpp:5625) and
+    /// `RelayAddress` (:2277).
+    ///
+    /// `received` holds only the entries of the incoming message that passed
+    /// the token bucket, and is empty when the message held more than 10
+    /// entries (`vAddr.size() <= 10`). Each entry is relayed only if it is a
+    /// full node (NODE_NETWORK or NODE_NETWORK_LIMITED), not banned or
+    /// discouraged, routable, and its timestamp lies within the last 10
+    /// minutes (Core clamps an out-of-range time to now-5d, which fails the
+    /// same freshness test). Reachable addresses go to 2 peers, unreachable
+    /// ones to 1 or 2; targets exclude the source and block-relay-only peers,
+    /// and peers without addrv2 get only v1-encodable addresses.
+    ///
+    /// The node's own address history (`get_addresses_for_sharing`) is never
+    /// relayed here: it used to be, on every addr message including empty
+    /// ones, which let a peer read our outbound connections.
+    ///
+    /// rustoshi never sends getaddr, so Core's `!peer.m_getaddr_sent` gate is
+    /// always satisfied.
+    async fn relay_addresses_to_peers(
+        &mut self,
+        source_id: PeerId,
+        received: &[crate::addr::AddrV2Entry],
+    ) {
         use rand::seq::SliceRandom;
-        let candidates: Vec<PeerId> = self
+        use rand::Rng;
+        if received.is_empty() {
+            return;
+        }
+        // Core SetupAddressRelay: addr traffic from a block-relay-only peer is
+        // ignored entirely.
+        match self.peers.get(&source_id) {
+            Some(p) if p.conn_type != ConnectionType::BlockRelayOnly => {}
+            _ => return,
+        }
+        let now = now_unix_secs();
+        let candidates: Vec<(PeerId, bool)> = self
             .peers
             .iter()
             .filter(|(pid, peer)| {
@@ -5159,39 +5231,65 @@ impl PeerManager {
                     && peer.conn_type != ConnectionType::BlockRelayOnly
                     && peer.info.state == PeerState::Established
             })
-            .map(|(pid, _)| *pid)
+            .map(|(pid, peer)| (*pid, peer.info.supports_addrv2))
             .collect();
+        let mut per_target: HashMap<PeerId, Vec<crate::addr::AddrV2Entry>> = HashMap::new();
         let mut rng = rand::thread_rng();
-        let targets: Vec<PeerId> = candidates
-            .choose_multiple(&mut rng, std::cmp::min(2, candidates.len()))
-            .cloned()
-            .collect();
-        for target_id in targets {
-            let target_supports_addrv2 = self
+        for entry in received {
+            if entry.services & (NODE_NETWORK | NODE_NETWORK_LIMITED) == 0 {
+                continue;
+            }
+            let ts = entry.timestamp as u64;
+            if ts <= ADDR_MIN_PLAUSIBLE_TIME
+                || ts > now + ADDR_RELAY_FRESH_SECS
+                || ts + ADDR_RELAY_FRESH_SECS <= now
+            {
+                continue;
+            }
+            if let Some(sa) = entry.to_socket_addr() {
+                if !ip_is_routable(&sa.ip().to_canonical())
+                    || self.ban_manager.is_banned(&sa.ip())
+                    || self.is_discouraged(&sa)
+                {
+                    continue;
+                }
+            }
+            let reachable = self.config.is_reachable(&entry.addr);
+            let n = if reachable || rng.gen::<bool>() { 2 } else { 1 };
+            let v1 = entry.is_addr_v1_compatible();
+            let eligible: Vec<PeerId> = candidates
+                .iter()
+                .filter(|(_, v2)| *v2 || v1)
+                .map(|(pid, _)| *pid)
+                .collect();
+            for target in eligible.choose_multiple(&mut rng, n.min(eligible.len())) {
+                per_target.entry(*target).or_default().push(entry.clone());
+            }
+        }
+        for (target_id, entries) in per_target {
+            let supports_v2 = self
                 .peers
                 .get(&target_id)
                 .map(|p| p.info.supports_addrv2)
                 .unwrap_or(false);
-            if target_supports_addrv2 {
-                let entries = self.addr_manager.get_addrv2_for_sharing(10);
-                if !entries.is_empty() {
-                    // Best-effort addr relay; never await a stuck peer.
-                    let _ = self.try_send_to_peer(target_id, NetworkMessage::AddrV2(entries));
-                }
+            let msg = if supports_v2 {
+                NetworkMessage::AddrV2(entries)
             } else {
-                let addrs = self.addr_manager.get_addresses_for_sharing(10);
-                let timestamped: Vec<TimestampedNetAddress> = addrs
-                    .into_iter()
-                    .map(|info| TimestampedNetAddress {
-                        timestamp: 0,
-                        address: socket_addr_to_net_address(info.addr, info.services),
-                    })
-                    .collect();
-                if !timestamped.is_empty() {
-                    // Best-effort addr relay; never await a stuck peer.
-                    let _ = self.try_send_to_peer(target_id, NetworkMessage::Addr(timestamped));
-                }
-            }
+                NetworkMessage::Addr(
+                    entries
+                        .into_iter()
+                        .filter_map(|e| {
+                            let sa = e.to_socket_addr()?;
+                            Some(TimestampedNetAddress {
+                                timestamp: e.timestamp,
+                                address: socket_addr_to_net_address(sa, e.services),
+                            })
+                        })
+                        .collect(),
+                )
+            };
+            // Best-effort addr relay; never await a stuck peer.
+            let _ = self.try_send_to_peer(target_id, msg);
         }
     }
 
