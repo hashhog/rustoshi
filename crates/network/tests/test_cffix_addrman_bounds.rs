@@ -142,3 +142,35 @@ fn try_queue_is_deduplicated() {
         "manual re-add duplicated the queue entry"
     );
 }
+
+/// An address evicted from the full store after it was queued must not be
+/// dialed from its stale queue hint.
+#[test]
+fn evicted_addresses_are_not_dialed() {
+    let mut mgr = AddressManager::new();
+    let ng = rustoshi_network::NetGroupManager::with_key(12345);
+    let from: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let ts = now_u32();
+    let total = ADDRMAN_CEILING as u32 + 5000;
+    let mut batch = Vec::with_capacity(1000);
+    for n in 0..total {
+        let a = SocketAddr::from(((0x0B00_0000u32 + n).to_be_bytes(), 8333));
+        batch.push(TimestampedNetAddress {
+            timestamp: ts,
+            address: socket_addr_to_net_address(a, 1),
+        });
+        if batch.len() == 1000 {
+            mgr.add_peer_addresses(&batch, from);
+            batch.clear();
+        }
+    }
+    mgr.add_peer_addresses(&batch, from);
+    let known: std::collections::HashSet<_> = mgr.all_known_ips().into_iter().collect();
+    // Drain the whole hint queue; every address handed out must still be known.
+    while mgr.queue_size() > 0 {
+        match mgr.next_addr_to_try(&ng) {
+            Some(a) => assert!(known.contains(&a.ip()), "dialed evicted address {a}"),
+            None => break,
+        }
+    }
+}

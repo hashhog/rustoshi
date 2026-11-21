@@ -1701,7 +1701,11 @@ impl AddressManager {
     /// that bound. The victim is the worst of a small sample taken from the
     /// map's (SipHash-randomised, so unpredictable to a peer) iteration
     /// order: never a connected or manual entry if the sample has another,
-    /// then never-succeeded before succeeded, then least recently seen.
+    /// then never-succeeded before succeeded, then least recently seen. If all
+    /// sampled entries are connected or manual one of them still goes: the
+    /// bound wins (with ~125 connections out of 81,920 entries this is rare).
+    /// A queued hint for the victim stays in `try_queue` and is skipped when
+    /// popped.
     fn make_room_legacy(&mut self, incoming: &SocketAddr) {
         if self.known_addrs.len() < ADDRMAN_CEILING || self.known_addrs.contains_key(incoming) {
             return;
@@ -1848,6 +1852,11 @@ impl AddressManager {
         // Stage 1: fast path over the preferred-order hint queue.
         while let Some(addr) = self.try_queue.pop_front() {
             self.queued.remove(&addr);
+            // Evicted from the store (make_room_legacy) after it was queued:
+            // the hint is stale, so do not dial it.
+            if !self.known_addrs.contains_key(&addr) {
+                continue;
+            }
             if !self.is_addr_eligible(&addr, netgroup_manager) {
                 continue;
             }
@@ -5082,8 +5091,15 @@ impl PeerManager {
                             self.addr_manager
                                 .add_peer_addresses(admitted, peer.info.addr);
                         }
-                        // BIP155: Relay a random subset of new addresses to 2 other peers
-                        self.relay_addresses_to_peers(*id).await;
+                        // BIP155: Relay a random subset of new addresses to 2 other peers.
+                        // Nothing admitted (an empty or fully rate-limited
+                        // message) means nothing to relay -- Core relays only
+                        // addresses taken from the message itself -- and the
+                        // relay would otherwise scan the address book under
+                        // this write lock for every such message.
+                        if admit > 0 {
+                            self.relay_addresses_to_peers(*id).await;
+                        }
                     }
                 }
 
@@ -5113,8 +5129,11 @@ impl PeerManager {
                                 .map(|p| p.info.addr)
                                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                         );
-                        // Relay to 2 other peers
-                        self.relay_addresses_to_peers(*id).await;
+                        // Relay to 2 other peers (skipped when nothing was
+                        // admitted; see the legacy addr arm above).
+                        if admit > 0 {
+                            self.relay_addresses_to_peers(*id).await;
+                        }
                     }
                 }
 
