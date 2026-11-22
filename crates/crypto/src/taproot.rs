@@ -29,8 +29,9 @@
 //! hit clearbit at h=947,960 (Ordinals tapscript >65535B → wrong
 //! tapleaf hash). Always go through this helper.
 
+use crate::precomputed::{encode_txout, PrecomputedTransactionData};
 use crate::{sha256, tagged_hash};
-use rustoshi_primitives::transaction::{Transaction, TxOut};
+use rustoshi_primitives::transaction::Transaction;
 
 // =====================================================================
 // SIGHASH constants (BIP-341)
@@ -245,10 +246,41 @@ pub fn build_sig_msg(
     annex: Option<&[u8]>,
     script_path: Option<TapscriptContext<'_>>,
 ) -> Result<Vec<u8>, TaprootSighashError> {
+    let txdata =
+        PrecomputedTransactionData::from_script_refs(tx, prevouts.amounts, prevouts.scripts);
+    build_sig_msg_precomputed(&txdata, input_index, hash_type, annex, script_path)
+}
+
+/// [`compute_taproot_sighash`] reading the BIP-341 `sha_*` digests from a
+/// per-transaction cache (Core `SignatureHashSchnorr` with
+/// `PrecomputedTransactionData`). Byte-identical to the uncached form.
+pub fn compute_taproot_sighash_precomputed(
+    txdata: &PrecomputedTransactionData<'_>,
+    input_index: usize,
+    hash_type: u8,
+    annex: Option<&[u8]>,
+    script_path: Option<TapscriptContext<'_>>,
+) -> Result<[u8; 32], TaprootSighashError> {
+    let preimage = build_sig_msg_precomputed(txdata, input_index, hash_type, annex, script_path)?;
+    Ok(tagged_hash("TapSighash", &preimage))
+}
+
+/// [`build_sig_msg`] reading the whole-transaction digests from `txdata`.
+///
+/// The spent outputs are the ones `txdata` was built with; it fails with
+/// `PrevoutsLengthMismatch` unless one is known for every input.
+pub fn build_sig_msg_precomputed(
+    txdata: &PrecomputedTransactionData<'_>,
+    input_index: usize,
+    hash_type: u8,
+    annex: Option<&[u8]>,
+    script_path: Option<TapscriptContext<'_>>,
+) -> Result<Vec<u8>, TaprootSighashError> {
+    let tx = txdata.tx();
     if input_index >= tx.inputs.len() {
         return Err(TaprootSighashError::InputIndexOutOfRange);
     }
-    if prevouts.amounts.len() != tx.inputs.len() || prevouts.scripts.len() != tx.inputs.len() {
+    if !txdata.spent_outputs_ready() {
         return Err(TaprootSighashError::PrevoutsLengthMismatch);
     }
     if !is_valid_taproot_hash_type(hash_type) {
@@ -280,42 +312,21 @@ pub fn build_sig_msg(
     out.extend_from_slice(&tx.lock_time.to_le_bytes());
 
     // 5-8. sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences
-    //     — only when NOT SIGHASH_ANYONECANPAY.
+    //     — only when NOT SIGHASH_ANYONECANPAY. Hashed once per tx (cache).
     if !anyone_can_pay {
-        let mut prevouts_buf = Vec::with_capacity(36 * tx.inputs.len());
-        for inp in &tx.inputs {
-            prevouts_buf.extend_from_slice(&inp.previous_output.txid.0);
-            prevouts_buf.extend_from_slice(&inp.previous_output.vout.to_le_bytes());
-        }
-        out.extend_from_slice(&sha256(&prevouts_buf));
-
-        let mut amounts_buf = Vec::with_capacity(8 * tx.inputs.len());
-        for amt in prevouts.amounts {
-            amounts_buf.extend_from_slice(&amt.to_le_bytes());
-        }
-        out.extend_from_slice(&sha256(&amounts_buf));
-
-        let mut scripts_buf = Vec::new();
-        for script in prevouts.scripts {
-            write_compact_size(&mut scripts_buf, script.len() as u64);
-            scripts_buf.extend_from_slice(script);
-        }
-        out.extend_from_slice(&sha256(&scripts_buf));
-
-        let mut sequences_buf = Vec::with_capacity(4 * tx.inputs.len());
-        for inp in &tx.inputs {
-            sequences_buf.extend_from_slice(&inp.sequence.to_le_bytes());
-        }
-        out.extend_from_slice(&sha256(&sequences_buf));
+        let shared = txdata.shared();
+        let spent = txdata
+            .spent_outputs()
+            .ok_or(TaprootSighashError::PrevoutsLengthMismatch)?;
+        out.extend_from_slice(&shared.sha_prevouts);
+        out.extend_from_slice(&spent.sha_amounts);
+        out.extend_from_slice(&spent.sha_scriptpubkeys);
+        out.extend_from_slice(&shared.sha_sequences);
     }
 
     // 9. sha_outputs — only when NOT SIGHASH_NONE/SINGLE.
     if output_type != SIGHASH_NONE && output_type != SIGHASH_SINGLE {
-        let mut outputs_buf = Vec::new();
-        for o in &tx.outputs {
-            encode_txout(&mut outputs_buf, o);
-        }
-        out.extend_from_slice(&sha256(&outputs_buf));
+        out.extend_from_slice(&txdata.shared().sha_outputs);
     }
 
     // 10. spend_type byte = (ext_flag * 2) | (annex_present ? 1 : 0).
@@ -329,11 +340,12 @@ pub fn build_sig_msg(
     //     else just the input_index as u32 LE.
     if anyone_can_pay {
         let inp = &tx.inputs[input_index];
+        let script = txdata.spent_script(input_index);
         out.extend_from_slice(&inp.previous_output.txid.0);
         out.extend_from_slice(&inp.previous_output.vout.to_le_bytes());
-        out.extend_from_slice(&prevouts.amounts[input_index].to_le_bytes());
-        write_compact_size(&mut out, prevouts.scripts[input_index].len() as u64);
-        out.extend_from_slice(prevouts.scripts[input_index]);
+        out.extend_from_slice(&txdata.spent_amounts()[input_index].to_le_bytes());
+        write_compact_size(&mut out, script.len() as u64);
+        out.extend_from_slice(script);
         out.extend_from_slice(&inp.sequence.to_le_bytes());
     } else {
         out.extend_from_slice(&(input_index as u32).to_le_bytes());
@@ -349,7 +361,7 @@ pub fn build_sig_msg(
 
     // 13. sha_single_output — only for SIGHASH_SINGLE, after annex.
     //     Per BIP-341 this comes AFTER the per-input data and annex,
-    //     not in place of sha_outputs.
+    //     not in place of sha_outputs. Per input, so not cached.
     if output_type == SIGHASH_SINGLE {
         if input_index >= tx.outputs.len() {
             return Err(TaprootSighashError::SighashSingleNoMatchingOutput);
@@ -367,13 +379,6 @@ pub fn build_sig_msg(
     }
 
     Ok(out)
-}
-
-/// Encode a TxOut as `value (8 LE) || compact_size(script_len) || script`.
-fn encode_txout(out: &mut Vec<u8>, txout: &TxOut) {
-    out.extend_from_slice(&txout.value.to_le_bytes());
-    write_compact_size(out, txout.script_pubkey.len() as u64);
-    out.extend_from_slice(&txout.script_pubkey);
 }
 
 // =====================================================================

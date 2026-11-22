@@ -13,7 +13,8 @@
 //! 7/7 keyPathSpending vectors pass byte-perfect on `sigMsg` + `sigHash`.
 
 pub use rustoshi_crypto::taproot::{
-    build_sig_msg, compute_taproot_sighash, is_valid_taproot_hash_type, TaprootPrevouts,
+    build_sig_msg, build_sig_msg_precomputed, compute_taproot_sighash,
+    compute_taproot_sighash_precomputed, is_valid_taproot_hash_type, TaprootPrevouts,
     TaprootSighashError, TapscriptContext, SIGHASH_ALL, SIGHASH_ANYONECANPAY, SIGHASH_DEFAULT,
     SIGHASH_NONE, SIGHASH_SINGLE,
 };

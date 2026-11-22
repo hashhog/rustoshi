@@ -14,6 +14,7 @@ pub mod hashes;
 pub mod hwaccel;
 pub mod keys;
 pub mod p2sh;
+pub mod precomputed;
 pub mod sha256;
 pub mod sighash;
 pub mod taproot;
@@ -37,9 +38,11 @@ pub use keys::{
     serialize_pubkey_uncompressed, sign_message_compact, signed_message_hash,
     BITCOIN_SIGNED_MESSAGE_MAGIC,
 };
+pub use precomputed::PrecomputedTransactionData;
 pub use sighash::{
     find_and_delete, find_and_delete_count, legacy_sighash, p2wpkh_script_code,
-    remove_codeseparators, segwit_v0_sighash, SigHashType, OP_CODESEPARATOR,
+    remove_codeseparators, segwit_v0_sighash, segwit_v0_sighash_precomputed, SigHashType,
+    OP_CODESEPARATOR,
 };
 
 // Re-export secp256k1 types that are used in the public API
