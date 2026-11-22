@@ -55,16 +55,18 @@ async fn getnewaddress_on_locked_wallet_needs_unlock_not_zero_seed() {
     }
 }
 
-/// Control: unlocking restores getnewaddress with a real, non-zero-seed
-/// address, so the -13 above is tied to the lock and not to encryption.
-/// (Which index it resumes at is not checked here: walletlock rewinds the
-/// receive index to the last persisted value, a separate pre-existing issue.)
+/// Control: unlocking restores getnewaddress with an address the wallet
+/// itself owns (`getaddressinfo ismine`), not a zero-seed one, so the -13
+/// above is tied to the lock and not to encryption. Which index it resumes at
+/// is not checked: walletlock rewinds the receive index to the last persisted
+/// value, a separate pre-existing issue.
 #[tokio::test]
 async fn getnewaddress_after_unlock_is_real_again() {
-    let (rpc, real) = locked_rpc().await;
+    let (rpc, _real) = locked_rpc().await;
     let _ = rpc.get_new_address(None, None).await;
     rpc.wallet_passphrase("pw".into(), 60).await.unwrap();
     let a = rpc.get_new_address(None, None).await.unwrap();
     assert!(!zero_seed_receive(25).contains(&a), "unlocked wallet minted zero-seed {a}");
-    assert!(real.contains(&a) || a.starts_with("bcrt1q"), "unexpected address {a}");
+    let info = rpc.get_address_info(a.clone()).await.unwrap();
+    assert_eq!(info["ismine"], serde_json::json!(true), "unlocked wallet does not own {a}: {info}");
 }
