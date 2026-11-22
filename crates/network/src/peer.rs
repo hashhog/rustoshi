@@ -10,7 +10,7 @@
 //! blocking I/O from stalling the main event loop.
 
 use crate::addr::NetworkAddr;
-use crate::event_lane::EventSender;
+use crate::event_lane::{event_cost, EventSender};
 use crate::message::{
     parse_message_header, serialize_message, NetworkMessage, SendCmpctMessage, VersionMessage,
     MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_PEER_PROTO_VERSION, NODE_NETWORK,
@@ -2698,7 +2698,7 @@ async fn message_loop_v1(
 
             // Deliver a staged inbound message. Never a blocking
             // `event_tx.send().await` in the loop body: see message_loop_v1.
-            permit = event_tx.reserve_priority(), if !outbox.is_empty() => {
+            permit = event_tx.reserve_priority(outbox.front().map_or(0, event_cost)), if !outbox.is_empty() => {
                 match permit {
                     Ok(permit) => permit.send(outbox.pop_front().expect("guarded non-empty")),
                     Err(_) => return Vec::new(), // main loop gone (shutdown)
@@ -2980,7 +2980,7 @@ async fn message_loop_v2(
             }
 
             // Deliver a staged inbound message (see message_loop_v1).
-            permit = event_tx.reserve_priority(), if !outbox.is_empty() => {
+            permit = event_tx.reserve_priority(outbox.front().map_or(0, event_cost)), if !outbox.is_empty() => {
                 match permit {
                     Ok(permit) => permit.send(outbox.pop_front().expect("guarded non-empty")),
                     Err(_) => return Vec::new(), // main loop gone (shutdown)

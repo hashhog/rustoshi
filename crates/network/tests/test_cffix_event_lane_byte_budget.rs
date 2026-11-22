@@ -103,7 +103,10 @@ async fn priority_lane_stops_at_byte_budget() {
     let (tx, rx) = event_channel(EVENT_LANE_CAPACITY);
     let mut accepted = 0usize;
     for _ in 0..12 {
-        let ev = PeerEvent::Message(PeerId(2), NetworkMessage::CmpctBlock(Vec::with_capacity(EACH)));
+        let ev = PeerEvent::Message(
+            PeerId(2),
+            NetworkMessage::CmpctBlock(Vec::with_capacity(EACH)),
+        );
         if tx.try_send(ev).is_ok() {
             accepted += 1;
         }
@@ -127,7 +130,10 @@ async fn draining_releases_the_budget() {
     let fill = |tx: &rustoshi_network::event_lane::EventSender| {
         let mut n = 0;
         for _ in 0..12 {
-            let ev = PeerEvent::Message(PeerId(3), NetworkMessage::CmpctBlock(Vec::with_capacity(EACH)));
+            let ev = PeerEvent::Message(
+                PeerId(3),
+                NetworkMessage::CmpctBlock(Vec::with_capacity(EACH)),
+            );
             if tx.try_send(ev).is_ok() {
                 n += 1;
             }
