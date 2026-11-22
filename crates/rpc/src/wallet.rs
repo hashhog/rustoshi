@@ -1159,6 +1159,10 @@ pub trait WalletRpc {
     /// Errors:
     /// - `-5` (RPC_WALLET_INVALID_ADDRESS_OR_KEY) if `seed` is missing or not
     ///   exactly 64 bytes of valid hex.
+    /// - `-13` (RPC_WALLET_UNLOCK_NEEDED) if the wallet is encrypted and
+    ///   locked. An unlocked encrypted wallet stays encrypted (the new seed is
+    ///   written under the same passphrase) and the previous seed file is
+    ///   archived, never destroyed.
     /// - `-4` (RPC_WALLET_ERROR) on any wallet/persistence failure.
     #[method(name = "sethdseed")]
     async fn set_hd_seed(
@@ -1839,6 +1843,20 @@ impl WalletRpcImpl {
                 other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
             }
         })
+    }
+
+    /// Map an address-derivation failure to an RPC error. A locked
+    /// encrypted wallet has no HD master to derive from (its in-memory
+    /// stand-in refuses with `WalletLocked`), which is Core's
+    /// RPC_WALLET_UNLOCK_NEEDED (-13); anything else stays -4.
+    fn address_derivation_err(e: rustoshi_wallet::WalletError) -> ErrorObjectOwned {
+        match e {
+            rustoshi_wallet::WalletError::WalletLocked => Self::rpc_error(
+                wallet_error::RPC_WALLET_UNLOCK_NEEDED,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
+            ),
+            other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+        }
     }
 
     /// FIX-61: parse a txid (hex display-order, 32 bytes) and return the
@@ -2542,7 +2560,7 @@ impl WalletRpcServer for WalletRpcImpl {
                 }
             },
         }
-        .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+        .map_err(Self::address_derivation_err)?;
 
         Ok(address)
     }
@@ -3927,6 +3945,9 @@ impl WalletRpcServer for WalletRpcImpl {
         // Resolve the target wallet name (URL-pinned, or the single default).
         let (name, _wallet) = self.resolve_wallet(&state)?;
 
+        // Core's legacy sethdseed: EnsureWalletIsUnlocked → -13 when locked.
+        Self::require_unlocked(&state, &name)?;
+
         state
             .wallet_manager
             .set_hd_seed(&name, &seed_bytes)
@@ -4334,9 +4355,9 @@ impl WalletRpcServer for WalletRpcImpl {
                         let mut wallet_guard = wallet.lock().map_err(|_| {
                             Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
                         })?;
-                        wallet_guard.get_change_address().map_err(|e| {
-                            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string())
-                        })?
+                        wallet_guard
+                            .get_change_address()
+                            .map_err(Self::address_derivation_err)?
                     };
                     let change_addr =
                         Address::from_string(&change_addr_str, net_param).map_err(|e| {

@@ -466,6 +466,15 @@ pub const FEELER_INTERVAL: Duration = Duration::from_secs(120);
 /// MAX_FEELER_CONNECTIONS = 1).
 pub const MAX_FEELER_CONNECTIONS: usize = 1;
 
+/// Core `ProcessAddrs` (net_processing.cpp): only an addr message holding at
+/// most this many entries is relayed (`vAddr.size() <= 10`).
+const ADDR_RELAY_MAX_MSG_SIZE: usize = 10;
+/// Core `ProcessAddrs`: an address is relayed only if its time is within the
+/// last 10 minutes (`addr.nTime > current_time - 10min`).
+const ADDR_RELAY_FRESH_SECS: u64 = 10 * 60;
+/// Core `ProcessAddrs`: times at or below this are treated as bogus.
+const ADDR_MIN_PLAUSIBLE_TIME: u64 = 100_000_000;
+
 /// Percentage of the addrman shared in a getaddr response (Core
 /// MAX_PCT_ADDR_TO_SEND = 23, net_processing.cpp:188). The getaddr response is
 /// capped at min(MAX_ADDR_TO_SEND, floor(23 * addrman_size / 100)) — primary
@@ -651,6 +660,20 @@ pub const ADDRMAN_TRIED_BUCKETS_PER_GROUP: u64 = 8;
 /// Max new buckets one address may simultaneously occupy (Core
 /// ADDRMAN_NEW_BUCKETS_PER_ADDRESS).
 pub const ADDRMAN_NEW_BUCKETS_PER_ADDRESS: u32 = 8;
+
+/// Core `ThreadOpenConnections`: give up after this many `addrman.Select`
+/// draws in one pass (net.cpp `if (nTries > 100) break;`).
+const OUTBOUND_SELECT_MAX_TRIES: usize = 100;
+/// Core: a pick tried within the last 10 minutes is skipped ...
+const OUTBOUND_SELECT_RECENT_TRY_SECS: u64 = 10 * 60;
+/// ... until this many draws have failed (`nTries < 30`).
+const OUTBOUND_SELECT_RECENT_TRY_GRACE: usize = 30;
+/// `AddrManTable::select`: random bucket draws before falling back to a
+/// uniform pick among the non-empty buckets (same distribution, bounded).
+const SELECT_RANDOM_BUCKET_DRAWS: usize = 64;
+/// Size at which `AddressManager::outbound_retry` drops entries whose
+/// backoff has passed.
+const OUTBOUND_RETRY_MAP_CAP: usize = 4096;
 /// Addresses not seen in this long are terrible (Core ADDRMAN_HORIZON = 30 d).
 pub const ADDRMAN_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
 /// Tries after which a never-successful address is terrible (Core
@@ -667,6 +690,10 @@ pub const ADDRMAN_MIN_FAIL_SECS: u64 = 7 * 24 * 60 * 60;
 /// table can grow past its fixed bucket geometry. This is the bounded ceiling.
 pub const ADDRMAN_CEILING: usize = ADDRMAN_NEW_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE
     + ADDRMAN_TRIED_BUCKET_COUNT * ADDRMAN_BUCKET_SIZE;
+
+/// How many entries `AddressManager`'s flat-store eviction samples to pick a
+/// victim once a store reaches ADDRMAN_CEILING.
+const FLAT_EVICT_SAMPLE: usize = 8;
 
 /// On-disk format version for the peers.dat-equiv. Bumping invalidates older
 /// files (they load as an empty cold start, never a hard-down).
@@ -1099,6 +1126,20 @@ impl AddrManTable {
         true
     }
 
+    /// Core `Attempt_` with `fCountFailure = false`: note the try time only,
+    /// without counting a failure. Used for automatic outbound picks; Core
+    /// counts those failures only once we have >= 2 outbound netgroups and
+    /// at most once per `Good`, and that gating is not ported, so counting
+    /// every pick would push never-answered entries to `is_terrible` (and
+    /// let colliding announcements evict them) after an outage.
+    pub fn record_try(&mut self, addr: &SocketAddr, now: u64) {
+        if let Some(&id) = self.map_addr.get(addr) {
+            if let Some(info) = self.map_info.get_mut(&id) {
+                info.last_try_unix = now;
+            }
+        }
+    }
+
     /// Core Attempt_: record a (possibly-failed) connection attempt.
     pub fn attempt(&mut self, addr: &SocketAddr, now: u64) {
         if let Some(&id) = self.map_addr.get(addr) {
@@ -1144,29 +1185,55 @@ impl AddrManTable {
             (&self.vv_new, ADDRMAN_NEW_BUCKET_COUNT)
         };
 
-        // Pick a random starting bucket + position for selection bias, then
-        // walk deterministically (wrapping) through every bucket. This is
-        // bounded (at most bucket_count * BUCKET_SIZE slots) AND guaranteed to
-        // return an occupant whenever one exists, unlike a pure rejection-
-        // sample loop which can starve on a sparse table. Core's Select_ loops
-        // forever on random buckets until it hits a non-empty one; this is the
-        // bounded, liveness-safe analogue. (GetChance()*1.2^miss probability
-        // bias is a named follow-up.)
-        let start_bucket = rng.gen_range(0..bucket_count);
-        let initial_pos = rng.gen_range(0..ADDRMAN_BUCKET_SIZE);
-        for nb in 0..bucket_count {
-            let bucket = (start_bucket + nb) % bucket_count;
-            for i in 0..ADDRMAN_BUCKET_SIZE {
-                let pos = (initial_pos + i) % ADDRMAN_BUCKET_SIZE;
-                let id = table[bucket][pos];
-                if id != -1 {
-                    if let Some(info) = self.map_info.get(&id) {
-                        return Some(info.addr);
-                    }
+        // Core Select_ draws random buckets until it hits a non-empty one,
+        // so every non-empty bucket is equally likely, then returns the first
+        // occupant from a random position in it. Walking on from a random
+        // start bucket instead (the old code) made an address's chance equal
+        // to the run of empty buckets before it: an entry right behind
+        // another was almost never drawn, which matters now that this picks
+        // every outbound peer. Bounded analogue: SELECT_RANDOM_BUCKET_DRAWS
+        // random draws, then a uniform pick among the non-empty buckets,
+        // which has the same distribution and cannot starve on a sparse
+        // table. (GetChance()*1.2^miss probability bias is a named follow-up.)
+        let occupied = |b: usize| table[b].iter().any(|&id| id != -1);
+        let mut bucket = None;
+        for _ in 0..SELECT_RANDOM_BUCKET_DRAWS {
+            let b = rng.gen_range(0..bucket_count);
+            if occupied(b) {
+                bucket = Some(b);
+                break;
+            }
+        }
+        let bucket = match bucket {
+            Some(b) => b,
+            None => {
+                let non_empty: Vec<usize> = (0..bucket_count).filter(|&b| occupied(b)).collect();
+                if non_empty.is_empty() {
+                    return None;
                 }
+                non_empty[rng.gen_range(0..non_empty.len())]
+            }
+        };
+        let initial_pos = rng.gen_range(0..ADDRMAN_BUCKET_SIZE);
+        for i in 0..ADDRMAN_BUCKET_SIZE {
+            let pos = (initial_pos + i) % ADDRMAN_BUCKET_SIZE;
+            let id = table[bucket][pos];
+            if id != -1 {
+                return self.map_info.get(&id).map(|info| info.addr);
             }
         }
         None
+    }
+
+    /// Last connection-attempt unix time for `addr` (0 = never tried or not
+    /// held). Core `Select` returns this alongside the address so the
+    /// outbound loop can skip very recently tried entries.
+    pub fn last_try_of(&self, addr: &SocketAddr) -> u64 {
+        self.map_addr
+            .get(addr)
+            .and_then(|id| self.map_info.get(id))
+            .map(|i| i.last_try_unix)
+            .unwrap_or(0)
     }
 
     /// Number of addresses currently in the NEW table.
@@ -1532,8 +1599,13 @@ pub struct AddressManager {
     known_addrs: HashMap<SocketAddr, AddrInfo>,
     /// BIP155 addresses (supports all network types including privacy networks).
     known_addrv2: HashMap<AddrV2Key, AddrV2Info>,
-    /// Addresses to try next (prioritized queue).
+    /// Addresses to try next (prioritized queue). Each address appears at
+    /// most once (`queued` mirrors membership) and the queue never holds more
+    /// than ADDRMAN_CEILING entries.
     try_queue: VecDeque<SocketAddr>,
+    /// Membership set for `try_queue`, so a re-announced address is not
+    /// queued a second time.
+    queued: HashSet<SocketAddr>,
     /// Banned addresses with unban time.
     banned: HashMap<SocketAddr, Instant>,
     /// Currently connected addresses (to avoid duplicates).
@@ -1553,6 +1625,13 @@ pub struct AddressManager {
     /// Adds that arrived before `bucket_ng` was captured. Flushed into the
     /// bucketed addrman on first capture. Bounded by ADDRMAN_CEILING.
     pending_bucket_adds: Vec<(SocketAddr, IpAddr, u64, u64)>,
+    /// Automatic outbound picks from the bucketed addrman: (last pick,
+    /// consecutive picks without a successful handshake). Drives the same
+    /// `retry_backoff` tiers the flat store uses, so a dead address is not
+    /// re-dialled in a tight loop: rustoshi refills straight from the
+    /// `Disconnected` event, where Core's ThreadOpenConnections sleeps 500ms
+    /// per pass. Cleared on success; pruned past OUTBOUND_RETRY_MAP_CAP.
+    outbound_retry: HashMap<SocketAddr, (Instant, u32)>,
 }
 
 impl AddressManager {
@@ -1562,12 +1641,14 @@ impl AddressManager {
             known_addrs: HashMap::new(),
             known_addrv2: HashMap::new(),
             try_queue: VecDeque::new(),
+            queued: HashSet::new(),
             banned: HashMap::new(),
             connected: HashSet::new(),
             connected_outbound_netgroups: HashSet::new(),
             addrman: AddrManTable::new(),
             bucket_ng: None,
             pending_bucket_adds: Vec::new(),
+            outbound_retry: HashMap::new(),
         }
     }
 
@@ -1616,6 +1697,7 @@ impl AddressManager {
     pub fn add_dns_addresses(&mut self, addrs: Vec<SocketAddr>) {
         for addr in addrs {
             if !self.known_addrs.contains_key(&addr) && !self.is_banned(&addr) {
+                self.make_room_legacy(&addr);
                 self.known_addrs.insert(
                     addr,
                     AddrInfo {
@@ -1629,7 +1711,7 @@ impl AddressManager {
                         source: AddrSource::Dns,
                     },
                 );
-                self.try_queue.push_back(addr);
+                self.enqueue_back(addr);
                 // Mirror into the bucketed addrman. DNS seeds are self-sourced
                 // (no announcing peer), matching Core's CAddress source==addr.
                 self.bucket_add(
@@ -1657,6 +1739,91 @@ impl AddressManager {
         }
     }
 
+    /// Queue `addr` at the back of the try queue unless it is already queued
+    /// or the queue is full (ADDRMAN_CEILING). The queue is only a hint;
+    /// `next_addr_to_try` falls back to the persistent store, so a dropped
+    /// hint never loses the address.
+    fn enqueue_back(&mut self, addr: SocketAddr) {
+        if self.queued.contains(&addr) || self.try_queue.len() >= ADDRMAN_CEILING {
+            return;
+        }
+        self.queued.insert(addr);
+        self.try_queue.push_back(addr);
+    }
+
+    /// Queue `addr` at the front of the try queue (manual peers). An existing
+    /// queue entry is moved, not duplicated; a full queue drops its back.
+    fn enqueue_front(&mut self, addr: SocketAddr) {
+        if self.queued.contains(&addr) {
+            self.try_queue.retain(|a| *a != addr);
+        } else if self.try_queue.len() >= ADDRMAN_CEILING {
+            if let Some(dropped) = self.try_queue.pop_back() {
+                self.queued.remove(&dropped);
+            }
+        }
+        self.queued.insert(addr);
+        self.try_queue.push_front(addr);
+    }
+
+    /// Make room for a new `known_addrs` key once the store holds
+    /// ADDRMAN_CEILING entries, by evicting one entry. Core never holds more
+    /// than its new/tried table geometry (`AddrManImpl::Add_`,
+    /// src/addrman.cpp) and evicts via `IsTerrible`; this flat store mirrors
+    /// that bound. The victim is the worst of a small sample taken from the
+    /// map's (SipHash-randomised, so unpredictable to a peer) iteration
+    /// order: never a connected or manual entry if the sample has another,
+    /// then never-succeeded before succeeded, then least recently seen. If all
+    /// sampled entries are connected or manual one of them still goes: the
+    /// bound wins (with ~125 connections out of 81,920 entries this is rare).
+    /// A queued hint for the victim stays in `try_queue` and is skipped when
+    /// popped.
+    fn make_room_legacy(&mut self, incoming: &SocketAddr) {
+        if self.known_addrs.len() < ADDRMAN_CEILING || self.known_addrs.contains_key(incoming) {
+            return;
+        }
+        let victim = self
+            .known_addrs
+            .iter()
+            .take(FLAT_EVICT_SAMPLE)
+            .min_by_key(|(a, i)| {
+                (
+                    self.connected.contains(a) || matches!(i.source, AddrSource::Manual),
+                    i.last_success.is_some(),
+                    i.last_seen,
+                )
+            })
+            .map(|(a, _)| *a);
+        if let Some(v) = victim {
+            self.known_addrs.remove(&v);
+        }
+    }
+
+    /// `known_addrv2` counterpart of `make_room_legacy`.
+    fn make_room_v2(&mut self, incoming: &AddrV2Key) {
+        if self.known_addrv2.len() < ADDRMAN_CEILING || self.known_addrv2.contains_key(incoming) {
+            return;
+        }
+        let victim = self
+            .known_addrv2
+            .iter()
+            .take(FLAT_EVICT_SAMPLE)
+            .min_by_key(|(k, i)| {
+                let connected = k
+                    .to_socket_addr()
+                    .map(|sa| self.connected.contains(&sa))
+                    .unwrap_or(false);
+                (
+                    connected || matches!(i.source, AddrSource::Manual),
+                    i.last_success.is_some(),
+                    i.last_seen,
+                )
+            })
+            .map(|(k, _)| k.clone());
+        if let Some(v) = victim {
+            self.known_addrv2.remove(&v);
+        }
+    }
+
     /// Add addresses from an addr message from a peer.
     pub fn add_peer_addresses(&mut self, addrs: &[TimestampedNetAddress], from: SocketAddr) {
         for taddr in addrs {
@@ -1670,6 +1837,7 @@ impl AddressManager {
                     // Clamp timestamp: mirrors Core net_processing.cpp:5678-5680.
                     // Pre-2001 (<=100_000_000) or >10 min future → 5 days ago.
                     let clamped_ts = clamp_addr_timestamp(taddr.timestamp, now_unix_secs());
+                    self.make_room_legacy(&socket_addr);
                     let entry = self
                         .known_addrs
                         .entry(socket_addr)
@@ -1689,12 +1857,10 @@ impl AddressManager {
                     let services = taddr.address.services;
                     let ts = clamped_ts;
 
-                    // Add to try queue if not already connected
-                    if !self.connected.contains(&socket_addr) {
-                        self.try_queue.push_back(socket_addr);
-                    }
-                    // Mirror into the bucketed addrman, keyed by the announcing
-                    // peer's address as the source group (Core AddSingle source).
+                    // Outbound slots are filled from the bucketed addrman, keyed
+                    // by the announcing peer's address as the source group (Core
+                    // AddSingle source). No try_queue hint: a peer must not be
+                    // able to put its addresses at the head of the dial order.
                     self.bucket_add(socket_addr, from.ip(), services, ts);
                 }
             }
@@ -1703,18 +1869,25 @@ impl AddressManager {
 
     /// Add a manually specified address.
     pub fn add_manual_address(&mut self, addr: SocketAddr) {
-        self.known_addrs.entry(addr).or_insert_with(|| AddrInfo {
-            addr,
-            services: NODE_NETWORK | NODE_WITNESS,
-            time_unix: now_unix_secs(),
-            last_seen: Instant::now(),
-            last_attempt: None,
-            last_success: None,
-            attempt_count: 0,
-            source: AddrSource::Manual,
-        });
+        self.make_room_legacy(&addr);
+        // An address we already learned from DNS or a peer becomes
+        // operator-named too, so the manual stage of `next_addr_to_try`
+        // still dials it first.
+        self.known_addrs
+            .entry(addr)
+            .and_modify(|info| info.source = AddrSource::Manual)
+            .or_insert_with(|| AddrInfo {
+                addr,
+                services: NODE_NETWORK | NODE_WITNESS,
+                time_unix: now_unix_secs(),
+                last_seen: Instant::now(),
+                last_attempt: None,
+                last_success: None,
+                attempt_count: 0,
+                source: AddrSource::Manual,
+            });
         // Manual addresses go to the front of the queue
-        self.try_queue.push_front(addr);
+        self.enqueue_front(addr);
         // Manual peers are self-sourced in the bucketed addrman.
         self.bucket_add(
             addr,
@@ -1724,36 +1897,159 @@ impl AddressManager {
         );
     }
 
-    /// Get the next address to try connecting to with network group diversity.
+    /// Get the next address to dial for an automatic (full-relay or
+    /// block-relay-only) outbound slot.
     ///
-    /// For IPv4/IPv6 outbound connections, this enforces that no two outbound
-    /// connections share the same /16 (IPv4) or /32 (IPv6) network group.
-    /// Privacy networks (Tor, I2P, CJDNS) are not subject to this restriction.
+    /// Routable IPv4/IPv6 candidates come ONLY from the bucketed addrman, the
+    /// way Core's `CConnman::ThreadOpenConnections` (net.cpp, non-feeler
+    /// branch) calls `addrman.Select(false, ...)`. A random draw over the
+    /// NEW/TRIED buckets is the anti-eclipse property: one announcing source
+    /// reaches at most `ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP` of the NEW
+    /// buckets, so it cannot choose our outbound peers. The candidate filter
+    /// follows Core's loop: at most 100 draws; skip banned, already connected
+    /// and (IPv4/IPv6) already-used outbound netgroups; skip addresses tried
+    /// in the last 10 minutes until 30 draws have failed. The chosen address
+    /// gets its try time recorded (Core `ConnectNode` -> `addrman.Attempt`;
+    /// the failure count is not bumped, see `AddrManTable::record_try`).
+    /// A picked address that has not completed a handshake is held back by
+    /// the same `retry_backoff` tiers as the flat store (60s, 5m, 15m, 1h),
+    /// because rustoshi refills on every `Disconnected` event with no pause.
+    /// Entries are never consumed, so the table stays re-selectable (the
+    /// 2026-05-19 zero-peer deadlock cannot come back through this path).
     ///
-    /// Selection has two stages:
-    ///  1. Fast path — drain the `try_queue` hint, which carries freshly
-    ///     learned / preferred-order addresses (DNS seeds, `addr` messages,
-    ///     manual peers).
-    ///  2. Fallback — when the hint queue is empty, re-select from the
-    ///     persistent `known_addrs` store, applying an attempt-count backoff.
+    /// Operator-named addresses (`add_manual_address`: `addnode add`, the
+    /// testnet4 fallback peers) keep their front-of-queue priority, routable
+    /// or not, as before; they are not peer-controlled.
     ///
-    /// The fallback is what makes the AddrMan re-selectable: `try_queue` is a
-    /// one-shot consume queue, so without stage 2 every address would be lost
-    /// forever after one `pop_front()`. Once the queue drained (which happens
-    /// within ~20 min of churn during IBD) `fill_outbound_connections` could
-    /// never open another connection, and with 0 peers no new `addr` messages
-    /// arrive to refill it — a permanent zero-peer deadlock (observed on
-    /// mainnet 2026-05-19: rustoshi wedged 13+ h at h=948304, `peers=0`).
-    /// Bitcoin Core's `AddrMan::Select_` is likewise a non-consuming read of
-    /// the persistent new/tried tables — entries are never dropped on select.
+    /// Addresses the bucketed table refuses (non-routable: loopback, RFC1918,
+    /// as used by regtest and local test setups) still go through the legacy
+    /// path — the `try_queue` hint, then the flat `known_addrs` store with a
+    /// retry backoff. Peer-announced addresses are always routable, so no
+    /// peer can reach an outbound slot through that path.
     ///
     /// Returns None if no eligible address is available.
     pub fn next_addr_to_try(&mut self, netgroup_manager: &NetGroupManager) -> Option<SocketAddr> {
+        self.next_addr_to_try_excluding(netgroup_manager, &HashSet::new(), &HashSet::new())
+    }
+
+    /// `next_addr_to_try`, also skipping `busy_addrs` (every peer we are
+    /// connected or still connecting to — Core `AlreadyConnectedToAddress`)
+    /// and `busy_groups` (netgroups of full-relay, block-relay-only and
+    /// manual peers, including ones still connecting — Core `outbound_ipv46_peer_netgroups`, built
+    /// from `m_nodes`). `connected` / `connected_outbound_netgroups` are only
+    /// filled at handshake, so without these a pass that fills several slots
+    /// could pick the same address twice.
+    pub fn next_addr_to_try_excluding(
+        &mut self,
+        netgroup_manager: &NetGroupManager,
+        busy_addrs: &HashSet<SocketAddr>,
+        busy_groups: &HashSet<Vec<u8>>,
+    ) -> Option<SocketAddr> {
         // Capture the netgroup manager + flush any deferred bucket adds.
         self.bind_netgroup(netgroup_manager);
+        if let Some(addr) = self.next_manual_addr_to_try(netgroup_manager, busy_addrs, busy_groups)
+        {
+            return Some(addr);
+        }
+        if let Some(addr) = self.select_from_addrman(netgroup_manager, busy_addrs, busy_groups) {
+            return Some(addr);
+        }
+        self.next_unroutable_addr_to_try(netgroup_manager, busy_addrs, busy_groups)
+    }
+
+    /// Take the first eligible operator-named (`AddrSource::Manual`) entry
+    /// from the `try_queue` hint, leaving every other entry in place.
+    fn next_manual_addr_to_try(
+        &mut self,
+        netgroup_manager: &NetGroupManager,
+        busy_addrs: &HashSet<SocketAddr>,
+        busy_groups: &HashSet<Vec<u8>>,
+    ) -> Option<SocketAddr> {
+        let pos = self.try_queue.iter().position(|addr| {
+            matches!(
+                self.known_addrs.get(addr).map(|i| &i.source),
+                Some(AddrSource::Manual)
+            ) && self.is_addr_eligible_excluding(addr, netgroup_manager, busy_addrs, busy_groups)
+        })?;
+        let addr = self.try_queue.remove(pos)?;
+        // Keep the `queued` membership set in step with `try_queue`, or a
+        // later `enqueue_back` of this address would be silently skipped.
+        self.queued.remove(&addr);
+        if let Some(info) = self.known_addrs.get_mut(&addr) {
+            info.last_attempt = Some(Instant::now());
+            info.attempt_count += 1;
+        }
+        self.addrman.record_try(&addr, now_unix_secs());
+        Some(addr)
+    }
+
+    /// Core `ThreadOpenConnections` candidate loop over `addrman.Select(false)`.
+    fn select_from_addrman(
+        &mut self,
+        netgroup_manager: &NetGroupManager,
+        busy_addrs: &HashSet<SocketAddr>,
+        busy_groups: &HashSet<Vec<u8>>,
+    ) -> Option<SocketAddr> {
+        if self.addrman.is_empty() {
+            return None;
+        }
+        let now_unix = now_unix_secs();
+        let mut chosen = None;
+        for n_tries in 1..=OUTBOUND_SELECT_MAX_TRIES {
+            let addr = match self.addrman.select(false) {
+                Some(a) => a,
+                None => break,
+            };
+            if !self.is_addr_eligible_excluding(&addr, netgroup_manager, busy_addrs, busy_groups) {
+                continue;
+            }
+            if self.in_outbound_backoff(&addr) {
+                continue;
+            }
+            // only consider very recently tried nodes after 30 failed attempts
+            let last_try = self.addrman.last_try_of(&addr);
+            if n_tries < OUTBOUND_SELECT_RECENT_TRY_GRACE
+                && last_try != 0
+                && now_unix.saturating_sub(last_try) < OUTBOUND_SELECT_RECENT_TRY_SECS
+            {
+                continue;
+            }
+            chosen = Some(addr);
+            break;
+        }
+        let addr = chosen?;
+        self.addrman.record_try(&addr, now_unix);
+        self.note_outbound_pick(addr);
+        if let Some(info) = self.known_addrs.get_mut(&addr) {
+            info.last_attempt = Some(Instant::now());
+            info.attempt_count += 1;
+        }
+        Some(addr)
+    }
+
+    /// Legacy selection, restricted to addresses the bucketed addrman cannot
+    /// hold (non-routable). Stage 1 drains the `try_queue` hint (DNS / manual
+    /// order); stage 2 re-selects from `known_addrs`, most-overdue first, with
+    /// an attempt-count backoff so a dead local peer is not hammered.
+    fn next_unroutable_addr_to_try(
+        &mut self,
+        netgroup_manager: &NetGroupManager,
+        busy_addrs: &HashSet<SocketAddr>,
+        busy_groups: &HashSet<Vec<u8>>,
+    ) -> Option<SocketAddr> {
         // Stage 1: fast path over the preferred-order hint queue.
         while let Some(addr) = self.try_queue.pop_front() {
-            if !self.is_addr_eligible(&addr, netgroup_manager) {
+            self.queued.remove(&addr);
+            // Evicted from the store (make_room_legacy) after it was queued:
+            // the hint is stale, so do not dial it.
+            if !self.known_addrs.contains_key(&addr) {
+                continue;
+            }
+            // Routable entries are dialled through the bucketed addrman.
+            if netgroup_manager.is_routable(&addr.ip()) {
+                continue;
+            }
+            if !self.is_addr_eligible_excluding(&addr, netgroup_manager, busy_addrs, busy_groups) {
                 continue;
             }
 
@@ -1769,14 +2065,17 @@ impl AddressManager {
         // Stage 2: fallback re-selection from the persistent store. Pick the
         // eligible address whose connect attempt is most overdue (never tried,
         // or attempted longest ago) so we cycle fairly instead of hammering
-        // one peer. This mirrors Core's AddrMan::Select_ reading the persistent
-        // tables rather than consuming a queue.
+        // one peer. `try_queue` is a one-shot consume queue, so without this
+        // stage every address would be lost after one `pop_front()`.
         let now = Instant::now();
         let mut best: Option<SocketAddr> = None;
         // Larger key = more overdue. `u64::MAX` for never-attempted addresses.
         let mut best_key: u64 = 0;
         for (addr, info) in self.known_addrs.iter() {
-            if !self.is_addr_eligible(addr, netgroup_manager) {
+            if netgroup_manager.is_routable(&addr.ip()) {
+                continue;
+            }
+            if !self.is_addr_eligible_excluding(addr, netgroup_manager, busy_addrs, busy_groups) {
                 continue;
             }
             let key = match info.last_attempt {
@@ -1806,6 +2105,50 @@ impl AddressManager {
             }
         }
         best
+    }
+
+    /// Whether an automatic pick of `addr` failed recently enough that the
+    /// `retry_backoff` window for its streak has not passed yet.
+    fn in_outbound_backoff(&self, addr: &SocketAddr) -> bool {
+        match self.outbound_retry.get(addr) {
+            Some((last, streak)) => {
+                Instant::now().saturating_duration_since(*last) < Self::retry_backoff(*streak)
+            }
+            None => false,
+        }
+    }
+
+    /// Record an automatic pick (cleared again by a successful handshake).
+    fn note_outbound_pick(&mut self, addr: SocketAddr) {
+        let now = Instant::now();
+        if self.outbound_retry.len() >= OUTBOUND_RETRY_MAP_CAP {
+            self.outbound_retry.retain(|_, (last, streak)| {
+                now.saturating_duration_since(*last) < Self::retry_backoff(*streak)
+            });
+        }
+        let e = self.outbound_retry.entry(addr).or_insert((now, 0));
+        e.0 = now;
+        e.1 = e.1.saturating_add(1);
+    }
+
+    /// `is_addr_eligible`, also refusing `busy_addrs` / `busy_groups` (see
+    /// `next_addr_to_try_excluding`).
+    fn is_addr_eligible_excluding(
+        &self,
+        addr: &SocketAddr,
+        netgroup_manager: &NetGroupManager,
+        busy_addrs: &HashSet<SocketAddr>,
+        busy_groups: &HashSet<Vec<u8>>,
+    ) -> bool {
+        if busy_addrs.contains(addr) {
+            return false;
+        }
+        if !netgroup_manager.is_privacy_network(&addr.ip())
+            && busy_groups.contains(netgroup_manager.get_group(&addr.ip()).as_bytes())
+        {
+            return false;
+        }
+        self.is_addr_eligible(addr, netgroup_manager)
     }
 
     /// Whether `addr` may be dialed right now: not banned, not already
@@ -1863,6 +2206,7 @@ impl AddressManager {
             info.last_success = Some(Instant::now());
             info.attempt_count = 0;
         }
+        self.outbound_retry.remove(addr);
 
         // Promote in the bucketed addrman (NEW -> TRIED), mirroring Core's
         // AddrMan::Good on a successful outbound connection.
@@ -1909,6 +2253,7 @@ impl AddressManager {
     #[cfg(test)]
     pub(crate) fn test_seed_new(&mut self, addr: SocketAddr, ng: &NetGroupManager) {
         self.bind_netgroup(ng);
+        self.make_room_legacy(&addr);
         self.known_addrs.entry(addr).or_insert_with(|| AddrInfo {
             addr,
             services: NODE_NETWORK | NODE_WITNESS,
@@ -2120,6 +2465,7 @@ impl AddressManager {
                     continue;
                 }
                 if !self.is_banned(&socket_addr) {
+                    self.make_room_legacy(&socket_addr);
                     let addr_entry =
                         self.known_addrs
                             .entry(socket_addr)
@@ -2137,14 +2483,15 @@ impl AddressManager {
                     addr_entry.time_unix = clamped_ts;
                     addr_entry.services = entry.services;
 
-                    // Add to try queue if not already connected
-                    if !self.connected.contains(&socket_addr) {
-                        self.try_queue.push_back(socket_addr);
-                    }
+                    // Same as the addr path: IPv4/IPv6 entries reach outbound
+                    // selection only through the bucketed addrman, sourced by
+                    // the announcing peer.
+                    self.bucket_add(socket_addr, from.ip(), entry.services, clamped_ts);
                 }
             }
 
             // Store in addrv2 storage
+            self.make_room_v2(&key);
             let v2_entry = self.known_addrv2.entry(key).or_insert_with(|| AddrV2Info {
                 addr: entry.addr.clone(),
                 port: entry.port,
@@ -2167,6 +2514,9 @@ impl AddressManager {
     /// Returns addresses that have been successfully connected to recently,
     /// including privacy network addresses.
     pub fn get_addrv2_for_sharing(&self, count: usize) -> Vec<crate::addr::AddrV2Entry> {
+        if count == 0 {
+            return Vec::new();
+        }
         self.known_addrv2
             .values()
             .filter(|info| info.last_success.is_some())
@@ -2239,6 +2589,7 @@ impl AddressManager {
         if self.known_addrs.contains_key(&addr) {
             return false;
         }
+        self.make_room_legacy(&addr);
         self.known_addrs.insert(
             addr,
             AddrInfo {
@@ -3649,7 +4000,12 @@ impl PeerManager {
         budget_left -= full_relay_needed;
 
         for _ in 0..full_relay_needed {
-            if let Some(addr) = self.addr_manager.next_addr_to_try(&self.netgroup_manager) {
+            let (busy_addrs, busy_groups) = self.outbound_busy_sets();
+            if let Some(addr) = self.addr_manager.next_addr_to_try_excluding(
+                &self.netgroup_manager,
+                &busy_addrs,
+                &busy_groups,
+            ) {
                 self.connect_to_with_type(addr, ConnectionType::FullRelay)
                     .await;
             } else {
@@ -3665,13 +4021,47 @@ impl PeerManager {
             .min(budget_left);
 
         for _ in 0..block_relay_needed {
-            if let Some(addr) = self.addr_manager.next_addr_to_try(&self.netgroup_manager) {
+            let (busy_addrs, busy_groups) = self.outbound_busy_sets();
+            if let Some(addr) = self.addr_manager.next_addr_to_try_excluding(
+                &self.netgroup_manager,
+                &busy_addrs,
+                &busy_groups,
+            ) {
                 self.connect_to_with_type(addr, ConnectionType::BlockRelayOnly)
                     .await;
             } else {
                 break;
             }
         }
+    }
+
+    /// Addresses and netgroups the outbound selector must skip, built from
+    /// every tracked peer whatever its state, so a peer that is still
+    /// connecting counts (Core builds both from `m_nodes`, net.cpp
+    /// ThreadOpenConnections). Addresses: all peers (Core
+    /// `AlreadyConnectedToAddress`). Netgroups: full-relay,
+    /// block-relay-only and manual peers, like Core's
+    /// `outbound_ipv46_peer_netgroups` (inbound, addr-fetch and feeler
+    /// connections are not counted).
+    fn outbound_busy_sets(&self) -> (HashSet<SocketAddr>, HashSet<Vec<u8>>) {
+        let mut addrs = HashSet::new();
+        let mut groups = HashSet::new();
+        for p in self.peers.values() {
+            addrs.insert(p.info.addr);
+            if matches!(
+                p.conn_type,
+                ConnectionType::FullRelay | ConnectionType::BlockRelayOnly | ConnectionType::Manual
+            ) && !self.netgroup_manager.is_privacy_network(&p.info.addr.ip())
+            {
+                groups.insert(
+                    self.netgroup_manager
+                        .get_group(&p.info.addr.ip())
+                        .as_bytes()
+                        .to_vec(),
+                );
+            }
+        }
+        (addrs, groups)
     }
 
     /// Whether the fixed-seed bootstrap fallback is enabled.
@@ -4980,8 +5370,31 @@ impl PeerManager {
                             self.addr_manager
                                 .add_peer_addresses(admitted, peer.info.addr);
                         }
-                        // BIP155: Relay a random subset of new addresses to 2 other peers
-                        self.relay_addresses_to_peers(*id).await;
+                        // Relay only addresses taken from THIS message, under
+                        // Core's ProcessAddrs rules (never our own history).
+                        let relay: Vec<crate::addr::AddrV2Entry> = if addrs.len()
+                            <= ADDR_RELAY_MAX_MSG_SIZE
+                        {
+                            admitted
+                                .iter()
+                                .filter_map(|t| {
+                                    let sa = net_address_to_socket_addr(&t.address)?;
+                                    let na = match sa.ip() {
+                                        IpAddr::V4(v4) => crate::addr::NetworkAddr::Ipv4(v4),
+                                        IpAddr::V6(v6) => crate::addr::NetworkAddr::Ipv6(v6),
+                                    };
+                                    Some(crate::addr::AddrV2Entry::new(
+                                        t.timestamp,
+                                        t.address.services,
+                                        na,
+                                        sa.port(),
+                                    ))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        self.relay_addresses_to_peers(*id, &relay).await;
                     }
                 }
 
@@ -5011,8 +5424,15 @@ impl PeerManager {
                                 .map(|p| p.info.addr)
                                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
                         );
-                        // Relay to 2 other peers
-                        self.relay_addresses_to_peers(*id).await;
+                        // Relay only addresses taken from THIS message, under
+                        // Core's ProcessAddrs rules (never our own history).
+                        let relay: Vec<crate::addr::AddrV2Entry> =
+                            if entries.len() <= ADDR_RELAY_MAX_MSG_SIZE {
+                                admitted.to_vec()
+                            } else {
+                                Vec::new()
+                            };
+                        self.relay_addresses_to_peers(*id, &relay).await;
                     }
                 }
 
@@ -5147,11 +5567,44 @@ impl PeerManager {
         Some(event)
     }
 
-    /// Relay addresses to up to 2 random peers (excluding the source).
-    /// This implements Bitcoin Core's RelayAddress behavior.
-    async fn relay_addresses_to_peers(&mut self, source_id: PeerId) {
+    /// Relay addresses received from `source_id` to other peers, following
+    /// Bitcoin Core's `ProcessAddrs` (net_processing.cpp:5625) and
+    /// `RelayAddress` (:2277).
+    ///
+    /// `received` holds only the entries of the incoming message that passed
+    /// the token bucket, and is empty when the message held more than 10
+    /// entries (`vAddr.size() <= 10`). Each entry is relayed only if it is a
+    /// full node (NODE_NETWORK or NODE_NETWORK_LIMITED), not banned or
+    /// discouraged, routable, and its timestamp lies within the last 10
+    /// minutes (Core clamps an out-of-range time to now-5d, which fails the
+    /// same freshness test). Reachable addresses go to 2 peers, unreachable
+    /// ones to 1 or 2; targets exclude the source and block-relay-only peers,
+    /// and peers without addrv2 get only v1-encodable addresses.
+    ///
+    /// The node's own address history (`get_addresses_for_sharing`) is never
+    /// relayed here: it used to be, on every addr message including empty
+    /// ones, which let a peer read our outbound connections.
+    ///
+    /// rustoshi never sends getaddr, so Core's `!peer.m_getaddr_sent` gate is
+    /// always satisfied.
+    async fn relay_addresses_to_peers(
+        &mut self,
+        source_id: PeerId,
+        received: &[crate::addr::AddrV2Entry],
+    ) {
         use rand::seq::SliceRandom;
-        let candidates: Vec<PeerId> = self
+        use rand::Rng;
+        if received.is_empty() {
+            return;
+        }
+        // Core SetupAddressRelay: addr traffic from a block-relay-only peer is
+        // ignored entirely.
+        match self.peers.get(&source_id) {
+            Some(p) if p.conn_type != ConnectionType::BlockRelayOnly => {}
+            _ => return,
+        }
+        let now = now_unix_secs();
+        let candidates: Vec<(PeerId, bool)> = self
             .peers
             .iter()
             .filter(|(pid, peer)| {
@@ -5159,39 +5612,65 @@ impl PeerManager {
                     && peer.conn_type != ConnectionType::BlockRelayOnly
                     && peer.info.state == PeerState::Established
             })
-            .map(|(pid, _)| *pid)
+            .map(|(pid, peer)| (*pid, peer.info.supports_addrv2))
             .collect();
+        let mut per_target: HashMap<PeerId, Vec<crate::addr::AddrV2Entry>> = HashMap::new();
         let mut rng = rand::thread_rng();
-        let targets: Vec<PeerId> = candidates
-            .choose_multiple(&mut rng, std::cmp::min(2, candidates.len()))
-            .cloned()
-            .collect();
-        for target_id in targets {
-            let target_supports_addrv2 = self
+        for entry in received {
+            if entry.services & (NODE_NETWORK | NODE_NETWORK_LIMITED) == 0 {
+                continue;
+            }
+            let ts = entry.timestamp as u64;
+            if ts <= ADDR_MIN_PLAUSIBLE_TIME
+                || ts > now + ADDR_RELAY_FRESH_SECS
+                || ts + ADDR_RELAY_FRESH_SECS <= now
+            {
+                continue;
+            }
+            if let Some(sa) = entry.to_socket_addr() {
+                if !ip_is_routable(&sa.ip().to_canonical())
+                    || self.ban_manager.is_banned(&sa.ip())
+                    || self.is_discouraged(&sa)
+                {
+                    continue;
+                }
+            }
+            let reachable = self.config.is_reachable(&entry.addr);
+            let n = if reachable || rng.gen::<bool>() { 2 } else { 1 };
+            let v1 = entry.is_addr_v1_compatible();
+            let eligible: Vec<PeerId> = candidates
+                .iter()
+                .filter(|(_, v2)| *v2 || v1)
+                .map(|(pid, _)| *pid)
+                .collect();
+            for target in eligible.choose_multiple(&mut rng, n.min(eligible.len())) {
+                per_target.entry(*target).or_default().push(entry.clone());
+            }
+        }
+        for (target_id, entries) in per_target {
+            let supports_v2 = self
                 .peers
                 .get(&target_id)
                 .map(|p| p.info.supports_addrv2)
                 .unwrap_or(false);
-            if target_supports_addrv2 {
-                let entries = self.addr_manager.get_addrv2_for_sharing(10);
-                if !entries.is_empty() {
-                    // Best-effort addr relay; never await a stuck peer.
-                    let _ = self.try_send_to_peer(target_id, NetworkMessage::AddrV2(entries));
-                }
+            let msg = if supports_v2 {
+                NetworkMessage::AddrV2(entries)
             } else {
-                let addrs = self.addr_manager.get_addresses_for_sharing(10);
-                let timestamped: Vec<TimestampedNetAddress> = addrs
-                    .into_iter()
-                    .map(|info| TimestampedNetAddress {
-                        timestamp: 0,
-                        address: socket_addr_to_net_address(info.addr, info.services),
-                    })
-                    .collect();
-                if !timestamped.is_empty() {
-                    // Best-effort addr relay; never await a stuck peer.
-                    let _ = self.try_send_to_peer(target_id, NetworkMessage::Addr(timestamped));
-                }
-            }
+                NetworkMessage::Addr(
+                    entries
+                        .into_iter()
+                        .filter_map(|e| {
+                            let sa = e.to_socket_addr()?;
+                            Some(TimestampedNetAddress {
+                                timestamp: e.timestamp,
+                                address: socket_addr_to_net_address(sa, e.services),
+                            })
+                        })
+                        .collect(),
+                )
+            };
+            // Best-effort addr relay; never await a stuck peer.
+            let _ = self.try_send_to_peer(target_id, msg);
         }
     }
 
@@ -7456,12 +7935,19 @@ mod tests {
         ];
         mgr.add_dns_addresses(addrs.clone());
 
-        // All should be allowed since they're in different netgroups
-        for expected in &addrs {
-            let addr = mgr.next_addr_to_try(&netgroup_mgr);
-            assert_eq!(addr, Some(*expected));
-            mgr.mark_outbound_success(expected, &netgroup_mgr);
+        // All should be allowed since they're in different netgroups. The
+        // order is a random draw over the bucketed addrman (Core
+        // addrman.Select), not DNS order, so compare as a set.
+        let mut picked = Vec::new();
+        for _ in &addrs {
+            let addr = mgr
+                .next_addr_to_try(&netgroup_mgr)
+                .expect("every distinct-netgroup address is dialable");
+            assert!(addrs.contains(&addr) && !picked.contains(&addr));
+            mgr.mark_outbound_success(&addr, &netgroup_mgr);
+            picked.push(addr);
         }
+        assert_eq!(picked.len(), addrs.len());
     }
 
     // ── Regression: AddrMan re-selection after try_queue drain ──────────────
@@ -7474,8 +7960,9 @@ mod tests {
     // `next_addr_to_try` must fall back to re-selecting from the persistent
     // `known_addrs` store, like Core's non-consuming `AddrMan::Select_`.
 
-    /// After the try_queue is fully drained, a known, non-connected,
-    /// netgroup-free address is still re-selectable from the persistent store.
+    /// After an attempt, a known, non-connected, netgroup-free address is
+    /// still re-selectable once its retry backoff has passed. Routable
+    /// addresses come from the bucketed addrman, which never consumes them.
     #[test]
     fn test_addr_reselectable_after_queue_drain() {
         let mut mgr = AddressManager::new();
@@ -7485,9 +7972,8 @@ mod tests {
         let addr: SocketAddr = "1.2.3.4:8333".parse().unwrap();
         mgr.add_dns_addresses(vec![addr]);
 
-        // Stage-1 fast path drains the queue.
         assert_eq!(mgr.next_addr_to_try(&ng), Some(addr));
-        assert_eq!(mgr.queue_size(), 0, "queue must be drained");
+        assert_eq!(mgr.addrman().total_count(), 1, "addrman keeps the entry");
 
         // The address was attempted but never connected: a fresh attempt is
         // gated by the failure backoff, so an immediate re-select is None …
@@ -7496,8 +7982,33 @@ mod tests {
             "address within retry backoff must not be re-selected yet"
         );
 
-        // … but once the backoff has elapsed, stage-2 re-selects it from the
-        // persistent store. Simulate elapsed time by ageing last_attempt.
+        // … but once the backoff has elapsed it is re-selected from the
+        // persistent table. Simulate elapsed time by ageing the pick.
+        mgr.outbound_retry.get_mut(&addr).unwrap().0 = Instant::now() - Duration::from_secs(3600);
+        assert_eq!(
+            mgr.next_addr_to_try(&ng),
+            Some(addr),
+            "address must be re-selectable from the persistent store after backoff"
+        );
+    }
+
+    /// The same for a non-routable address, which the bucketed addrman does
+    /// not hold: it goes through the try_queue + known_addrs legacy path.
+    #[test]
+    fn test_addr_reselectable_after_queue_drain_unroutable() {
+        let mut mgr = AddressManager::new();
+        let ng = NetGroupManager::with_key(12345);
+        let addr: SocketAddr = "192.168.1.1:8333".parse().unwrap();
+        mgr.add_dns_addresses(vec![addr]);
+        assert!(mgr.addrman().is_empty());
+
+        // Stage-1 fast path drains the queue.
+        assert_eq!(mgr.next_addr_to_try(&ng), Some(addr));
+        assert_eq!(mgr.queue_size(), 0, "queue must be drained");
+        assert!(
+            mgr.next_addr_to_try(&ng).is_none(),
+            "address within retry backoff must not be re-selected yet"
+        );
         let info = mgr.known_addrs.get_mut(&addr).unwrap();
         info.last_attempt = Some(Instant::now() - Duration::from_secs(3600));
         assert_eq!(
@@ -7530,7 +8041,9 @@ mod tests {
         for a in &addrs {
             mgr.mark_outbound_disconnected(a, &ng);
         }
-        assert_eq!(mgr.queue_size(), 0, "queue drained by the connect cycle");
+        // Routable addresses are drawn from the bucketed addrman, which keeps
+        // every entry after it is dialled.
+        assert_eq!(mgr.addrman().total_count(), addrs.len());
         assert_eq!(mgr.connected_count(), 0, "all peers disconnected");
 
         // Age last_attempt past the backoff window to model the 45s
@@ -8206,14 +8719,18 @@ mod tests {
         mgr.add_dns_addresses(attacker_addrs);
         mgr.add_dns_addresses(vec![legitimate_addr]);
 
-        // First connection to attacker
+        // Two picks: the legitimate address and exactly one attacker
+        // address. (The routable legitimate address is drawn from the
+        // bucketed addrman, so it now comes first; the order is not the point.)
         let first = mgr.next_addr_to_try(&netgroup_mgr).unwrap();
         mgr.mark_outbound_success(&first, &netgroup_mgr);
-
-        // All other attacker addresses should be skipped (same netgroup)
-        // Next should be the legitimate one
         let second = mgr.next_addr_to_try(&netgroup_mgr).unwrap();
-        assert_eq!(second, legitimate_addr);
+        mgr.mark_outbound_success(&second, &netgroup_mgr);
+        assert!(first == legitimate_addr || second == legitimate_addr);
+        assert_ne!(first, second);
+
+        // All other attacker addresses share the occupied netgroup.
+        assert!(mgr.next_addr_to_try(&netgroup_mgr).is_none());
     }
 
     // ============================================================

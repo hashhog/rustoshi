@@ -302,6 +302,15 @@ pub struct Wallet {
     ///   seed is publicly known);
     /// - key generation and signing refuse with an explicit error.
     private_keys_enabled: bool,
+    /// Whether `master_key` is this wallet's real HD master. `false` only for
+    /// the stand-in [`Self::locked_placeholder`] that `WalletManager` holds
+    /// while an encrypted wallet is locked: its master is built from the
+    /// public all-zero seed, so every HD derivation (address minting, the
+    /// ownership lookahead, signing keys, PSBT key origins) refuses with
+    /// [`WalletError::WalletLocked`] instead of handing out keys anyone can
+    /// spend from. Core's `GetNewDestination` never substitutes key material
+    /// (`src/wallet/rpc/addresses.cpp:62`).
+    hd_master_available: bool,
 }
 
 /// A per-output or per-input line item in a wallet transaction's `details[]`.
@@ -421,7 +430,45 @@ impl Wallet {
             imported_keys: HashMap::new(),
             watched_scripts: HashMap::new(),
             private_keys_enabled: true,
+            hd_master_available: true,
         })
+    }
+
+    /// The in-memory stand-in for an encrypted wallet while it is locked.
+    ///
+    /// The real seed is on disk, encrypted, so there is no HD master to
+    /// derive from. The struct still needs a `master_key`, which is built
+    /// from the all-zero seed, but [`Self::hd_master`] refuses to hand it
+    /// out: every address-minting and key path returns
+    /// [`WalletError::WalletLocked`] until `walletpassphrase` swaps the real
+    /// wallet back in. The indices are kept so that unlocking resumes the
+    /// real chain where it left off.
+    pub fn locked_placeholder(
+        network: Network,
+        address_type: AddressType,
+        receive_index: u32,
+        change_index: u32,
+    ) -> Result<Self, WalletError> {
+        let mut w = Self::from_seed(&[0u8; 64], network, address_type)?;
+        w.hd_master_available = false;
+        w.restore_indices(receive_index, change_index);
+        Ok(w)
+    }
+
+    /// Whether this wallet can derive HD keys right now (`false` for a
+    /// locked encrypted wallet's placeholder).
+    pub fn hd_master_available(&self) -> bool {
+        self.hd_master_available
+    }
+
+    /// The real HD master, or `WalletLocked` for the locked placeholder.
+    /// Every use of `master_key` goes through here.
+    fn hd_master(&self) -> Result<&ExtendedPrivKey, WalletError> {
+        if self.hd_master_available {
+            Ok(&self.master_key)
+        } else {
+            Err(WalletError::WalletLocked)
+        }
     }
 
     /// Whether this wallet holds private keys (the inverse of Core's
@@ -639,7 +686,7 @@ impl Wallet {
     /// P2WPKH-default wallet. For default-type paths the purpose matches
     /// `self.address_type`, so behaviour is unchanged.
     fn derive_address(&self, path: &[u32]) -> Result<String, WalletError> {
-        let child_key = self.master_key.derive_path(path)?;
+        let child_key = self.hd_master()?.derive_path(path)?;
         let secp = secp_ctx();
         let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child_key.secret_key);
         let compressed: [u8; 33] = pubkey.serialize();
@@ -700,7 +747,7 @@ impl Wallet {
 
     /// Get the private key for a derivation path (for signing).
     fn get_private_key(&self, path: &[u32]) -> Result<secp256k1::SecretKey, WalletError> {
-        let child = self.master_key.derive_path(path)?;
+        let child = self.hd_master()?.derive_path(path)?;
         Ok(child.secret_key)
     }
 
@@ -761,9 +808,10 @@ impl Wallet {
         path: &[u32],
     ) -> Result<([u8; 33], crate::psbt::KeyOrigin), WalletError> {
         let secp = secp_ctx();
-        let child = self.master_key.derive_path(path)?;
+        let master = self.hd_master()?;
+        let child = master.derive_path(path)?;
         let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child.secret_key);
-        let origin = crate::psbt::KeyOrigin::new(self.master_key.fingerprint(), path.to_vec());
+        let origin = crate::psbt::KeyOrigin::new(master.fingerprint(), path.to_vec());
         Ok((pubkey.serialize(), origin))
     }
 
@@ -2421,7 +2469,9 @@ impl Wallet {
         // A disable_private_keys wallet has no SPKMs in Core
         // (wallet.cpp:3104-3105); indexing the placeholder zero seed's
         // derivations here would credit funds to publicly-derivable keys.
-        if self.private_keys_enabled {
+        // A locked wallet's placeholder has no real HD master: indexing its
+        // all-zero-seed derivations would claim the public seed's scripts.
+        if self.private_keys_enabled && self.hd_master_available {
             // (a) every already-generated address (path tells us the chain
             //     branch).
             for (_addr, path) in self.addresses.iter() {
@@ -2905,8 +2955,9 @@ impl Wallet {
         pkh: &rustoshi_primitives::Hash160,
     ) -> Option<secp256k1::SecretKey> {
         let secp = secp_ctx();
+        let master = self.hd_master().ok()?;
         for path in self.addresses.values() {
-            let child = self.master_key.derive_path(path).ok()?;
+            let child = master.derive_path(path).ok()?;
             let pubkey = secp256k1::PublicKey::from_secret_key(secp, &child.secret_key);
             let hash = hash160(&pubkey.serialize());
             if &hash == pkh {
@@ -2926,7 +2977,7 @@ impl Wallet {
         // Fast path: if we generated this address, derive directly from the
         // stored derivation path. This skips a full re-scan of `addresses`.
         if let Some(path) = self.addresses.get(address) {
-            return self.master_key.derive_path(path).ok().map(|c| c.secret_key);
+            return self.hd_master().ok()?.derive_path(path).ok().map(|c| c.secret_key);
         }
         None
     }
