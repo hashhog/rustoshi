@@ -46,6 +46,29 @@
 //! overtake that peer's own earlier BULK events; the main loop drops bulk
 //! messages from a peer it no longer knows.
 //!
+//! # Byte budget (cffix-rustoshi-event-lane-byte-budget)
+//!
+//! A slot holds a DECODED message, and decoding amplifies: a 4,000,000-byte
+//! `tx` whose input carries 3,999,933 empty witness items is ~96 MB in memory
+//! (one 24-byte `Vec` header per item). Bounded by slot count alone, a
+//! stalled main loop could retain 1024 x 96 MB per lane, and the loop being
+//! behind for minutes is the overload state this module exists for. Core
+//! never holds decoded messages in a queue: it pauses reading a peer
+//! (`fPauseRecv`) once that peer's queued bytes exceed `-maxreceivebuffer`
+//! (`CNode::MarkReceivedMsgsForProcessing`, net.cpp) and decodes serially in
+//! the message handler.
+//!
+//! So each stamped lane also carries a byte budget ([`event_cost`] per event,
+//! released when the main loop takes the event): the bulk lane DROPS an event
+//! that does not fit ([`BULK_LANE_BYTE_BUDGET`]); the priority lane keeps its
+//! back-pressure and makes the sender wait ([`PRIORITY_LANE_BYTE_BUDGET`]).
+//! A single event's charge is clamped to the budget, so one oversized event
+//! still passes alone and a lane can never wedge.
+//! The budget is a FIFO semaphore: a large priority event waiting for its
+//! charge also holds back smaller priority events queued after it, until the
+//! main loop has drained enough. That delay is bounded by one drain of the
+//! lane, the same wait a full slot count already imposes.
+//!
 //! A plain `mpsc::Sender<PeerEvent>` converts into an [`EventSender`] whose two
 //! lanes are the same channel (tests and single-channel callers keep their
 //! previous behaviour, except that bulk events are dropped rather than staged
@@ -57,10 +80,127 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 /// Capacity of each lane between the peer tasks and the main loop.
 pub const EVENT_LANE_CAPACITY: usize = 1024;
+
+/// Decoded bytes the priority lane may hold while the main loop is behind.
+/// ~250 full mainnet blocks: far more buffer than a serial block connector
+/// can use, and a hard ceiling instead of 1024 x a worst-case decoded block.
+pub const PRIORITY_LANE_BYTE_BUDGET: usize = 1 << 30;
+
+/// Decoded bytes the bulk (tx/addr) lane may hold. Normal relay (1024 slots x
+/// a few KB) never comes near it; beyond it bulk events are dropped, the same
+/// best-effort treatment they get when the slots run out.
+pub const BULK_LANE_BYTE_BUDGET: usize = 128 << 20;
+
+fn tx_heap_bytes(tx: &rustoshi_primitives::Transaction) -> usize {
+    use rustoshi_primitives::{TxIn, TxOut};
+    use std::mem::size_of;
+    let mut n = tx.inputs.capacity() * size_of::<TxIn>()
+        + tx.outputs.capacity() * size_of::<TxOut>();
+    for i in &tx.inputs {
+        n += i.script_sig.capacity() + i.witness.capacity() * size_of::<Vec<u8>>();
+        n += i.witness.iter().map(Vec::capacity).sum::<usize>();
+    }
+    n + tx.outputs.iter().map(|o| o.script_pubkey.capacity()).sum::<usize>()
+}
+
+/// Approximate bytes an event retains while it sits in a lane: the event
+/// itself plus the heap its decoded message owns. Counts capacity, not
+/// length, because capacity is what is allocated.
+pub fn event_cost(ev: &PeerEvent) -> usize {
+    use std::mem::size_of;
+    let heap = match ev {
+        PeerEvent::Message(_, msg) => match msg {
+            NetworkMessage::Tx(tx) => tx_heap_bytes(tx),
+            NetworkMessage::Block(b) => {
+                b.transactions.capacity() * size_of::<rustoshi_primitives::Transaction>()
+                    + b.transactions.iter().map(tx_heap_bytes).sum::<usize>()
+            }
+            NetworkMessage::Headers(h) => h.capacity() * size_of::<rustoshi_primitives::BlockHeader>(),
+            NetworkMessage::Inv(v) | NetworkMessage::GetData(v) | NetworkMessage::NotFound(v) => {
+                v.capacity() * size_of::<InvVector>()
+            }
+            NetworkMessage::Addr(v) => v.capacity() * size_of::<crate::message::TimestampedNetAddress>(),
+            NetworkMessage::AddrV2(v) => v.capacity() * size_of::<crate::addr::AddrV2Entry>(),
+            NetworkMessage::CmpctBlock(v)
+            | NetworkMessage::GetBlockTxn(v)
+            | NetworkMessage::BlockTxn(v)
+            | NetworkMessage::MerkleBlock(v)
+            | NetworkMessage::FilterLoad(v)
+            | NetworkMessage::FilterAdd(v)
+            | NetworkMessage::ReqRecon(v)
+            | NetworkMessage::Sketch(v)
+            | NetworkMessage::ReconcilDiff(v) => v.capacity(),
+            // An unrecognised command keeps its whole payload (up to
+            // MAX_MESSAGE_SIZE) and rides the priority lane.
+            NetworkMessage::Unknown { command, payload } => command.capacity() + payload.capacity(),
+            NetworkMessage::Reject(r) => {
+                r.message.capacity() + r.reason.capacity() + r.data.capacity()
+            }
+            NetworkMessage::Version(v) => v.user_agent.capacity(),
+            NetworkMessage::GetHeaders(g) => g.locator_hashes.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            NetworkMessage::GetBlocks(g) => g.locator_hashes.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            NetworkMessage::CFilter(c) => c.filter_bytes.capacity(),
+            NetworkMessage::CFHeaders(c) => c.filter_hashes.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            NetworkMessage::CFCheckpt(c) => c.filter_headers.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            // Fixed-size messages own no heap. Listed instead of a wildcard
+            // so a new heap-owning variant cannot silently ride for free.
+            NetworkMessage::Verack
+            | NetworkMessage::Ping(_)
+            | NetworkMessage::Pong(_)
+            | NetworkMessage::GetAddr
+            | NetworkMessage::FeeFilter(_)
+            | NetworkMessage::SendHeaders
+            | NetworkMessage::SendCmpct(_)
+            | NetworkMessage::MemPool
+            | NetworkMessage::WtxidRelay
+            | NetworkMessage::SendAddrV2
+            | NetworkMessage::SendTxRcncl(_)
+            | NetworkMessage::FilterClear
+            | NetworkMessage::GetCFilters(_)
+            | NetworkMessage::GetCFHeaders(_)
+            | NetworkMessage::GetCFCheckpt(_) => 0,
+        },
+        _ => 0,
+    };
+    size_of::<Stamped>() + heap
+}
+
+/// One lane's byte budget. `charge` clamps a single event to the whole
+/// budget so an oversized event waits for an empty lane instead of never
+/// fitting.
+#[derive(Clone, Debug)]
+struct Budget {
+    sem: Arc<Semaphore>,
+    total: usize,
+}
+
+impl Budget {
+    fn new(total: usize) -> Self {
+        // acquire_many takes u32 permits; budgets are well under 4 GiB.
+        let total = total.clamp(1, u32::MAX as usize);
+        Budget {
+            sem: Arc::new(Semaphore::new(total)),
+            total,
+        }
+    }
+
+    fn permits(&self, cost: usize) -> u32 {
+        cost.clamp(1, self.total) as u32
+    }
+
+    fn try_charge(&self, cost: usize) -> Option<OwnedSemaphorePermit> {
+        self.sem.clone().try_acquire_many_owned(self.permits(cost)).ok()
+    }
+
+    async fn charge(&self, cost: usize) -> Option<OwnedSemaphorePermit> {
+        // Never closed; `ok()` only to avoid an unwrap.
+        self.sem.clone().acquire_many_owned(self.permits(cost)).await.ok()
+    }
+}
 
 fn is_tx_inv(item: &InvVector) -> bool {
     matches!(
@@ -106,11 +246,18 @@ pub enum BulkOffer {
 pub struct Stamped {
     at: Instant,
     ev: PeerEvent,
+    /// This event's share of its lane's byte budget; returned to the lane
+    /// when the main loop takes the event (the `Stamped` is dropped).
+    _charge: Option<OwnedSemaphorePermit>,
 }
 
 impl Stamped {
-    fn now(ev: PeerEvent) -> Self {
-        Stamped { at: Instant::now(), ev }
+    fn now(ev: PeerEvent, charge: Option<OwnedSemaphorePermit>) -> Self {
+        Stamped {
+            at: Instant::now(),
+            ev,
+            _charge: charge,
+        }
     }
 }
 
@@ -119,7 +266,7 @@ impl Stamped {
 #[derive(Clone, Debug)]
 enum LaneTx {
     Plain(mpsc::Sender<PeerEvent>),
-    Stamped(mpsc::Sender<Stamped>),
+    Stamped(mpsc::Sender<Stamped>, Budget),
 }
 
 fn unstamp_try(e: mpsc::error::TrySendError<Stamped>) -> mpsc::error::TrySendError<PeerEvent> {
@@ -133,24 +280,35 @@ impl LaneTx {
     async fn send(&self, ev: PeerEvent) -> Result<(), mpsc::error::SendError<PeerEvent>> {
         match self {
             LaneTx::Plain(tx) => tx.send(ev).await,
-            LaneTx::Stamped(tx) => tx
-                .send(Stamped::now(ev))
-                .await
-                .map_err(|e| mpsc::error::SendError(e.0.ev)),
+            LaneTx::Stamped(tx, budget) => {
+                let charge = budget.charge(event_cost(&ev)).await;
+                tx.send(Stamped::now(ev, charge))
+                    .await
+                    .map_err(|e| mpsc::error::SendError(e.0.ev))
+            }
         }
     }
 
     fn try_send(&self, ev: PeerEvent) -> Result<(), mpsc::error::TrySendError<PeerEvent>> {
         match self {
             LaneTx::Plain(tx) => tx.try_send(ev),
-            LaneTx::Stamped(tx) => tx.try_send(Stamped::now(ev)).map_err(unstamp_try),
+            LaneTx::Stamped(tx, budget) => {
+                if tx.is_closed() {
+                    return Err(mpsc::error::TrySendError::Closed(ev));
+                }
+                // Over budget reads as Full: the lane is full by bytes.
+                match budget.try_charge(event_cost(&ev)) {
+                    Some(charge) => tx.try_send(Stamped::now(ev, Some(charge))).map_err(unstamp_try),
+                    None => Err(mpsc::error::TrySendError::Full(ev)),
+                }
+            }
         }
     }
 
     fn is_closed(&self) -> bool {
         match self {
             LaneTx::Plain(tx) => tx.is_closed(),
-            LaneTx::Stamped(tx) => tx.is_closed(),
+            LaneTx::Stamped(tx, _) => tx.is_closed(),
         }
     }
 }
@@ -163,10 +321,85 @@ pub enum PriorityPermit<'a> {
 }
 
 impl PriorityPermit<'_> {
-    pub fn send(self, ev: PeerEvent) {
+    /// Send `ev`, carrying the byte charge held in `staged` (taken, leaving
+    /// it idle for the next staged event).
+    pub fn send(self, ev: PeerEvent, staged: &mut StagedCharge) {
+        let charge = staged.take();
         match self {
             PriorityPermit::Plain(p) => p.send(ev),
-            PriorityPermit::Stamped(p) => p.send(Stamped::now(ev)),
+            PriorityPermit::Stamped(p) => p.send(Stamped::now(ev, charge)),
+        }
+    }
+}
+
+type ChargeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<OwnedSemaphorePermit>> + Send>>;
+
+#[derive(Default)]
+enum ChargeState {
+    #[default]
+    Idle,
+    Waiting(ChargeFuture),
+    Held(Option<OwnedSemaphorePermit>),
+}
+
+/// The priority-lane byte charge of the event a peer task has staged,
+/// kept ACROSS `select!` passes. The acquire future lives here, not in the
+/// `select!` arm, so when another arm fires (a command, the ping timer) the
+/// waiter keeps its place in the budget's FIFO queue and the permits it has
+/// already been assigned. Rebuilding the acquire on every pass would send a
+/// large event to the back of the queue each time and could starve it.
+#[derive(Default)]
+pub struct StagedCharge {
+    state: ChargeState,
+}
+
+impl StagedCharge {
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, ChargeState::Idle)
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        matches!(self.state, ChargeState::Waiting(_))
+    }
+
+    pub fn is_held(&self) -> bool {
+        matches!(self.state, ChargeState::Held(_))
+    }
+
+    /// Start charging `cost` bytes ([`event_cost`] of the staged event) to
+    /// `tx`'s priority lane. No-op unless idle. A plain lane has no budget
+    /// and is held at once.
+    pub fn start(&mut self, tx: &EventSender, cost: usize) {
+        if !self.is_idle() {
+            return;
+        }
+        self.state = match &tx.prio {
+            LaneTx::Plain(_) => ChargeState::Held(None),
+            LaneTx::Stamped(_, budget) => {
+                let budget = budget.clone();
+                ChargeState::Waiting(Box::pin(async move { budget.charge(cost).await }))
+            }
+        };
+    }
+
+    /// Resolve once the charge is held. Cancel-safe: a cancelled call
+    /// leaves the acquire in place, to be resumed by the next call. Pending
+    /// forever when not waiting (for use behind a `select!` precondition).
+    pub async fn wait(&mut self) {
+        match &mut self.state {
+            ChargeState::Waiting(f) => {
+                let charge = f.as_mut().await;
+                self.state = ChargeState::Held(charge);
+            }
+            _ => std::future::pending().await,
+        }
+    }
+
+    fn take(&mut self) -> Option<OwnedSemaphorePermit> {
+        match std::mem::take(&mut self.state) {
+            ChargeState::Held(c) => c,
+            _ => None,
         }
     }
 }
@@ -234,10 +467,12 @@ impl EventSender {
     }
 
     /// Reserve a slot on the priority lane (cancel-safe; for `select!`).
+    /// The event's byte charge is acquired separately, through a
+    /// [`StagedCharge`] that survives `select!` passes.
     pub async fn reserve_priority(&self) -> Result<PriorityPermit<'_>, mpsc::error::SendError<()>> {
         match &self.prio {
             LaneTx::Plain(tx) => tx.reserve().await.map(PriorityPermit::Plain),
-            LaneTx::Stamped(tx) => tx.reserve().await.map(PriorityPermit::Stamped),
+            LaneTx::Stamped(tx, _) => tx.reserve().await.map(PriorityPermit::Stamped),
         }
     }
 
@@ -324,8 +559,8 @@ pub fn event_channel(capacity: usize) -> (EventSender, EventReceiver) {
     let (btx, brx) = mpsc::channel(capacity);
     (
         EventSender {
-            prio: LaneTx::Stamped(ptx),
-            bulk: LaneTx::Stamped(btx),
+            prio: LaneTx::Stamped(ptx, Budget::new(PRIORITY_LANE_BYTE_BUDGET)),
+            bulk: LaneTx::Stamped(btx, Budget::new(BULK_LANE_BYTE_BUDGET)),
             dropped: Arc::new(AtomicU64::new(0)),
         },
         EventReceiver {
@@ -578,8 +813,12 @@ mod tests {
             rx.last_wait()
         );
         // A reserved permit stamps too.
+        let ev = headers_msg(3);
+        let mut staged = StagedCharge::default();
+        staged.start(&tx, event_cost(&ev));
+        staged.wait().await;
         let permit = tx.reserve_priority().await.unwrap();
-        permit.send(headers_msg(3));
+        permit.send(ev, &mut staged);
         assert!(matches!(rx.try_recv(), Ok(PeerEvent::Message(PeerId(3), _))));
     }
 

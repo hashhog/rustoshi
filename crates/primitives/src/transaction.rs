@@ -569,7 +569,12 @@ impl Decodable for Transaction {
                         format!("too many witness items: {}", witness_count),
                     ));
                 }
-                input.witness = Vec::with_capacity(witness_count as usize);
+                // Reserve at most one chunk up front, like inputs/outputs
+                // above (Core's MAX_VECTOR_ALLOCATE): the count is
+                // attacker-chosen, so a frame declaring 4M items reserved
+                // 4M x 24 B = 96 MB before reading a single one.
+                input.witness =
+                    Vec::with_capacity((witness_count as usize).min(MAX_ALLOC_RESERVE));
                 for _ in 0..witness_count {
                     let item_len = read_compact_size(reader)?;
                     if item_len > MAX_WITNESS_ITEM_SIZE {
