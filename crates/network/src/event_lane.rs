@@ -313,21 +313,93 @@ impl LaneTx {
     }
 }
 
-/// A reserved priority-lane slot plus byte budget (see
-/// [`EventSender::reserve_priority`]). `send` stamps the event with the
-/// instant it enters the lane.
+/// A reserved priority-lane slot (see [`EventSender::reserve_priority`]).
+/// `send` stamps the event with the instant it enters the lane.
 pub enum PriorityPermit<'a> {
     Plain(mpsc::Permit<'a, PeerEvent>),
-    Stamped(mpsc::Permit<'a, Stamped>, Option<OwnedSemaphorePermit>),
+    Stamped(mpsc::Permit<'a, Stamped>),
 }
 
 impl PriorityPermit<'_> {
-    /// Send the event the permit was reserved for (its cost was charged
-    /// when the permit was reserved).
-    pub fn send(self, ev: PeerEvent) {
+    /// Send `ev`, carrying the byte charge held in `staged` (taken, leaving
+    /// it idle for the next staged event).
+    pub fn send(self, ev: PeerEvent, staged: &mut StagedCharge) {
+        let charge = staged.take();
         match self {
             PriorityPermit::Plain(p) => p.send(ev),
-            PriorityPermit::Stamped(p, charge) => p.send(Stamped::now(ev, charge)),
+            PriorityPermit::Stamped(p) => p.send(Stamped::now(ev, charge)),
+        }
+    }
+}
+
+type ChargeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<OwnedSemaphorePermit>> + Send>>;
+
+#[derive(Default)]
+enum ChargeState {
+    #[default]
+    Idle,
+    Waiting(ChargeFuture),
+    Held(Option<OwnedSemaphorePermit>),
+}
+
+/// The priority-lane byte charge of the event a peer task has staged,
+/// kept ACROSS `select!` passes. The acquire future lives here, not in the
+/// `select!` arm, so when another arm fires (a command, the ping timer) the
+/// waiter keeps its place in the budget's FIFO queue and the permits it has
+/// already been assigned. Rebuilding the acquire on every pass would send a
+/// large event to the back of the queue each time and could starve it.
+#[derive(Default)]
+pub struct StagedCharge {
+    state: ChargeState,
+}
+
+impl StagedCharge {
+    pub fn is_idle(&self) -> bool {
+        matches!(self.state, ChargeState::Idle)
+    }
+
+    pub fn is_waiting(&self) -> bool {
+        matches!(self.state, ChargeState::Waiting(_))
+    }
+
+    pub fn is_held(&self) -> bool {
+        matches!(self.state, ChargeState::Held(_))
+    }
+
+    /// Start charging `cost` bytes ([`event_cost`] of the staged event) to
+    /// `tx`'s priority lane. No-op unless idle. A plain lane has no budget
+    /// and is held at once.
+    pub fn start(&mut self, tx: &EventSender, cost: usize) {
+        if !self.is_idle() {
+            return;
+        }
+        self.state = match &tx.prio {
+            LaneTx::Plain(_) => ChargeState::Held(None),
+            LaneTx::Stamped(_, budget) => {
+                let budget = budget.clone();
+                ChargeState::Waiting(Box::pin(async move { budget.charge(cost).await }))
+            }
+        };
+    }
+
+    /// Resolve once the charge is held. Cancel-safe: a cancelled call
+    /// leaves the acquire in place, to be resumed by the next call. Pending
+    /// forever when not waiting (for use behind a `select!` precondition).
+    pub async fn wait(&mut self) {
+        match &mut self.state {
+            ChargeState::Waiting(f) => {
+                let charge = f.as_mut().await;
+                self.state = ChargeState::Held(charge);
+            }
+            _ => std::future::pending().await,
+        }
+    }
+
+    fn take(&mut self) -> Option<OwnedSemaphorePermit> {
+        match std::mem::take(&mut self.state) {
+            ChargeState::Held(c) => c,
+            _ => None,
         }
     }
 }
@@ -394,25 +466,13 @@ impl EventSender {
         }
     }
 
-    /// Reserve a slot and `cost` bytes of budget on the priority lane, where
-    /// `cost` is [`event_cost`] of the event about to be sent. Cancel-safe
-    /// for `select!`: dropping the future before it resolves releases any
-    /// budget it had taken.
-    pub async fn reserve_priority(
-        &self,
-        cost: usize,
-    ) -> Result<PriorityPermit<'_>, mpsc::error::SendError<()>> {
+    /// Reserve a slot on the priority lane (cancel-safe; for `select!`).
+    /// The event's byte charge is acquired separately, through a
+    /// [`StagedCharge`] that survives `select!` passes.
+    pub async fn reserve_priority(&self) -> Result<PriorityPermit<'_>, mpsc::error::SendError<()>> {
         match &self.prio {
             LaneTx::Plain(tx) => tx.reserve().await.map(PriorityPermit::Plain),
-            LaneTx::Stamped(tx, budget) => {
-                if tx.is_closed() {
-                    return Err(mpsc::error::SendError(()));
-                }
-                let charge = budget.charge(cost).await;
-                tx.reserve()
-                    .await
-                    .map(|p| PriorityPermit::Stamped(p, charge))
-            }
+            LaneTx::Stamped(tx, _) => tx.reserve().await.map(PriorityPermit::Stamped),
         }
     }
 
@@ -754,9 +814,88 @@ mod tests {
         );
         // A reserved permit stamps too.
         let ev = headers_msg(3);
-        let permit = tx.reserve_priority(event_cost(&ev)).await.unwrap();
-        permit.send(ev);
+        let mut staged = StagedCharge::default();
+        staged.start(&tx, event_cost(&ev));
+        staged.wait().await;
+        let permit = tx.reserve_priority().await.unwrap();
+        permit.send(ev, &mut staged);
         assert!(matches!(rx.try_recv(), Ok(PeerEvent::Message(PeerId(3), _))));
+    }
+
+    fn big(p: u64, bytes: usize) -> PeerEvent {
+        // Capacity-only: charged by capacity, pages never touched.
+        PeerEvent::Message(PeerId(p), NetworkMessage::CmpctBlock(Vec::with_capacity(bytes)))
+    }
+
+    /// A staged charge whose `wait()` is cancelled over and over (another
+    /// `select!` arm firing) must keep its queue place: it is satisfied
+    /// before a waiter that queued after it, even though that later waiter
+    /// never gets cancelled. Rebuilding the acquire on every pass would let
+    /// the later waiter take the freed bytes first, every time.
+    #[tokio::test]
+    async fn staged_charge_keeps_its_place_across_cancelled_waits() {
+        const EACH: usize = 128 << 20;
+        let (tx, mut rx) = event_channel(EVENT_LANE_CAPACITY);
+        let mut filled = 0;
+        while tx.try_send(big(1, EACH)).is_ok() {
+            filled += 1;
+        }
+        assert!(filled >= 4, "budget should hold several 128 MiB events");
+
+        // A queues first, for half the budget.
+        let a = big(2, PRIORITY_LANE_BYTE_BUDGET / 2);
+        let mut staged = StagedCharge::default();
+        staged.start(&tx, event_cost(&a));
+        assert!(staged.is_waiting());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), staged.wait())
+                .await
+                .is_err(),
+            "lane is full: A must wait"
+        );
+
+        // B queues second, for the same amount, and is never cancelled.
+        let tx_b = tx.clone();
+        let b = tokio::spawn(async move {
+            tx_b.send(big(3, PRIORITY_LANE_BYTE_BUDGET / 2)).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        // The main loop drains filler events one at a time; between drains A
+        // is polled and cancelled again.
+        for _ in 0..filled {
+            match rx.try_recv() {
+                Ok(PeerEvent::Message(PeerId(1), _)) => {}
+                other => panic!("expected filler, got {:?}", other.map(|e| event_kind(&e))),
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(2), staged.wait()).await;
+            if staged.is_held() {
+                break;
+            }
+        }
+        assert!(staged.is_held(), "A never got its charge");
+        assert!(!b.is_finished(), "B (queued after A) was served first");
+        let permit = tx.reserve_priority().await.unwrap();
+        permit.send(a, &mut staged);
+        assert!(staged.is_idle());
+        drop(rx);
+        let _ = b.await;
+    }
+
+    /// The charge travels with the event and is returned when the main loop
+    /// takes it, not before.
+    #[tokio::test]
+    async fn staged_charge_is_released_on_receive() {
+        let (tx, mut rx) = event_channel(EVENT_LANE_CAPACITY);
+        let ev = big(1, PRIORITY_LANE_BYTE_BUDGET);
+        let mut staged = StagedCharge::default();
+        staged.start(&tx, event_cost(&ev));
+        staged.wait().await;
+        tx.reserve_priority().await.unwrap().send(ev, &mut staged);
+        // The whole budget is now in the lane: nothing else fits.
+        assert!(tx.try_send(headers_msg(2)).is_err());
+        rx.recv().await.unwrap();
+        tx.try_send(headers_msg(2)).expect("budget released on receive");
     }
 
     #[test]

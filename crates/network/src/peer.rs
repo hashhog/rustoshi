@@ -10,7 +10,7 @@
 //! blocking I/O from stalling the main event loop.
 
 use crate::addr::NetworkAddr;
-use crate::event_lane::{event_cost, EventSender};
+use crate::event_lane::{event_cost, EventSender, StagedCharge};
 use crate::message::{
     parse_message_header, serialize_message, NetworkMessage, SendCmpctMessage, VersionMessage,
     MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE, MIN_PEER_PROTO_VERSION, NODE_NETWORK,
@@ -2641,6 +2641,7 @@ async fn message_loop_v1(
     let mut pending_read: Option<PendingRead> = None;
     let mut header_buf = [0u8; MESSAGE_HEADER_SIZE];
     let mut parsed_header: Option<(String, u32, [u8; 4])> = None;
+    let mut staged = StagedCharge::default();
 
     loop {
         // Bulk (tx/addr) events never wait for the main loop: offered to the
@@ -2649,6 +2650,13 @@ async fn message_loop_v1(
         // See crate::event_lane.
         if !event_tx.flush_bulk_front(outbox) {
             return Vec::new(); // main loop gone (shutdown)
+        }
+        // The front of `outbox` is now a priority event (or nothing): charge
+        // its decoded size to the priority lane's byte budget, once.
+        if staged.is_idle() {
+            if let Some(front) = outbox.front() {
+                staged.start(event_tx, event_cost(front));
+            }
         }
         // Initialize pending read if needed
         if pending_read.is_none() {
@@ -2698,9 +2706,16 @@ async fn message_loop_v1(
 
             // Deliver a staged inbound message. Never a blocking
             // `event_tx.send().await` in the loop body: see message_loop_v1.
-            permit = event_tx.reserve_priority(outbox.front().map_or(0, event_cost)), if !outbox.is_empty() => {
+            // Wait for the staged event's byte charge (see StagedCharge:
+            // the acquire survives this select!, keeping its queue place).
+            () = staged.wait(), if staged.is_waiting() => {}
+
+            permit = event_tx.reserve_priority(), if staged.is_held() => {
                 match permit {
-                    Ok(permit) => permit.send(outbox.pop_front().expect("guarded non-empty")),
+                    Ok(permit) => permit.send(
+                        outbox.pop_front().expect("a held charge implies a staged event"),
+                        &mut staged,
+                    ),
                     Err(_) => return Vec::new(), // main loop gone (shutdown)
                 }
             }
@@ -2932,11 +2947,18 @@ async fn message_loop_v2(
     let mut last_ping = Instant::now();
     let mut ping_nonce_pending: Option<(u64, Instant)> = None;
     let mut packet = V2PacketReader::new();
+    let mut staged = StagedCharge::default();
 
     loop {
         // Bulk events never wait for the main loop (see message_loop_v1).
         if !event_tx.flush_bulk_front(outbox) {
             return Vec::new(); // main loop gone (shutdown)
+        }
+        // Charge the staged priority event once (see message_loop_v1).
+        if staged.is_idle() {
+            if let Some(front) = outbox.front() {
+                staged.start(event_tx, event_cost(front));
+            }
         }
         tokio::select! {
             biased;
@@ -2980,9 +3002,16 @@ async fn message_loop_v2(
             }
 
             // Deliver a staged inbound message (see message_loop_v1).
-            permit = event_tx.reserve_priority(outbox.front().map_or(0, event_cost)), if !outbox.is_empty() => {
+            // Wait for the staged event's byte charge (see StagedCharge:
+            // the acquire survives this select!, keeping its queue place).
+            () = staged.wait(), if staged.is_waiting() => {}
+
+            permit = event_tx.reserve_priority(), if staged.is_held() => {
                 match permit {
-                    Ok(permit) => permit.send(outbox.pop_front().expect("guarded non-empty")),
+                    Ok(permit) => permit.send(
+                        outbox.pop_front().expect("a held charge implies a staged event"),
+                        &mut staged,
+                    ),
                     Err(_) => return Vec::new(), // main loop gone (shutdown)
                 }
             }
