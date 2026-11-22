@@ -444,17 +444,6 @@ thread_local! {
     static CHUNK_SEARCH_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Subset visits one [`DepGraph::linearize`] call may spend searching for
-/// chunks. Core bounds the same work (txmempool.h `ACCEPTABLE_COST = 75'000`,
-/// cluster_linearize.h `Linearize` `max_iterations`); the units differ, the
-/// purpose is the same: a cluster's shape cannot buy unbounded work, and the
-/// RBF diagram check (which relinearizes every touched cluster before the
-/// script checks) stays cheap for a replacement that is then rejected. The
-/// whole diagram check for a 17-tx chain needs under 1,000 visits; only wide
-/// clusters with tens of thousands of ancestor-closed subsets reach the
-/// budget, and they fall back to the best chunk found so far.
-pub const LINEARIZE_SEARCH_BUDGET: u64 = 75_000;
-
 /// Depth-first walk over the ancestor-closed subsets of one `remaining` set,
 /// see [`DepGraph::find_best_chunk`]. Bit `p` of a mask is `idxs[p]`.
 struct ClosedSetSearch<'a> {
@@ -464,17 +453,12 @@ struct ClosedSetSearch<'a> {
     desc_mask: &'a [u32],
     best_chunk: HashSet<usize>,
     best_feefrac: FeeFrac,
-    budget: &'a mut u64,
 }
 
 impl ClosedSetSearch<'_> {
     /// Decide positions `pos-1` down to 0. `inc` is ancestor-closed, `exc`
     /// descendant-closed, and they are disjoint.
     fn visit(&mut self, pos: usize, inc: u32, exc: u32) {
-        if *self.budget == 0 {
-            return;
-        }
-        *self.budget -= 1;
         CHUNK_SEARCH_VISITS.with(|c| c.set(c.get() + 1));
         if pos == 0 {
             if inc != 0 {
@@ -554,8 +538,13 @@ impl DepGraph {
         let mut idx_to_txid = Vec::with_capacity(n);
         let mut feerates = Vec::with_capacity(n);
 
-        // Assign indices
-        for (i, txid) in txids.iter().enumerate() {
+        // Assign indices in txid order, not `HashSet` order: the chunk search
+        // walks indices in a fixed order and keeps the first of equally good
+        // sets, so the index order must not depend on the set's hasher seed
+        // or two builds of the same cluster could pick different chunks.
+        let mut sorted: Vec<Hash256> = txids.iter().copied().collect();
+        sorted.sort_unstable();
+        for (i, txid) in sorted.iter().enumerate() {
             txid_to_idx.insert(*txid, i);
             idx_to_txid.push(*txid);
             if let Some(entry) = entries.get(txid) {
@@ -656,14 +645,10 @@ impl DepGraph {
 
         let mut remaining: HashSet<usize> = (0..n).collect();
         let mut chunks = Vec::new();
-        // Shared by every chunk of this linearization, so one call costs at
-        // most LINEARIZE_SEARCH_BUDGET subset visits however the cluster is
-        // shaped (Core: `Linearize(..., max_iterations, ...)`).
-        let mut budget = LINEARIZE_SEARCH_BUDGET;
 
         while !remaining.is_empty() {
             // Find the highest feerate topological prefix
-            let best_chunk = self.find_best_chunk(&remaining, &mut budget);
+            let best_chunk = self.find_best_chunk(&remaining);
 
             if best_chunk.is_empty() {
                 // Fallback: take any transaction with all ancestors in remaining
@@ -729,19 +714,25 @@ impl DepGraph {
     ///
     /// Core's chunk is that subset (txgraph `FindBestChunk`), not only the
     /// ancestor set of one transaction. Clusters of at most 16 transactions
-    /// are searched exactly while `budget` lasts; larger clusters, and any
-    /// search the budget cuts short, keep the best set found so far (at
-    /// worst the ancestor-set heuristic), which is always ancestor-closed.
+    /// are searched exactly, with no early stop: a search cut short keeps
+    /// whichever set it happened to reach first, so its diagram would depend
+    /// on index order and could disagree with Core. Larger clusters keep the
+    /// ancestor-set heuristic.
     ///
     /// The search visits only ancestor-closed subsets: deciding positions
     /// from the highest down, excluding a transaction also excludes its
     /// descendants and including one also includes its ancestors, so no
     /// branch dead-ends. Exclude is tried first, so complete sets come out
     /// in increasing mask order -- the order of the exhaustive 2^n scan this
-    /// replaced -- and the result is identical whenever the budget suffices.
-    fn find_best_chunk(&self, remaining: &HashSet<usize>, budget: &mut u64) -> HashSet<usize> {
+    /// replaced -- and the result is identical to that scan. The cost is
+    /// bounded by the shape alone: a chain of 16 has 17 closed sets, and the
+    /// widest 16-transaction cluster (one parent, 15 children) costs about
+    /// 230,000 visits for the whole linearization, each a few word
+    /// operations with no allocation, where the 2^n scan built a `HashSet`
+    /// for every one of 2^16 + 2^15 + ... masks.
+    fn find_best_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
         let best_chunk = self.find_best_ancestor_chunk(remaining);
-        if remaining.len() > 16 || best_chunk.is_empty() || *budget == 0 {
+        if remaining.len() > 16 || best_chunk.is_empty() {
             return best_chunk;
         }
         let mut idxs: Vec<usize> = remaining.iter().copied().collect();
@@ -762,7 +753,6 @@ impl DepGraph {
             desc_mask: &desc_mask,
             best_chunk,
             best_feefrac,
-            budget,
         };
         search.visit(idxs.len(), 0, 0);
         search.best_chunk
