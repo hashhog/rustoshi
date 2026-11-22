@@ -8,9 +8,11 @@
 //! subset evaluations against a 17-transaction cluster, got rejected without
 //! penalty, left the cluster in place, and could repeat.
 //!
-//! Core bounds the same work: `TxGraph` keeps linearizations and improves them
-//! under a cost budget (`ACCEPTABLE_COST = 75'000`, txmempool.h:54;
-//! `Linearize(..., max_iterations, ...)`, cluster_linearize.h).
+//! Core bounds the same work with a cost budget (`ACCEPTABLE_COST = 75'000`,
+//! txmempool.h:54). rustoshi does not cut its exact search short -- a search
+//! stopped early keeps an index-order-dependent chunk -- so its bound comes
+//! from the walk instead: closed subsets only, no allocation per visit, and
+//! at most 262,124 visits for any cluster ([`WIDE_VISIT_BOUND`]).
 //!
 //! The work is measured as heap allocations on the test thread, counted by a
 //! global allocator in this test binary. The pre-fix search allocated one
@@ -460,7 +462,8 @@ fn wide_cluster_worst_case_hits_the_visit_bound_exactly() {
 /// parent plus every child except the 10_000-sat one: fee 150_501, size
 /// 1_500. A search that stops early returns that only for some index orders
 /// (with the parent last it finished; with the parent first and the children
-/// in increasing-fee order it kept fee 149_201). The chunk must not depend on
+/// in increasing-fee order it kept fee 149_201 with the review's txids,
+/// and 160_501 / 1_600 with this test's). The chunk must not depend on
 /// where the parent sits.
 #[test]
 fn star_cluster_best_chunk_is_independent_of_index_order() {
