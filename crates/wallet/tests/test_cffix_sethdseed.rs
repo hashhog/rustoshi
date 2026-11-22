@@ -21,8 +21,8 @@
 
 use rustoshi_crypto::address::Network;
 use rustoshi_wallet::{
-    decrypt_seed, parse_seed_file, AddressType, CreateWalletOptions, ParsedSeedFile, Wallet,
-    WalletError, WalletManager, ENCRYPTED_FILE_LEN,
+    decrypt_seed, encrypt_seed, parse_seed_file, AddressType, CreateWalletOptions, ParsedSeedFile,
+    Wallet, WalletError, WalletManager, ENCRYPTED_FILE_LEN,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -386,4 +386,46 @@ fn passphrase_change_rewraps_archived_seeds() {
         open_seed_file(&archived[0], "second passphrase"),
         Some(old_seed)
     );
+}
+
+/// encryptwallet must stay retryable when an earlier attempt re-wrapped the
+/// archives but failed writing the live seed (live seed still plaintext,
+/// archive already encrypted under the same passphrase). The state is staged
+/// directly: the archive is replaced by its encryption under PASS.
+#[test]
+fn encryptwallet_retry_after_partial_archive_rewrap() {
+    let dir = TempDir::new().unwrap();
+    let mut mgr = WalletManager::new(dir.path(), Network::Regtest).unwrap();
+    mgr.create_wallet("w", CreateWalletOptions::default())
+        .unwrap();
+    let old = std::fs::read(seed_path(dir.path(), "w")).unwrap();
+    mgr.set_hd_seed("w", &NEW_SEED).unwrap();
+
+    let wdir = dir.path().join("wallets").join("w");
+    let archive = std::fs::read_dir(&wdir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("wallet_seed.bin.replaced-")
+        })
+        .unwrap();
+    let mut old_arr = [0u8; 64];
+    old_arr.copy_from_slice(&old);
+    std::fs::write(
+        &archive,
+        encrypt_seed(&old_arr, PASS, rustoshi_wallet::DEFAULT_KDF_ITERATIONS).unwrap(),
+    )
+    .unwrap();
+
+    mgr.encrypt_wallet("w", PASS)
+        .expect("encryptwallet must succeed on retry");
+    assert_eq!(
+        std::fs::read(seed_path(dir.path(), "w")).unwrap().len(),
+        ENCRYPTED_FILE_LEN
+    );
+    let archived = archived_seed_files(dir.path(), "w");
+    assert_eq!(open_seed_file(&archived[0], PASS), Some(old_arr));
 }
