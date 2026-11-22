@@ -257,24 +257,73 @@ pub fn encrypt_seed(
     passphrase: &str,
     iterations: u32,
 ) -> Result<Vec<u8>, WalletEncryptError> {
-    // Defense-in-depth: refuse empty passphrases. Bitcoin Core also refuses
-    // (`walletpassphrasechange` rejects empty new). An empty passphrase is
-    // a footgun — if a user genuinely wants no encryption, they should pass
-    // `None`, not `Some("")`.
-    if passphrase.is_empty() {
-        return Err(WalletEncryptError::Malformed(
-            "refusing to encrypt with empty passphrase".to_string(),
-        ));
+    let key = SeedKey::generate(passphrase, iterations)?;
+    encrypt_seed_with_key(seed, &key)
+}
+
+/// A passphrase-derived seed-file key together with the salt and KDF
+/// iteration count it was derived with. Zeroized on drop.
+///
+/// Held by [`crate::manager::WalletManager`] only while an encrypted wallet
+/// is unlocked, so that operations which must REPLACE the seed (e.g.
+/// `sethdseed`) can write the new seed encrypted under the wallet's existing
+/// passphrase without keeping the passphrase itself in memory. This is the
+/// analogue of Core keeping `vMasterKey` in `CWallet` while unlocked.
+pub(crate) struct SeedKey {
+    key: [u8; KEY_LEN],
+    salt: [u8; SALT_LEN],
+    iterations: u32,
+}
+
+impl SeedKey {
+    /// Derive a key for a brand-new seed file (fresh random salt).
+    pub(crate) fn generate(passphrase: &str, iterations: u32) -> Result<Self, WalletEncryptError> {
+        // Defense-in-depth: refuse empty passphrases. Bitcoin Core also refuses
+        // (`walletpassphrasechange` rejects empty new). An empty passphrase is
+        // a footgun — if a user genuinely wants no encryption, they should pass
+        // `None`, not `Some("")`.
+        if passphrase.is_empty() {
+            return Err(WalletEncryptError::Malformed(
+                "refusing to encrypt with empty passphrase".to_string(),
+            ));
+        }
+        let mut salt = [0u8; SALT_LEN];
+        rand_bytes(&mut salt)?;
+        let key = derive_key(passphrase, &salt, iterations)?;
+        Ok(Self { key, salt, iterations })
     }
 
-    let mut salt = [0u8; SALT_LEN];
-    rand_bytes(&mut salt)?;
+    /// Derive the key an existing seed file was encrypted with.
+    pub(crate) fn for_file(
+        file: &EncryptedSeedFile,
+        passphrase: &str,
+    ) -> Result<Self, WalletEncryptError> {
+        let key = derive_key(passphrase, &file.salt, file.iterations)?;
+        Ok(Self {
+            key,
+            salt: file.salt,
+            iterations: file.iterations,
+        })
+    }
+}
 
+impl Drop for SeedKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+/// Encrypt `seed` under an already-derived [`SeedKey`], with a fresh random
+/// nonce. Keeps the key's salt + iteration count, so the same passphrase
+/// keeps unlocking the file.
+pub(crate) fn encrypt_seed_with_key(
+    seed: &[u8; SEED_LEN],
+    key: &SeedKey,
+) -> Result<Vec<u8>, WalletEncryptError> {
     let mut nonce = [0u8; NONCE_LEN];
     rand_bytes(&mut nonce)?;
 
-    let mut key = derive_key(passphrase, &salt, iterations)?;
-    let cipher = ChaCha20Poly1305::new((&key).into());
+    let cipher = ChaCha20Poly1305::new((&key.key).into());
 
     // ChaCha20-Poly1305 encrypts in place; we work on a copy of the seed.
     let mut buffer = seed.to_vec();
@@ -286,22 +335,19 @@ pub fn encrypt_seed(
         )
         .map_err(|e| WalletEncryptError::Malformed(format!("AEAD encrypt failed: {}", e)))?;
 
-    // Now serialize the file. Zero the key buffer before we leave scope —
-    // the derived key is the most valuable thing in this function.
     let mut out = Vec::with_capacity(ENCRYPTED_FILE_LEN);
     out.extend_from_slice(&SEED_FILE_MAGIC);
     out.push(SEED_FILE_VERSION);
     out.push(KDF_PBKDF2_SHA512);
     out.push(CIPHER_CHACHA20_POLY1305);
     out.push(0); // reserved
-    out.extend_from_slice(&iterations.to_be_bytes());
-    out.extend_from_slice(&salt);
+    out.extend_from_slice(&key.iterations.to_be_bytes());
+    out.extend_from_slice(&key.salt);
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&buffer);
     out.extend_from_slice(&tag);
     debug_assert_eq!(out.len(), ENCRYPTED_FILE_LEN);
 
-    key.zeroize();
     buffer.zeroize();
 
     Ok(out)
@@ -404,8 +450,16 @@ pub fn decrypt_seed(
     file: &EncryptedSeedFile,
     passphrase: &str,
 ) -> Result<[u8; SEED_LEN], WalletEncryptError> {
-    let mut key = derive_key(passphrase, &file.salt, file.iterations)?;
-    let cipher = ChaCha20Poly1305::new((&key).into());
+    let key = SeedKey::for_file(file, passphrase)?;
+    decrypt_seed_with_key(file, &key)
+}
+
+/// Decrypt a parsed v2 seed file with an already-derived [`SeedKey`].
+pub(crate) fn decrypt_seed_with_key(
+    file: &EncryptedSeedFile,
+    key: &SeedKey,
+) -> Result<[u8; SEED_LEN], WalletEncryptError> {
+    let cipher = ChaCha20Poly1305::new((&key.key).into());
 
     let mut ciphertext = file.ciphertext_and_tag[..SEED_LEN].to_vec();
     let tag = &file.ciphertext_and_tag[SEED_LEN..];
@@ -416,8 +470,6 @@ pub fn decrypt_seed(
         &mut ciphertext,
         tag.into(),
     );
-
-    key.zeroize();
 
     match result {
         Ok(()) => {

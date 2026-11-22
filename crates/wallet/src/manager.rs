@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use crate::db::WalletDb;
 use crate::encryption::{
-    decrypt_seed, encrypt_seed, parse_seed_file, ParsedSeedFile, DEFAULT_KDF_ITERATIONS,
+    decrypt_seed, decrypt_seed_with_key, encrypt_seed, encrypt_seed_with_key, parse_seed_file,
+    ParsedSeedFile, SeedKey, DEFAULT_KDF_ITERATIONS,
 };
 use crate::hd::WalletError;
 use crate::wallet::{AddressType, Wallet};
@@ -103,8 +104,18 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), WalletError> {
 ///
 /// On Unix, both temp and target inherit mode `0600`.
 fn write_seed_payload(wallet_dir: &Path, bytes: &[u8]) -> Result<(), WalletError> {
-    let final_path = wallet_dir.join(SEED_FILE_NAME);
-    let tmp_path = wallet_dir.join(format!("{}.tmp", SEED_FILE_NAME));
+    write_private_file_atomic(wallet_dir, SEED_FILE_NAME, bytes)
+}
+
+/// Atomically write `bytes` to `<wallet_dir>/<file_name>` (temp file +
+/// fsync + rename, mode `0600` on Unix).
+fn write_private_file_atomic(
+    wallet_dir: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(), WalletError> {
+    let final_path = wallet_dir.join(file_name);
+    let tmp_path = wallet_dir.join(format!("{}.tmp", file_name));
 
     #[cfg(unix)]
     {
@@ -166,6 +177,44 @@ fn persist_seed(
     };
 
     write_seed_payload(wallet_dir, &payload)
+}
+
+/// Prefix of the archive copies [`archive_seed_file`] leaves next to
+/// `wallet_seed.bin`.
+const REPLACED_SEED_PREFIX: &str = "wallet_seed.bin.replaced-";
+
+/// Copy the current `<wallet_dir>/wallet_seed.bin` (if any) byte-for-byte to
+/// `<wallet_dir>/wallet_seed.bin.replaced-<unix-secs>[-<n>]` before it is
+/// replaced, so a seed replacement never destroys the previous seed. An
+/// encrypted file stays encrypted in the archive. Never overwrites an
+/// existing archive.
+///
+/// Core's legacy `sethdseed` kept the old HD keys in the keystore (they
+/// remained spendable); rustoshi's wallet holds exactly one seed, so the
+/// old seed file is preserved on disk instead.
+fn archive_seed_file(wallet_dir: &Path) -> Result<(), WalletError> {
+    let seed_path = wallet_dir.join(SEED_FILE_NAME);
+    if !seed_path.exists() {
+        return Ok(());
+    }
+    let bytes = fs::read(&seed_path).map_err(WalletError::Io)?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut n = 0u32;
+    let file_name = loop {
+        let candidate = if n == 0 {
+            format!("{}{}", REPLACED_SEED_PREFIX, secs)
+        } else {
+            format!("{}{}-{}", REPLACED_SEED_PREFIX, secs, n)
+        };
+        if !wallet_dir.join(&candidate).exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+    write_private_file_atomic(wallet_dir, &file_name, &bytes)
 }
 
 /// Outcome of [`load_seed`]: the seed itself if the wallet is unencrypted
@@ -313,6 +362,12 @@ pub struct WalletManager {
     /// Per-wallet encryption + lock bookkeeping. Always populated alongside
     /// `wallets`.
     lock_states: HashMap<String, Arc<Mutex<WalletLockState>>>,
+    /// Seed-file keys of encrypted wallets that are currently unlocked.
+    /// Present only between unlock (`walletpassphrase`, `encryptwallet`,
+    /// `createwallet` with a passphrase) and `walletlock` / unload / timeout
+    /// relock, so a seed replacement (`sethdseed`) can re-encrypt under the
+    /// wallet's passphrase without holding the passphrase itself.
+    session_keys: HashMap<String, SeedKey>,
     /// Base directory for wallet data.
     wallets_dir: PathBuf,
     /// Network (for address encoding).
@@ -336,6 +391,7 @@ impl WalletManager {
             wallets: HashMap::new(),
             wallet_dbs: HashMap::new(),
             lock_states: HashMap::new(),
+            session_keys: HashMap::new(),
             wallets_dir,
             network,
             load_on_startup: Vec::new(),
@@ -348,6 +404,7 @@ impl WalletManager {
             wallets: HashMap::new(),
             wallet_dbs: HashMap::new(),
             lock_states: HashMap::new(),
+            session_keys: HashMap::new(),
             wallets_dir: PathBuf::new(),
             network,
             load_on_startup: Vec::new(),
@@ -400,6 +457,7 @@ impl WalletManager {
         }
 
         let mut warnings = Vec::new();
+        let mut created_session_key: Option<SeedKey> = None;
 
         // Create wallet directory (owner-only: it holds the seed and keys)
         create_private_dir(&wallet_dir)?;
@@ -468,7 +526,18 @@ impl WalletManager {
             let mut seed = [0u8; SEED_LEN];
             getrandom::getrandom(&mut seed)
                 .map_err(|e| WalletError::Crypto(format!("failed to generate random seed: {}", e)))?;
-            persist_seed(&wallet_dir, &seed, passphrase)?;
+            match passphrase {
+                Some(pw) => {
+                    // Encrypted + unlocked for this session (below): keep the
+                    // seed-file key so a later sethdseed can re-encrypt.
+                    let key = SeedKey::generate(pw, DEFAULT_KDF_ITERATIONS)
+                        .map_err(WalletError::from)?;
+                    let payload = encrypt_seed_with_key(&seed, &key).map_err(WalletError::from)?;
+                    write_seed_payload(&wallet_dir, &payload)?;
+                    created_session_key = Some(key);
+                }
+                None => persist_seed(&wallet_dir, &seed, None)?,
+            }
             let wallet = Wallet::from_seed(&seed, self.network, AddressType::P2WPKH)?;
             let state = if want_encryption {
                 // Wallet was just created with a passphrase — the seed is
@@ -509,6 +578,9 @@ impl WalletManager {
         self.wallets.insert(name.to_string(), wallet_arc);
         self.wallet_dbs.insert(name.to_string(), db_arc);
         self.lock_states.insert(name.to_string(), lock_state_arc);
+        if let Some(key) = created_session_key {
+            self.session_keys.insert(name.to_string(), key);
+        }
 
         // Handle load_on_startup
         if let Some(true) = options.load_on_startup {
@@ -550,7 +622,13 @@ impl WalletManager {
     /// # Errors
     /// - `InvalidSeedLength` if `seed` is not 64 bytes.
     /// - `InvalidPath` if the wallet is not loaded.
+    /// - `WalletLocked` if the wallet is encrypted and locked (Core's legacy
+    ///   `sethdseed` called `EnsureWalletIsUnlocked`). Nothing is written.
     /// - propagated I/O / crypto errors from persistence and key derivation.
+    ///
+    /// An encrypted wallet stays encrypted: the new seed is persisted under
+    /// the same passphrase. The previous `wallet_seed.bin` is archived as
+    /// `wallet_seed.bin.replaced-<unix-secs>` rather than destroyed.
     pub fn set_hd_seed(&mut self, name: &str, seed: &[u8]) -> Result<(), WalletError> {
         if seed.len() != SEED_LEN {
             return Err(WalletError::InvalidSeedLength(seed.len()));
@@ -565,6 +643,18 @@ impl WalletManager {
             .cloned()
             .ok_or_else(|| WalletError::InvalidPath(format!("wallet '{}' not loaded", name)))?;
 
+        // Core's legacy sethdseed began with EnsureWalletIsUnlocked: an
+        // encrypted wallet must be unlocked before its seed can be replaced.
+        // This also drives the auto-relock timer.
+        if let Err(e) = self.require_unlocked(name) {
+            self.session_keys.remove(name);
+            return Err(e);
+        }
+        let encrypted = self
+            .lock_state(name)
+            .map(|ls| ls.encrypted)
+            .ok_or_else(|| WalletError::InvalidPath(format!("wallet '{}' not loaded", name)))?;
+
         let (network, address_type) = {
             let guard = wallet_arc
                 .lock()
@@ -576,12 +666,26 @@ impl WalletManager {
         let new_wallet = Wallet::from_seed(&seed_arr, network, address_type)?;
 
         // Persist the seed so `loadwallet` reproduces the same key material.
-        // We write the v1 (unencrypted) layout here; an operator who wants the
-        // restored wallet encrypted re-runs `encryptwallet` afterwards. This
-        // matches the recovery use-case where the seed is the secret of record.
+        // An encrypted wallet stays encrypted: the new seed is written under
+        // the key the wallet was unlocked with (Core encrypted the new HD
+        // seed under the master key). The previous seed file is archived
+        // first, never destroyed.
         let wallet_dir = self.wallets_dir.join(name);
         if wallet_dir.exists() {
-            persist_seed(&wallet_dir, &seed_arr, None)?;
+            let payload = if encrypted {
+                let key = self.session_keys.get(name).ok_or_else(|| {
+                    WalletError::EncryptionState(
+                        "wallet is encrypted but its unlock key is not held; run walletlock \
+                         then walletpassphrase and retry"
+                            .into(),
+                    )
+                })?;
+                encrypt_seed_with_key(&seed_arr, key).map_err(WalletError::from)?
+            } else {
+                seed_arr.to_vec()
+            };
+            archive_seed_file(&wallet_dir)?;
+            write_seed_payload(&wallet_dir, &payload)?;
         }
 
         // Reset the persisted derivation indices so the restored wallet starts
@@ -613,13 +717,9 @@ impl WalletManager {
             *guard = new_wallet;
         }
 
-        // The restored wallet is unencrypted + unlocked in memory.
-        if let Some(ls) = self.lock_states.get(name) {
-            if let Ok(mut ls_guard) = ls.lock() {
-                *ls_guard = WalletLockState::unencrypted();
-            }
-        }
-
+        // The lock state is unchanged: an encrypted wallet stays encrypted
+        // (and unlocked until its existing timeout), an unencrypted one stays
+        // unencrypted.
         Ok(())
     }
 
@@ -786,6 +886,7 @@ impl WalletManager {
 
         let db = self.wallet_dbs.remove(name);
         let _lock_state = self.lock_states.remove(name);
+        self.session_keys.remove(name);
 
         if save {
             if let (Some(db_arc), Ok(wallet_guard)) = (db, wallet.lock()) {
@@ -1319,7 +1420,8 @@ impl WalletManager {
         };
 
         // Decrypt — this is where wrong passphrases are rejected.
-        let seed = decrypt_seed(&file, passphrase).map_err(WalletError::from)?;
+        let key = SeedKey::for_file(&file, passphrase).map_err(WalletError::from)?;
+        let seed = decrypt_seed_with_key(&file, &key).map_err(WalletError::from)?;
 
         // Need the address type + indices to build the live wallet.
         let db_arc = self
@@ -1367,6 +1469,7 @@ impl WalletManager {
                 .map_err(|_| WalletError::Crypto("lock state poisoned".into()))?;
             *state = WalletLockState::unlocked_for(timeout);
         }
+        self.session_keys.insert(name.to_string(), key);
 
         Ok(())
     }
@@ -1442,6 +1545,7 @@ impl WalletManager {
                 .map_err(|_| WalletError::Crypto("lock state poisoned".into()))?;
             *state = WalletLockState::locked();
         }
+        self.session_keys.remove(name);
 
         Ok(())
     }
@@ -1507,7 +1611,10 @@ impl WalletManager {
         // Write the encrypted form atomically. If this fails partway, the
         // temp file is left behind but the original plaintext stays intact;
         // a rerun will retry the encryption.
-        persist_seed(&wallet_dir, &seed, Some(passphrase))?;
+        let key = SeedKey::generate(passphrase, DEFAULT_KDF_ITERATIONS).map_err(WalletError::from)?;
+        let payload = encrypt_seed_with_key(&seed, &key).map_err(WalletError::from)?;
+        write_seed_payload(&wallet_dir, &payload)?;
+        self.session_keys.insert(name.to_string(), key);
 
         // Update in-memory state to "encrypted + unlocked for the session".
         // Choose a long unlock timeout (effectively this session); the user
@@ -1569,7 +1676,16 @@ impl WalletManager {
         let seed = decrypt_seed(&file, old_passphrase).map_err(WalletError::from)?;
 
         // Re-write with the new passphrase.
-        persist_seed(&wallet_dir, &seed, Some(new_passphrase))?;
+        let key = SeedKey::generate(new_passphrase, DEFAULT_KDF_ITERATIONS)
+            .map_err(WalletError::from)?;
+        let payload = encrypt_seed_with_key(&seed, &key).map_err(WalletError::from)?;
+        write_seed_payload(&wallet_dir, &payload)?;
+
+        // A held unlock key now belongs to the old passphrase; replace it so a
+        // later seed replacement is encrypted under the NEW passphrase.
+        if self.session_keys.contains_key(name) {
+            self.session_keys.insert(name.to_string(), key);
+        }
 
         Ok(())
     }
