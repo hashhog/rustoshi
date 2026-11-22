@@ -8266,8 +8266,14 @@ impl Mempool {
         }
 
         // ImprovesFeerateDiagram after the cluster limits, as in Core's
-        // single-in-package ReplacementChecks (and the single-tx path).
-        if !rbf_conflicts.is_empty() {
+        // single-in-package ReplacementChecks, when a TRUC sibling is being
+        // evicted. Only then: Core reports a diagram failure as
+        // TX_RECONSIDERABLE and retries the tx in package evaluation, where
+        // package RBF may accept it — but package evaluation never allows
+        // sibling eviction, so with a sibling the retry cannot help and the
+        // rejection here is final. A plain input-conflict replacement keeps
+        // the package path's existing handling.
+        if sibling_to_evict.is_some() {
             self.check_rbf_diagram(txid, modified_fee, vsize, &rbf_conflicts, &mempool_parents)?;
         }
 

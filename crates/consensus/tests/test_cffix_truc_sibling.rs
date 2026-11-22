@@ -155,14 +155,38 @@ fn truc_sibling_counts_in_rbf_fee_sum_package_path() {
         "package must fail: N underpays S + X, got {:?}",
         res.tx_results.iter().map(|r| (&r.txid, &r.error)).collect::<Vec<_>>()
     );
+    // Prefix match: Core's full reason is "insufficient fee (including
+    // sibling eviction)" (validation.cpp ReplacementChecks); rustoshi does
+    // not carry the suffix yet. What matters here is that N fails
+    // PaysForRBF, not some other check.
     let n_result = res.tx_results.iter().find(|r| r.txid == n_txid).expect("N result");
-    assert_eq!(
-        n_result.error.as_deref(),
-        Some("insufficient fee"),
-        "N must fail PaysForRBF, not some other check"
+    assert!(
+        n_result.error.as_deref().is_some_and(|e| e.starts_with("insufficient fee")),
+        "N must fail PaysForRBF, got {:?}",
+        n_result.error
     );
     assert!(f.pool.contains(&f.sibling));
     assert!(f.pool.contains(&f.x));
+}
+
+#[test]
+fn truc_sibling_eviction_must_improve_diagram_package_path() {
+    // The diagram-worsening sibling eviction below, submitted as a [P, N]
+    // package with P already in the pool (Core SingleInPackageAccept runs
+    // ImprovesFeerateDiagram; package evaluation cannot evict a sibling, so
+    // nothing retries it).
+    let (mut pool, utxos, parent, sibling) = small_high_feerate_sibling();
+    let n = wide_child(parent, 25, 11_000);
+    let n_txid = n.txid();
+    let p = pool.get(&parent).expect("P").tx.clone();
+    let res = pool.accept_package(vec![p, n], &|op: &OutPoint| utxos.get(op).cloned());
+    assert!(
+        res.package_error.is_some(),
+        "package must fail: N worsens the diagram, got {:?}",
+        res.tx_results.iter().map(|r| (&r.txid, &r.error)).collect::<Vec<_>>()
+    );
+    assert!(!pool.contains(&n_txid));
+    assert!(pool.contains(&sibling), "sibling S stays");
 }
 
 #[test]
