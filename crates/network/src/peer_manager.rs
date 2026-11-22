@@ -1963,6 +1963,9 @@ impl AddressManager {
             ) && self.is_addr_eligible_excluding(addr, netgroup_manager, busy_addrs, busy_groups)
         })?;
         let addr = self.try_queue.remove(pos)?;
+        // Keep the `queued` membership set in step with `try_queue`, or a
+        // later `enqueue_back` of this address would be silently skipped.
+        self.queued.remove(&addr);
         if let Some(info) = self.known_addrs.get_mut(&addr) {
             info.last_attempt = Some(Instant::now());
             info.attempt_count += 1;

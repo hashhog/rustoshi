@@ -52,7 +52,9 @@ fn flat_addr_stores_are_bounded() {
         ADDRMAN_CEILING
     );
 
-    // The same IPv4 announced twice must be queued once.
+    // The same IPv4 announced twice must not be queued more than once. Since
+    // rustoshi#71 gossiped addresses take no `try_queue` hint at all (outbound
+    // slots come from the bucketed addrman), so "at most once" is exactly 0.
     let mut mgr = AddressManager::new();
     let a: SocketAddr = "8.8.8.8:8333".parse().unwrap();
     let ta = TimestampedNetAddress {
@@ -61,7 +63,7 @@ fn flat_addr_stores_are_bounded() {
     };
     mgr.add_peer_addresses(&[ta.clone()], from);
     mgr.add_peer_addresses(&[ta], from);
-    assert_eq!(mgr.queue_size(), 1, "duplicate addr announce re-queued");
+    assert_eq!(mgr.queue_size(), 0, "gossiped addr announce was queued");
 
     // Same through addrv2.
     let mut mgr = AddressManager::new();
@@ -73,7 +75,7 @@ fn flat_addr_stores_are_bounded() {
     };
     mgr.add_addrv2_addresses(&[e.clone()], from);
     mgr.add_addrv2_addresses(&[e], from);
-    assert_eq!(mgr.queue_size(), 1, "duplicate addrv2 announce re-queued");
+    assert_eq!(mgr.queue_size(), 0, "gossiped addrv2 announce was queued");
 }
 
 #[test]
@@ -133,8 +135,12 @@ fn try_queue_is_deduplicated() {
         port: 8333,
     };
     mgr.add_addrv2_addresses(&[e.clone(), e], from);
-    assert_eq!(mgr.queue_size(), 1, "one address, queued once");
-    // A manual add of an already-queued address moves it, not duplicates it.
+    // rustoshi#71: gossip never queues, so five announcements leave nothing.
+    assert_eq!(mgr.queue_size(), 0, "gossiped address was queued");
+    // The operator path still queues, and a re-add moves the entry rather
+    // than duplicating it.
+    mgr.add_manual_address(a);
+    assert_eq!(mgr.queue_size(), 1, "manual add did not queue the address");
     mgr.add_manual_address(a);
     assert_eq!(
         mgr.queue_size(),

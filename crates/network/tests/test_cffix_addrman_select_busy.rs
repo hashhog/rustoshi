@@ -239,3 +239,38 @@ fn failed_pick_is_not_redialled_inside_backoff() {
     mgr.mark_outbound_disconnected(&first, &ng);
     assert_eq!(mgr.next_addr_to_try(&ng), Some(first));
 }
+
+/// Merge guard for rustoshi#69 + #71: after #71, gossip never queues, so the
+/// only `try_queue` hints left are DNS / manual. #69's stale-hint skip (a
+/// queued address that `make_room_legacy` evicted is not dialled) must still
+/// hold on the non-routable stage that drains them. `evicted_addresses_are_not_dialed`
+/// in test_cffix_addrman_bounds.rs fills through gossip, so on this branch it
+/// has nothing queued; this fills through the DNS path instead.
+#[test]
+fn evicted_dns_hint_is_not_dialed() {
+    use rustoshi_network::ADDRMAN_CEILING;
+    let mut mgr = AddressManager::new();
+    let ng = NetGroupManager::with_key(12345);
+    // Non-routable 10.x.y.z, so the bucketed addrman refuses them and the
+    // `try_queue` stage is what dials them (regtest / local setups).
+    let total = ADDRMAN_CEILING as u32 + 5000;
+    let addrs: Vec<SocketAddr> = (0..total)
+        .map(|n| SocketAddr::from(((0x0A00_0000u32 + n).to_be_bytes(), 8333)))
+        .collect();
+    mgr.add_dns_addresses(addrs);
+    assert!(mgr.known_count() <= ADDRMAN_CEILING);
+    let known: HashSet<IpAddr> = mgr.all_known_ips().into_iter().collect();
+    assert!(mgr.queue_size() > 0, "DNS path queued nothing: test is vacuous");
+    // ~5000 of the ~65k queued hints are stale; 1000 picks reach ~75 of them.
+    let mut picks = 0;
+    for _ in 0..1000 {
+        match mgr.next_addr_to_try(&ng) {
+            Some(a) => {
+                picks += 1;
+                assert!(known.contains(&a.ip()), "dialed evicted DNS address {a}");
+            }
+            None => break,
+        }
+    }
+    assert!(picks > 0, "no picks made: test is vacuous");
+}
