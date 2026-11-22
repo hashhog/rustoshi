@@ -2726,6 +2726,16 @@ impl Mempool {
         // This may indicate sibling eviction is possible
         let sibling_to_evict = self.check_truc_policy(&tx, txid, vsize, &mempool_parents, &direct_conflicts)?;
 
+        // TRUC sibling eviction (BIP 431 rule 6). Core PreChecks adds the
+        // sibling to ws.m_conflicts / m_iters_conflicting (validation.cpp
+        // ~958-969), so ReplacementChecks treats it like any other conflict:
+        // Rule 5, PaysForRBF over the SUM of every evicted entry's modified
+        // fee, and ImprovesFeerateDiagram. It used to be checked ad hoc here
+        // (`fee > sibling_fee` + bandwidth), outside the RBF set, so a child
+        // that also had input conflicts only had to beat max(conflicts,
+        // sibling) and a pure sibling eviction skipped the diagram check.
+        let rbf_conflicts = Self::with_sibling(&direct_conflicts, sibling_to_evict);
+
         // Handle conflicts via RBF.
         //
         // STAGED, not applied. Core builds the eviction set into a
@@ -2742,56 +2752,21 @@ impl Mempool {
         // against the unmodified pool; `staged_removals` is committed only
         // after every check passed and only when !test_accept.
         let mut staged_removals: Vec<Hash256> = Vec::new();
-        if !direct_conflicts.is_empty() {
+        if !rbf_conflicts.is_empty() {
             // Check RBF rules (read-only). Rules 3 and 4 compare the modified
             // fee (Core PaysForRBF(..., ws.m_modified_fees, ...)).
-            self.check_rbf_rules(&tx, modified_fee, fee_rate, vsize, &direct_conflicts, &mempool_parents)?;
+            self.check_rbf_rules(&tx, modified_fee, fee_rate, vsize, &rbf_conflicts, &mempool_parents)?;
 
-            // Collect all transactions to remove (direct conflicts + their descendants)
+            // Collect all transactions to remove (conflicts, the TRUC
+            // sibling, and their descendants).
             let mut all_to_remove = HashSet::new();
-            for conflict_txid in &direct_conflicts {
+            for conflict_txid in &rbf_conflicts {
                 all_to_remove.insert(*conflict_txid);
                 for desc in self.get_all_descendants(conflict_txid) {
                     all_to_remove.insert(desc);
                 }
             }
             staged_removals.extend(all_to_remove);
-        }
-
-        // Handle TRUC sibling eviction (Rule 6)
-        // For v3 child transactions, we can evict an existing v3 sibling
-        // without the normal RBF fee-rate rule (but still need higher absolute fee)
-        if let Some(sibling_txid) = sibling_to_evict {
-            // For sibling eviction, we only require:
-            // 1. Higher absolute fee than the sibling
-            // 2. Pay for bandwidth
-            // We do NOT require higher fee rate (unlike standard RBF)
-            if let Some(sibling_entry) = self.transactions.get(&sibling_txid) {
-                // FIX-72: use GetModifiedFee for the sibling — a prioritised
-                // sibling must be beaten on its modified fee, mirroring Core.
-                let sibling_fee = Self::get_modified_fee(sibling_entry);
-
-                // Must pay higher absolute fee
-                if fee <= sibling_fee {
-                    return Err(MempoolError::RbfInsufficientAbsoluteFee(fee, sibling_fee));
-                }
-
-                // Must pay for bandwidth (sat/kvB × vsize / 1000, ceiling)
-                // incremental_relay_fee is in sat/kvB; mirrors Core CFeeRate::GetFee(vsize).
-                let additional_fee = fee - sibling_fee;
-                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;
-                if additional_fee < required_bandwidth_fee {
-                    return Err(MempoolError::RbfInsufficientBandwidthFee(
-                        additional_fee,
-                        required_bandwidth_fee,
-                    ));
-                }
-
-                // Stage the sibling (removed at commit, below).
-                if !staged_removals.contains(&sibling_txid) {
-                    staged_removals.push(sibling_txid);
-                }
-            }
         }
 
         // ---- Cluster limits (Core v31 cluster mempool). POLICY, not consensus. ----
@@ -2850,9 +2825,9 @@ impl Mempool {
         }
 
         // ImprovesFeerateDiagram (validation.cpp ReplacementChecks), after
-        // the cluster limits like Core.
-        if !direct_conflicts.is_empty() {
-            self.check_rbf_diagram(txid, modified_fee, vsize, &direct_conflicts, &mempool_parents)?;
+        // the cluster limits like Core. Runs for a pure sibling eviction too.
+        if !rbf_conflicts.is_empty() {
+            self.check_rbf_diagram(txid, modified_fee, vsize, &rbf_conflicts, &mempool_parents)?;
         }
 
         // CheckEphemeralSpends for a single tx (validation.cpp:1377), after
@@ -4044,6 +4019,18 @@ impl Mempool {
         }
 
         Ok(None)
+    }
+
+    /// The RBF conflict set: direct input conflicts plus the TRUC sibling
+    /// `check_truc_policy` chose for eviction (Core PreChecks inserts it into
+    /// `ws.m_conflicts`).
+    fn with_sibling(
+        direct_conflicts: &HashSet<Hash256>,
+        sibling: Option<Hash256>,
+    ) -> HashSet<Hash256> {
+        let mut set = direct_conflicts.clone();
+        set.extend(sibling);
+        set
     }
 
     /// Calculate ancestor statistics for a set of direct parents.
@@ -8201,19 +8188,29 @@ impl Mempool {
         // accumulation (validation.cpp:1236).
         let mut replaced_txids: Vec<Hash256> = Vec::new();
 
+        // A sibling can only be found here when the tx's TRUC parent is
+        // already in the pool, i.e. the tx is the package's only new member
+        // (a new parent cannot have siblings, and two parents fail the TRUC
+        // ancestor limit). That is Core AcceptSubPackage of one tx ->
+        // ATMPArgs::SingleInPackageAccept, which allows sibling eviction and
+        // runs the full ReplacementChecks with the sibling in m_conflicts —
+        // the same set as the single-tx path above.
+        let rbf_conflicts = Self::with_sibling(&direct_conflicts, sibling_to_evict);
+        let modified_fee = self.modified_fee_of(&txid, fee);
+
         // Handle conflicts via RBF (same as normal add_transaction)
-        if !direct_conflicts.is_empty() {
+        if !rbf_conflicts.is_empty() {
             self.check_rbf_rules(
                 &tx,
-                self.modified_fee_of(&txid, fee),
+                modified_fee,
                 fee_rate,
                 vsize,
-                &direct_conflicts,
+                &rbf_conflicts,
                 &mempool_parents,
             )?;
 
             let mut all_to_remove = HashSet::new();
-            for conflict_txid in &direct_conflicts {
+            for conflict_txid in &rbf_conflicts {
                 all_to_remove.insert(*conflict_txid);
                 for desc in self.get_all_descendants(conflict_txid) {
                     all_to_remove.insert(desc);
@@ -8224,36 +8221,9 @@ impl Mempool {
                 // Captured now; removed only after script checks pass.
                 // Core applies the ChangeSet in FinalizeSubpackage, after
                 // PolicyScriptChecks and ConsensusScriptChecks.
+                // FIX-73: includes the TRUC sibling (validation.cpp:639 —
+                // m_replaced_transactions includes sibling-eviction targets).
                 replaced_txids.push(*txid_to_remove);
-            }
-        }
-
-        // Handle TRUC sibling eviction (package path).
-        if let Some(sibling_txid) = sibling_to_evict {
-            if let Some(sibling_entry) = self.transactions.get(&sibling_txid) {
-                // FIX-72: use GetModifiedFee — same rationale as the
-                // standard add_transaction TRUC sibling path above.
-                let sibling_fee = Self::get_modified_fee(sibling_entry);
-
-                if fee <= sibling_fee {
-                    return Err(MempoolError::RbfInsufficientAbsoluteFee(fee, sibling_fee));
-                }
-
-                // incremental_relay_fee is in sat/kvB; ceiling division matches Core.
-                let additional_fee = fee - sibling_fee;
-                let required_bandwidth_fee = (self.config.incremental_relay_fee * vsize as u64 + 999) / 1000;
-                if additional_fee < required_bandwidth_fee {
-                    return Err(MempoolError::RbfInsufficientBandwidthFee(
-                        additional_fee,
-                        required_bandwidth_fee,
-                    ));
-                }
-
-                // FIX-73: TRUC sibling counts as a replaced tx per Core
-                // (validation.cpp:639 — m_replaced_transactions includes
-                // sibling-eviction targets in addition to conflict-input txns).
-                // Removed only after script checks pass.
-                replaced_txids.push(sibling_txid);
             }
         }
 
@@ -8290,6 +8260,12 @@ impl Mempool {
                 new_cluster_weight,
                 MAX_CLUSTER_SIZE_WEIGHT,
             ));
+        }
+
+        // ImprovesFeerateDiagram after the cluster limits, as in Core's
+        // single-in-package ReplacementChecks (and the single-tx path).
+        if !rbf_conflicts.is_empty() {
+            self.check_rbf_diagram(txid, modified_fee, vsize, &rbf_conflicts, &mempool_parents)?;
         }
 
         // Ancestor data computed for entry bookkeeping only — not a gate.
@@ -12432,14 +12408,15 @@ mod tests {
         let child1 = make_tx(vec![(parent_txid, 0)], vec![30_000], TRUC_VERSION);
         mempool.add_transaction(child1, &|op| utxos.get(op).cloned()).unwrap();
 
-        // Second v3 child with same fee - sibling eviction is possible but fails due to equal fee
-        // This returns an RBF error because sibling eviction requires higher absolute fee
+        // Second v3 child with same fee - sibling eviction is possible but fails due to equal fee.
+        // The sibling goes through Core PaysForRBF like any conflict: an equal
+        // fee passes Rule 3 (only `replacement < original` fails) and then
+        // pays zero toward its own bandwidth, so Rule 4 rejects it.
         let child2 = make_tx(vec![(parent_txid, 1)], vec![30_000], TRUC_VERSION);
         let result = mempool.add_transaction(child2, &|op| utxos.get(op).cloned());
 
-        // When sibling eviction is possible but fee is insufficient, we get an RBF error
         assert!(
-            matches!(result, Err(MempoolError::RbfInsufficientAbsoluteFee(_, _))),
+            matches!(result, Err(MempoolError::RbfInsufficientBandwidthFee(0, _))),
             "Second v3 child with equal fee should fail sibling eviction, got: {:?}",
             result
         );
