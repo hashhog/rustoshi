@@ -145,6 +145,7 @@ fn truc_sibling_counts_in_rbf_fee_sum_package_path() {
     // ReplacementChecks with the sibling in the conflict set.
     let mut f = sibling_and_conflict();
     let n = child_with_conflict(f.parent, 10_500);
+    let n_txid = n.txid();
     let p = f.pool.get(&f.parent).expect("P").tx.clone();
     let utxos = f.utxos.clone();
     let res = f.pool.accept_package(vec![p, n], &|op: &OutPoint| utxos.get(op).cloned());
@@ -153,6 +154,12 @@ fn truc_sibling_counts_in_rbf_fee_sum_package_path() {
         res.package_error.is_some(),
         "package must fail: N underpays S + X, got {:?}",
         res.tx_results.iter().map(|r| (&r.txid, &r.error)).collect::<Vec<_>>()
+    );
+    let n_result = res.tx_results.iter().find(|r| r.txid == n_txid).expect("N result");
+    assert_eq!(
+        n_result.error.as_deref(),
+        Some("insufficient fee"),
+        "N must fail PaysForRBF, not some other check"
     );
     assert!(f.pool.contains(&f.sibling));
     assert!(f.pool.contains(&f.x));

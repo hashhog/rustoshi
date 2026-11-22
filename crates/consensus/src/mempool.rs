@@ -8189,12 +8189,15 @@ impl Mempool {
         let mut replaced_txids: Vec<Hash256> = Vec::new();
 
         // A sibling can only be found here when the tx's TRUC parent is
-        // already in the pool, i.e. the tx is the package's only new member
-        // (a new parent cannot have siblings, and two parents fail the TRUC
-        // ancestor limit). That is Core AcceptSubPackage of one tx ->
+        // already in the pool (a new parent cannot have siblings, and two
+        // parents fail the TRUC ancestor limit). When the tx is the package's
+        // only new member that is Core AcceptSubPackage of one tx ->
         // ATMPArgs::SingleInPackageAccept, which allows sibling eviction and
         // runs the full ReplacementChecks with the sibling in m_conflicts —
-        // the same set as the single-tx path above.
+        // the same set as the single-tx path above. (If it instead has a new
+        // child in the package, that child would have two TRUC ancestors
+        // and fails the TRUC ancestor limit, so the package fails as Core's
+        // no-sibling-eviction package evaluation does.)
         let rbf_conflicts = Self::with_sibling(&direct_conflicts, sibling_to_evict);
         let modified_fee = self.modified_fee_of(&txid, fee);
 
