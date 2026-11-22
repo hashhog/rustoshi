@@ -419,8 +419,11 @@ fn wide_cluster_linearize_is_bounded_and_valid() {
     let child_fees: Vec<i64> = (1..16).map(|i| 100 * i as i64).collect();
     let g = star_graph(100_000, &child_fees, 0, 0x57a2);
 
+    let t0 = std::time::Instant::now();
     let (chunks, allocs, visits) = cost_of(|| g.linearize());
-    eprintln!("wide-cluster linearize: {allocs} allocations, {visits} search visits");
+    let elapsed = t0.elapsed();
+    // Printed, not asserted: wall clock is not a stable bound on a shared box.
+    eprintln!("wide-cluster linearize: {allocs} allocations, {visits} search visits, {elapsed:?}");
     assert!(allocs <= ALLOC_BUDGET, "wide-cluster linearize cost {allocs} allocations (budget {ALLOC_BUDGET})");
     assert!(visits > 75_000, "this shape must need more than a 75,000-visit budget; got {visits}");
     assert!(visits <= WIDE_VISIT_BOUND, "wide-cluster linearize cost {visits} visits (bound {WIDE_VISIT_BOUND})");
