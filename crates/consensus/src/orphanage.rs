@@ -136,8 +136,14 @@ pub struct TxOrphanage {
     /// Per-peer wtxid set, used for the per-peer cap and `erase_for_peer`.
     by_peer: HashMap<u64, HashSet<Hash256>>,
     /// FIFO queue of wtxids in insertion order; used by the eviction policy.
-    /// Stale entries (wtxids no longer in `by_wtxid`) are skipped lazily.
-    fifo: VecDeque<Hash256>,
+    /// Stale entries (wtxids no longer in `by_wtxid`) are skipped lazily and
+    /// compacted away in `add`, so the length stays at most
+    /// `2 * MAX_ORPHAN_TRANSACTIONS + 1`.
+    ///
+    /// Each entry carries the `seq` it was inserted with, so an entry left
+    /// behind by an erase is recognised as stale even if the same wtxid was
+    /// added again later.
+    fifo: VecDeque<(Hash256, u64)>,
     /// Insertion-order counter; assigned to `OrphanEntry::seq` and
     /// monotonically increases across the orphanage's lifetime.
     next_seq: u64,
@@ -266,7 +272,8 @@ impl TxOrphanage {
             .entry(from_peer)
             .or_default()
             .insert(wtxid);
-        self.fifo.push_back(wtxid);
+        self.compact_fifo_if_needed();
+        self.fifo.push_back((wtxid, seq));
 
         Ok(())
     }
@@ -289,7 +296,7 @@ impl TxOrphanage {
             }
         }
         // We don't proactively scan `fifo` — stale entries are skipped on
-        // pop in `evict_oldest`.
+        // pop in `evict_oldest` and dropped by `compact_fifo_if_needed`.
         Some(entry)
     }
 
@@ -382,15 +389,51 @@ impl TxOrphanage {
         out
     }
 
+    /// Number of entries in the eviction FIFO, live and stale.
+    ///
+    /// Exposed for the bound test (`tests/test_cffix_orphanage_fifo.rs`);
+    /// not part of the orphanage's API.
+    #[doc(hidden)]
+    pub fn fifo_len(&self) -> usize {
+        self.fifo.len()
+    }
+
+    /// Drop stale FIFO entries once they could outnumber the live ones.
+    ///
+    /// `erase`, `erase_for_peer` and `expire_orphans` leave their wtxids in
+    /// `fifo` (removing from the middle of a `VecDeque` is O(n)), and the
+    /// only pop is in `evict_oldest`, which runs only at the global cap.
+    /// Without this, a peer that keeps the live count under the cap (add,
+    /// disconnect, repeat) grows `fifo` by one hash per orphan ever added.
+    /// Core keeps every index in step on each erase
+    /// (`TxOrphanageImpl::EraseTxInternal` / `EraseForPeer`), so its
+    /// `LimitOrphans` never sees stale entries.
+    ///
+    /// `add` is the only place `fifo` grows, so compacting here before each
+    /// push bounds it at `2 * MAX_ORPHAN_TRANSACTIONS + 1`.  A compaction
+    /// keeps only entries whose `seq` matches a live orphan (one per live
+    /// orphan, so at most `len() <= MAX_ORPHAN_TRANSACTIONS`) and so runs
+    /// at most once per `MAX_ORPHAN_TRANSACTIONS` pushes; its O(n) `retain`
+    /// is amortised O(1) per add.  `retain` keeps insertion order, so
+    /// `evict_oldest` still evicts the oldest live orphan.
+    fn compact_fifo_if_needed(&mut self) {
+        if self.fifo.len() >= 2 * MAX_ORPHAN_TRANSACTIONS {
+            let live = &self.by_wtxid;
+            self.fifo
+                .retain(|(w, seq)| live.get(w).is_some_and(|e| e.seq == *seq));
+        }
+    }
+
     /// Drop the oldest orphan in FIFO order.  Called when the global cap is
     /// reached.  Returns `true` if something was evicted.
     fn evict_oldest(&mut self) -> bool {
-        while let Some(wtxid) = self.fifo.pop_front() {
-            if self.by_wtxid.contains_key(&wtxid) {
+        while let Some((wtxid, seq)) = self.fifo.pop_front() {
+            if self.by_wtxid.get(&wtxid).is_some_and(|e| e.seq == seq) {
                 self.erase(&wtxid);
                 return true;
             }
-            // else: stale FIFO entry from a prior `erase`; keep popping.
+            // else: stale FIFO entry from a prior `erase` (the wtxid is gone,
+            // or was re-added later under a newer seq); keep popping.
         }
         false
     }
