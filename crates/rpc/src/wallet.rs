@@ -1159,6 +1159,10 @@ pub trait WalletRpc {
     /// Errors:
     /// - `-5` (RPC_WALLET_INVALID_ADDRESS_OR_KEY) if `seed` is missing or not
     ///   exactly 64 bytes of valid hex.
+    /// - `-13` (RPC_WALLET_UNLOCK_NEEDED) if the wallet is encrypted and
+    ///   locked. An unlocked encrypted wallet stays encrypted (the new seed is
+    ///   written under the same passphrase) and the previous seed file is
+    ///   archived, never destroyed.
     /// - `-4` (RPC_WALLET_ERROR) on any wallet/persistence failure.
     #[method(name = "sethdseed")]
     async fn set_hd_seed(
@@ -3940,6 +3944,9 @@ impl WalletRpcServer for WalletRpcImpl {
 
         // Resolve the target wallet name (URL-pinned, or the single default).
         let (name, _wallet) = self.resolve_wallet(&state)?;
+
+        // Core's legacy sethdseed: EnsureWalletIsUnlocked → -13 when locked.
+        Self::require_unlocked(&state, &name)?;
 
         state
             .wallet_manager
