@@ -725,11 +725,16 @@ impl DepGraph {
     /// branch dead-ends. Exclude is tried first, so complete sets come out
     /// in increasing mask order -- the order of the exhaustive 2^n scan this
     /// replaced -- and the result is identical to that scan. The cost is
-    /// bounded by the shape alone: a chain of 16 has 17 closed sets, and the
-    /// widest 16-transaction cluster (one parent, 15 children) costs about
-    /// 230,000 visits for the whole linearization, each a few word
-    /// operations with no allocation, where the 2^n scan built a `HashSet`
-    /// for every one of 2^16 + 2^15 + ... masks.
+    /// bounded without a counter: a round with m <= 16 remaining walks a
+    /// binary tree of depth m, at most 2^(m+1) - 1 visits, rounds with more
+    /// than 16 remaining make none, and every round removes at least one
+    /// transaction. So one linearization makes at most
+    /// sum_{m=1..16} (2^(m+1) - 1) = 262,124 visits, each a few word
+    /// operations with no allocation. A parent whose feerate beats its 16+
+    /// children reaches that (the heuristic peels the parent, leaving a
+    /// 16-wide antichain); a chain of 16 has only 17 closed sets. The 2^n
+    /// scan this replaced built a `HashSet` for every one of 2^16 + 2^15 + ...
+    /// masks.
     fn find_best_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
         let best_chunk = self.find_best_ancestor_chunk(remaining);
         if remaining.len() > 16 || best_chunk.is_empty() {

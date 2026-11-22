@@ -359,10 +359,12 @@ fn bounded_chunk_search_matches_exhaustive_scan() {
     assert_eq!(cases, 12 * 4 * 6);
 }
 
-/// Upper bound on chunk-search visits for one linearize() of any cluster:
-/// exact search runs only while at most 16 transactions remain, and the
-/// widest such cluster (one parent, 15 children) measures 229,357 visits.
-const WIDE_VISIT_BOUND: u64 = 240_000;
+/// Upper bound on chunk-search visits for one linearize() of any cluster.
+/// Exact search runs only while at most 16 transactions remain; a round
+/// with m remaining walks a binary tree of depth m (at most 2^(m+1) - 1
+/// visits) and removes at least one transaction, so the total is at most
+/// sum_{m=1..16} (2^(m+1) - 1) = 2^18 - 4 - 16.
+const WIDE_VISIT_BOUND: u64 = (1 << 18) - 4 - 16;
 
 /// One parent and 15 children; `parent_at` is the parent's index, the
 /// children take the other indices in increasing order of `child_fees`.
@@ -408,10 +410,10 @@ fn assert_topological(g: &DepGraph, chunks: &[rustoshi_consensus::mempool::Chunk
 
 /// A wide cluster -- one parent and 15 children -- has 2^15 + 1 ancestor-closed
 /// subsets, and after the parent's chunk the 15 children are an antichain, so
-/// the closed-set search visits 2^16 + 2^15 + ... subsets in all: more than
-/// Core's 75,000 cost figure. It must still finish (a search cut short keeps
-/// an index-order-dependent set) and return the exhaustive scan's answer,
-/// within the shape's worst-case bound.
+/// the closed-set search visits 2^16 + 2^15 + ... subsets in all (229,357):
+/// more than Core's 75,000 cost figure. It must still finish (a search cut
+/// short keeps an index-order-dependent set) and return the exhaustive
+/// scan's answer, within the any-cluster bound.
 #[test]
 fn wide_cluster_linearize_is_bounded_and_valid() {
     // The parent pays the highest feerate, so it is a chunk by itself and the
@@ -427,6 +429,27 @@ fn wide_cluster_linearize_is_bounded_and_valid() {
     assert!(allocs <= ALLOC_BUDGET, "wide-cluster linearize cost {allocs} allocations (budget {ALLOC_BUDGET})");
     assert!(visits > 75_000, "this shape must need more than a 75,000-visit budget; got {visits}");
     assert!(visits <= WIDE_VISIT_BOUND, "wide-cluster linearize cost {visits} visits (bound {WIDE_VISIT_BOUND})");
+    assert_topological(&g, &chunks);
+    let got = sorted_chunks(chunks.into_iter().map(|c| (c.txids, c.feefrac)).collect());
+    assert_eq!(got, sorted_chunks(reference_linearize(&g)));
+}
+
+/// The worst case of [`WIDE_VISIT_BOUND`] is reached, not just bounded: one
+/// parent paying the top feerate and 16 children. Seventeen transactions is
+/// past the exact-search limit, so the heuristic peels the parent for free;
+/// the 16 children left are an antichain, so every later round walks the
+/// full tree. The linearization must still equal the exhaustive scan.
+#[test]
+fn wide_cluster_worst_case_hits_the_visit_bound_exactly() {
+    assert_eq!(WIDE_VISIT_BOUND, 262_124);
+    let child_fees: Vec<i64> = (1..17).map(|i| 100 * i as i64).collect();
+    let g = star_graph(100_000, &child_fees, 0, 0x57a3);
+    let t0 = std::time::Instant::now();
+    let (chunks, allocs, visits) = cost_of(|| g.linearize());
+    let elapsed = t0.elapsed();
+    eprintln!("17-tx star linearize: {allocs} allocations, {visits} search visits, {elapsed:?}");
+    assert!(allocs <= ALLOC_BUDGET, "17-tx star linearize cost {allocs} allocations (budget {ALLOC_BUDGET})");
+    assert_eq!(visits, WIDE_VISIT_BOUND, "the 17-tx star is the shape that reaches the bound");
     assert_topological(&g, &chunks);
     let got = sorted_chunks(chunks.into_iter().map(|c| (c.txids, c.feefrac)).collect());
     assert_eq!(got, sorted_chunks(reference_linearize(&g)));
