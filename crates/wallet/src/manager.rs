@@ -451,14 +451,16 @@ impl WalletManager {
             // than silently diverging. Honor the passphrase even for blank
             // wallets so the encrypted-state flag survives a reload.
             persist_seed(&wallet_dir, &seed, passphrase)?;
-            let wallet = Wallet::from_seed(&seed, self.network, AddressType::P2WPKH)?;
-            let state = if want_encryption {
-                // Encrypted blank wallet starts locked.
-                WalletLockState::locked()
+            if want_encryption {
+                // Encrypted blank wallet starts locked, so it gets the same
+                // key-less placeholder as any other locked wallet.
+                let wallet =
+                    Wallet::locked_placeholder(self.network, AddressType::P2WPKH, 0, 0)?;
+                (wallet, WalletLockState::locked())
             } else {
-                WalletLockState::unencrypted()
-            };
-            (wallet, state)
+                let wallet = Wallet::from_seed(&seed, self.network, AddressType::P2WPKH)?;
+                (wallet, WalletLockState::unencrypted())
+            }
         } else {
             // Generate a random seed and persist it BEFORE constructing the
             // wallet so that a later `loadwallet` reproduces the same key
@@ -695,15 +697,18 @@ impl WalletManager {
             }
             LoadedSeed::Encrypted(_file) => {
                 // Construct a placeholder wallet so getbalance / listunspent
-                // (which don't need private keys) keep working. Signing
-                // operations gate on the lock state separately.
-                let placeholder_seed = [0u8; SEED_LEN];
-                let mut w = Wallet::from_seed(
-                    &placeholder_seed,
+                // (which don't need private keys) keep working. It has no HD
+                // master: address minting, the HD ownership lookahead and
+                // key derivation refuse with WalletLocked until
+                // walletpassphrase swaps the real wallet in. (It used to be a
+                // plain zero-seed wallet that handed out the public seed's
+                // addresses.)
+                let w = Wallet::locked_placeholder(
                     meta.network,
                     meta.address_type,
+                    meta.next_receive_index,
+                    meta.next_change_index,
                 )?;
-                w.restore_indices(meta.next_receive_index, meta.next_change_index);
                 // Note: the parsed encrypted file is dropped here. On unlock,
                 // we re-read it from disk; this avoids holding the ciphertext
                 // in memory longer than necessary and means a tampered file
@@ -1426,9 +1431,9 @@ impl WalletManager {
             )
         };
 
-        let mut placeholder =
-            Wallet::from_seed(&[0u8; SEED_LEN], network, address_type)?;
-        placeholder.restore_indices(recv_idx, change_idx);
+        // No HD master while locked: see `Wallet::locked_placeholder`.
+        let placeholder =
+            Wallet::locked_placeholder(network, address_type, recv_idx, change_idx)?;
 
         {
             let mut guard = wallet_arc
@@ -1966,16 +1971,18 @@ mod tests {
         assert!(state.encrypted);
         assert!(!state.unlocked);
 
-        // The placeholder wallet's peek_address differs from the real one
-        // (because it was constructed from a zero seed).
-        let placeholder_addr = {
+        // The locked placeholder has no HD master: it must refuse to derive
+        // rather than answer with the public zero seed's address (which this
+        // test used to assert it did).
+        let placeholder_peek = {
             let arc = manager.get_wallet("enc-load").unwrap();
             let w = arc.lock().unwrap();
-            w.peek_address().unwrap()
+            w.peek_address()
         };
-        assert_ne!(
-            placeholder_addr, addr_pre_unload,
-            "locked wallet should expose a placeholder, not the real seed's address"
+        assert!(
+            matches!(placeholder_peek, Err(WalletError::WalletLocked)),
+            "locked wallet must not derive any address, got {placeholder_peek:?} \
+             (real index-0 address is {addr_pre_unload})"
         );
 
         // Signing path gate should refuse.

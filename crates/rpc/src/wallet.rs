@@ -1841,6 +1841,20 @@ impl WalletRpcImpl {
         })
     }
 
+    /// Map an address-derivation failure to an RPC error. A locked
+    /// encrypted wallet has no HD master to derive from (its in-memory
+    /// stand-in refuses with `WalletLocked`), which is Core's
+    /// RPC_WALLET_UNLOCK_NEEDED (-13); anything else stays -4.
+    fn address_derivation_err(e: rustoshi_wallet::WalletError) -> ErrorObjectOwned {
+        match e {
+            rustoshi_wallet::WalletError::WalletLocked => Self::rpc_error(
+                wallet_error::RPC_WALLET_UNLOCK_NEEDED,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
+            ),
+            other => Self::rpc_error(wallet_error::RPC_WALLET_ERROR, other.to_string()),
+        }
+    }
+
     /// FIX-61: parse a txid (hex display-order, 32 bytes) and return the
     /// internal-order `Hash256`. Mirrors how `gettransaction` / `bumpfee`
     /// expect the txid argument.
@@ -2542,7 +2556,7 @@ impl WalletRpcServer for WalletRpcImpl {
                 }
             },
         }
-        .map_err(|e| Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string()))?;
+        .map_err(Self::address_derivation_err)?;
 
         Ok(address)
     }
@@ -4334,9 +4348,9 @@ impl WalletRpcServer for WalletRpcImpl {
                         let mut wallet_guard = wallet.lock().map_err(|_| {
                             Self::rpc_error(wallet_error::RPC_WALLET_ERROR, "Failed to lock wallet")
                         })?;
-                        wallet_guard.get_change_address().map_err(|e| {
-                            Self::rpc_error(wallet_error::RPC_WALLET_ERROR, e.to_string())
-                        })?
+                        wallet_guard
+                            .get_change_address()
+                            .map_err(Self::address_derivation_err)?
                     };
                     let change_addr =
                         Address::from_string(&change_addr_str, net_param).map_err(|e| {
