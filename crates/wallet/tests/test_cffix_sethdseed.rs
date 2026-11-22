@@ -21,7 +21,8 @@
 
 use rustoshi_crypto::address::Network;
 use rustoshi_wallet::{
-    AddressType, CreateWalletOptions, Wallet, WalletError, WalletManager, ENCRYPTED_FILE_LEN,
+    decrypt_seed, parse_seed_file, AddressType, CreateWalletOptions, ParsedSeedFile, Wallet,
+    WalletError, WalletManager, ENCRYPTED_FILE_LEN,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -297,4 +298,92 @@ fn sethdseed_unencrypted_wallet_still_plaintext() {
     assert!(!ls.encrypted && ls.unlocked);
     assert_eq!(peek(&mgr, "w"), expected_first_address(&NEW_SEED));
     assert_eq!(archived_seed_files(dir.path(), "w"), vec![old]);
+}
+
+/// Open an archived (or live) seed file with `passphrase`.
+fn open_seed_file(bytes: &[u8], passphrase: &str) -> Option<[u8; 64]> {
+    match parse_seed_file(bytes).unwrap() {
+        ParsedSeedFile::PlaintextV1(_) => None,
+        ParsedSeedFile::EncryptedV2(f) => decrypt_seed(&f, passphrase).ok(),
+    }
+}
+
+/// The archive files must not break re-running backupwallet to the same
+/// destination (an earlier backup is recognised by its file names).
+#[test]
+fn sethdseed_archive_does_not_break_repeat_backup() {
+    let dir = TempDir::new().unwrap();
+    let mut mgr = encrypted_wallet(&dir, "w");
+    mgr.set_hd_seed("w", &NEW_SEED).unwrap();
+
+    let dest = dir.path().join("w.bak");
+    let d = dest.to_string_lossy().into_owned();
+    mgr.backup_wallet("w", &d).expect("first backup");
+    mgr.backup_wallet("w", &d)
+        .expect("second backup over the first");
+    let n = std::fs::read_dir(&dest)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wallet_seed.bin.replaced-")
+        })
+        .count();
+    assert_eq!(n, 1, "the archived seed is part of the backup");
+}
+
+/// An unencrypted wallet's archived seed is plaintext; encryptwallet must
+/// encrypt it too, or the old seed stays readable at rest after the RPC says
+/// the wallet is encrypted.
+#[test]
+fn encryptwallet_after_sethdseed_encrypts_archived_seed() {
+    let dir = TempDir::new().unwrap();
+    let mut mgr = WalletManager::new(dir.path(), Network::Regtest).unwrap();
+    mgr.create_wallet("w", CreateWalletOptions::default())
+        .unwrap();
+    let old = std::fs::read(seed_path(dir.path(), "w")).unwrap();
+    assert_eq!(old.len(), 64);
+    mgr.set_hd_seed("w", &NEW_SEED).unwrap();
+
+    mgr.encrypt_wallet("w", PASS).unwrap();
+    let archived = archived_seed_files(dir.path(), "w");
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        archived[0].len(),
+        ENCRYPTED_FILE_LEN,
+        "archived seed must be encrypted by encryptwallet"
+    );
+    assert!(!archived[0].windows(64).any(|w| w == &old[..]));
+    assert_eq!(
+        open_seed_file(&archived[0], PASS).map(|s| s.to_vec()),
+        Some(old),
+        "the wallet passphrase opens the archived old seed"
+    );
+}
+
+/// walletpassphrasechange must re-wrap archived seeds: afterwards the old
+/// passphrase opens nothing, the new one opens the archive.
+#[test]
+fn passphrase_change_rewraps_archived_seeds() {
+    let dir = TempDir::new().unwrap();
+    let mut mgr = encrypted_wallet(&dir, "w");
+    let old_live = std::fs::read(seed_path(dir.path(), "w")).unwrap();
+    let old_seed = open_seed_file(&old_live, PASS).unwrap();
+    mgr.set_hd_seed("w", &NEW_SEED).unwrap();
+
+    mgr.change_wallet_passphrase("w", PASS, "second passphrase")
+        .unwrap();
+    let archived = archived_seed_files(dir.path(), "w");
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        open_seed_file(&archived[0], PASS),
+        None,
+        "old passphrase opens nothing"
+    );
+    assert_eq!(
+        open_seed_file(&archived[0], "second passphrase"),
+        Some(old_seed)
+    );
 }

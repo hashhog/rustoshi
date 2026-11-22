@@ -20,6 +20,7 @@ use crate::encryption::{
 };
 use crate::hd::WalletError;
 use crate::wallet::{AddressType, Wallet};
+use zeroize::Zeroize;
 use rustoshi_crypto::address::Network;
 use serde::{Deserialize, Serialize};
 
@@ -56,9 +57,9 @@ fn earlier_backup_files(dest: &Path) -> Option<Vec<PathBuf>> {
     for entry in fs::read_dir(dest).ok()? {
         let entry = entry.ok()?;
         let name = entry.file_name();
-        if !entry.file_type().ok()?.is_file()
-            || !WALLET_FILE_NAMES.iter().any(|n| name.as_os_str() == *n)
-        {
+        let known = WALLET_FILE_NAMES.iter().any(|n| name.as_os_str() == *n)
+            || name.to_str().map_or(false, is_replaced_seed_name);
+        if !entry.file_type().ok()?.is_file() || !known {
             return None;
         }
         files.push(entry.path());
@@ -215,6 +216,86 @@ fn archive_seed_file(wallet_dir: &Path) -> Result<(), WalletError> {
         n += 1;
     };
     write_private_file_atomic(wallet_dir, &file_name, &bytes)
+}
+
+/// True for a file name [`archive_seed_file`] produces:
+/// `wallet_seed.bin.replaced-<digits>[-<digits>]` (not its `.tmp`).
+fn is_replaced_seed_name(name: &str) -> bool {
+    match name.strip_prefix(REPLACED_SEED_PREFIX) {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest.chars().all(|c| c.is_ascii_digit() || c == '-')
+                && rest.chars().next().map_or(false, |c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// The archived seed files in `wallet_dir`, sorted by name.
+fn archived_seed_paths(wallet_dir: &Path) -> Result<Vec<PathBuf>, WalletError> {
+    let mut out = Vec::new();
+    if !wallet_dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(wallet_dir).map_err(WalletError::Io)? {
+        let entry = entry.map_err(WalletError::Io)?;
+        if entry.file_type().map_err(WalletError::Io)?.is_file()
+            && entry.file_name().to_str().map_or(false, is_replaced_seed_name)
+        {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Re-encrypt every archived seed under `new_key`, so archives always share
+/// the live seed's protection (Core's EncryptWallet / ChangeWalletPassphrase
+/// cover every key the wallet holds, old HD keys included).
+///
+/// A plaintext archive is encrypted. An encrypted archive is decrypted with
+/// the first of `old_passphrases` that opens it. All new payloads are built
+/// before anything is written, so an archive no passphrase opens aborts
+/// with nothing changed.
+fn rewrap_archived_seeds(
+    wallet_dir: &Path,
+    old_passphrases: &[&str],
+    new_key: &SeedKey,
+) -> Result<(), WalletError> {
+    let mut rewritten: Vec<(String, Vec<u8>)> = Vec::new();
+    for path in archived_seed_paths(wallet_dir)? {
+        let bytes = fs::read(&path).map_err(WalletError::Io)?;
+        let mut seed = match parse_seed_file(&bytes).map_err(WalletError::from)? {
+            ParsedSeedFile::PlaintextV1(seed) => seed,
+            ParsedSeedFile::EncryptedV2(file) => {
+                let mut opened = None;
+                for pw in old_passphrases {
+                    if let Ok(seed) = decrypt_seed(&file, pw) {
+                        opened = Some(seed);
+                        break;
+                    }
+                }
+                opened.ok_or_else(|| {
+                    WalletError::EncryptionState(format!(
+                        "archived seed {} does not open with the wallet passphrase",
+                        path.display()
+                    ))
+                })?
+            }
+        };
+        let payload = encrypt_seed_with_key(&seed, new_key).map_err(WalletError::from);
+        seed.zeroize();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| WalletError::InvalidPath(path.display().to_string()))?;
+        rewritten.push((name, payload?));
+    }
+    for (name, payload) in rewritten {
+        write_private_file_atomic(wallet_dir, &name, &payload)?;
+    }
+    Ok(())
 }
 
 /// Outcome of [`load_seed`]: the seed itself if the wallet is unencrypted
@@ -1613,6 +1694,9 @@ impl WalletManager {
         // a rerun will retry the encryption.
         let key = SeedKey::generate(passphrase, DEFAULT_KDF_ITERATIONS).map_err(WalletError::from)?;
         let payload = encrypt_seed_with_key(&seed, &key).map_err(WalletError::from)?;
+        // Seeds archived by sethdseed are encrypted too, before the live
+        // seed, so a failure here leaves the wallet unencrypted and retryable.
+        rewrap_archived_seeds(&wallet_dir, &[], &key)?;
         write_seed_payload(&wallet_dir, &payload)?;
         self.session_keys.insert(name.to_string(), key);
 
@@ -1679,6 +1763,10 @@ impl WalletManager {
         let key = SeedKey::generate(new_passphrase, DEFAULT_KDF_ITERATIONS)
             .map_err(WalletError::from)?;
         let payload = encrypt_seed_with_key(&seed, &key).map_err(WalletError::from)?;
+        // Re-wrap archived seeds under the new passphrase first (the new one
+        // is also tried, so a retry after a partial failure still works), then
+        // the live seed: afterwards the old passphrase opens nothing.
+        rewrap_archived_seeds(&wallet_dir, &[old_passphrase, new_passphrase], &key)?;
         write_seed_payload(&wallet_dir, &payload)?;
 
         // A held unlock key now belongs to the old passphrase; replace it so a
