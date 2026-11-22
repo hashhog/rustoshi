@@ -4010,19 +4010,26 @@ impl Mempool {
             // Check if the parent already has a child
             let parent_txid = *mempool_parents.iter().next().unwrap();
             if let Some(parent_entry) = self.transactions.get(&parent_txid) {
-                if parent_entry.descendant_count >= TRUC_DESCENDANT_LIMIT {
+                // Core SingleTRUCChecks `child_will_be_replaced`: don't
+                // double-count a descendant of the parent that this tx directly
+                // conflicts with. It is replaced under the RBF rules, so the
+                // descendant limit is not exceeded and no sibling eviction is
+                // considered. Without this a same-input replacement of a TRUC
+                // child could never pass (anchor pinning).
+                let child_will_be_replaced = self
+                    .get_descendants_of(&parent_txid)
+                    .iter()
+                    .any(|d| direct_conflicts.contains(d));
+                if parent_entry.descendant_count >= TRUC_DESCENDANT_LIMIT
+                    && !child_will_be_replaced
+                {
                     // Parent already has max descendants
                     // Check if sibling eviction is possible (Rule 6)
                     if let Some(siblings) = self.children.get(&parent_txid) {
                         // Find the existing child
                         for sibling_txid in siblings {
-                            // Don't consider ourselves (we're not in mempool yet)
-                            // Check if this sibling is a direct conflict (will be replaced anyway)
-                            if direct_conflicts.contains(sibling_txid) {
-                                // This sibling is already being replaced via normal RBF
-                                continue;
-                            }
-
+                            // No sibling is a direct conflict here: that case
+                            // is `child_will_be_replaced` above.
                             // Check if sibling eviction is possible
                             // Sibling must be a direct child (ancestor count == 2)
                             // and have no descendants of its own
