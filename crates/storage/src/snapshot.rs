@@ -1238,13 +1238,24 @@ fn read_compressed_script<R: Read>(reader: &mut R) -> Result<Vec<u8>, SnapshotEr
         return decompress_special_script(n_size, &payload);
     }
     // Generic form: real script bytes follow.
-    let raw_size = (n_size - N_SPECIAL_SCRIPTS) as usize;
-    if raw_size > MAX_SCRIPT_SIZE {
-        // Mirror Core's "overly long script, replace with OP_RETURN" sentinel.
-        let mut waste = vec![0u8; raw_size];
-        reader.read_exact(&mut waste)?;
+    let raw_size = n_size - N_SPECIAL_SCRIPTS;
+    if raw_size > MAX_SCRIPT_SIZE as u64 {
+        // Mirror Core's "overly long script, replace with OP_RETURN" sentinel
+        // (compressor.h ScriptCompression::Unser: `s.ignore(nSize)`).
+        // `raw_size` is an unbounded VARINT from an unauthenticated snapshot
+        // (read before the hash_serialized gate), so discard the bytes by
+        // streaming them into a sink: never size a buffer from it, and treat
+        // a short stream as an error like Core's ignore() does.
+        let skipped = io::copy(&mut reader.by_ref().take(raw_size), &mut io::sink())?;
+        if skipped != raw_size {
+            return Err(SnapshotError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("over-long script: expected {raw_size} bytes, stream ended after {skipped}"),
+            )));
+        }
         return Ok(vec![0x6a]); // OP_RETURN
     }
+    let raw_size = raw_size as usize;
     let mut script = vec![0u8; raw_size];
     reader.read_exact(&mut script)?;
     Ok(script)
