@@ -75,8 +75,8 @@ const RBF_SEQ: u32 = 0xFFFF_FFFD;
 const IN_VALUE: u64 = 1_000_000;
 
 /// Upper bound on heap allocations, and on chunk-search visits, for one
-/// rejected submission and for one linearize() call. Core's ACCEPTABLE_COST
-/// figure. The pre-fix search makes ~131,000 allocations here (one per mask).
+/// rejected submission against the 17-tx chain, and on allocations for one
+/// linearize() call. Core's ACCEPTABLE_COST figure. The pre-fix search makes ~131,000 allocations here (one per mask).
 const ALLOC_BUDGET: u64 = 75_000;
 const VISIT_BUDGET: u64 = 75_000;
 /// 17 txs: at most n chunks, each search visiting O(n) prefixes over n
@@ -209,9 +209,8 @@ fn rbf_diagram_cost_is_bounded() {
 }
 
 // ---------------------------------------------------------------------------
-// Diagram results are unchanged: the bounded search returns the same
-// linearization as the exhaustive 2^n mask scan it replaced, on every graph
-// small enough to finish inside the budget.
+// Diagram results are unchanged: the closed-set search returns the same
+// linearization as the exhaustive 2^n mask scan it replaced.
 // ---------------------------------------------------------------------------
 
 fn h(i: usize, salt: u64) -> Hash256 {
@@ -360,38 +359,43 @@ fn bounded_chunk_search_matches_exhaustive_scan() {
     assert_eq!(cases, 12 * 4 * 6);
 }
 
-/// A wide cluster -- one parent and 15 children -- has 2^15 + 1 ancestor-closed
-/// subsets, so even a search that visits only closed sets would spend ~2^16
-/// subset visits per chunk. The per-linearize budget caps it, and the fallback still
-/// returns a complete, topologically valid linearization.
-#[test]
-fn wide_cluster_linearize_is_bounded_and_valid() {
-    let n = 16usize;
+/// Upper bound on chunk-search visits for one linearize() of any cluster:
+/// exact search runs only while at most 16 transactions remain, and the
+/// widest such cluster (one parent, 15 children) measures 229,357 visits.
+const WIDE_VISIT_BOUND: u64 = 240_000;
+
+/// One parent and 15 children; `parent_at` is the parent's index, the
+/// children take the other indices in increasing order of `child_fees`.
+fn star_graph(parent_fee: i64, child_fees: &[i64], parent_at: usize, salt: u64) -> DepGraph {
+    let n = child_fees.len() + 1;
+    let children: Vec<usize> = (0..n).filter(|&i| i != parent_at).collect();
     let mut ancestors: Vec<HashSet<usize>> = (0..n).map(|i| std::iter::once(i).collect()).collect();
-    for anc in ancestors.iter_mut().skip(1) {
-        anc.insert(0);
-    }
     let mut descendants: Vec<HashSet<usize>> = (0..n).map(|i| std::iter::once(i).collect()).collect();
-    descendants[0].extend(1..n);
-    let idx_to_txid: Vec<Hash256> = (0..n).map(|i| h(i, 0x57a2)).collect();
-    let txid_to_idx: HashMap<Hash256, usize> = idx_to_txid.iter().enumerate().map(|(i, t)| (*t, i)).collect();
-    // The parent pays the highest feerate, so it is a chunk by itself and the
-    // 15 children are left as an antichain for the next rounds: the
-    // exhaustive scan then pays 2^16 + 2^15 + ... masks.
-    let feerates: Vec<FeeFrac> = (0..n)
-        .map(|i| if i == 0 { FeeFrac { fee: 100_000, size: 100 } } else { FeeFrac { fee: 100 * i as i64, size: 100 } })
-        .collect();
-    let g = DepGraph { txid_to_idx: txid_to_idx.clone(), idx_to_txid, feerates, ancestors, descendants };
+    let mut feerates = vec![FeeFrac::default(); n];
+    feerates[parent_at] = FeeFrac { fee: parent_fee, size: 100 };
+    for (k, &c) in children.iter().enumerate() {
+        ancestors[c].insert(parent_at);
+        descendants[parent_at].insert(c);
+        feerates[c] = FeeFrac { fee: child_fees[k], size: 100 };
+    }
+    let idx_to_txid: Vec<Hash256> = (0..n).map(|i| h(i, salt)).collect();
+    let txid_to_idx = idx_to_txid.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+    DepGraph { txid_to_idx, idx_to_txid, feerates, ancestors, descendants }
+}
 
-    let (chunks, allocs, visits) = cost_of(|| g.linearize());
-    eprintln!("wide-cluster linearize: {allocs} allocations, {visits} search visits");
-    assert!(allocs <= ALLOC_BUDGET, "wide-cluster linearize cost {allocs} allocations (budget {ALLOC_BUDGET})");
-    // Pruning to closed sets alone would visit ~2^16 + 2^15 + ... here; only
-    // the per-call budget stops the search, and it stops it exactly there.
-    assert_eq!(visits, VISIT_BUDGET, "wide-cluster linearize must stop at the search budget");
+fn sorted_chunks(v: Vec<(Vec<Hash256>, FeeFrac)>) -> Vec<(Vec<Hash256>, FeeFrac)> {
+    v.into_iter()
+        .map(|(mut t, f)| {
+            t.sort();
+            (t, f)
+        })
+        .collect()
+}
 
-    // Every tx exactly once; no tx before any of its ancestors.
-    let order: Vec<usize> = chunks.iter().flat_map(|c| c.txids.iter().map(|t| txid_to_idx[t])).collect();
+/// Every tx exactly once; no tx before any of its ancestors.
+fn assert_topological(g: &DepGraph, chunks: &[rustoshi_consensus::mempool::Chunk]) {
+    let n = g.idx_to_txid.len();
+    let order: Vec<usize> = chunks.iter().flat_map(|c| c.txids.iter().map(|t| g.txid_to_idx[t])).collect();
     let mut seen = HashSet::new();
     for &i in &order {
         assert!(g.ancestors[i].iter().all(|a| *a == i || seen.contains(a)), "tx {i} placed before an ancestor");
@@ -400,4 +404,87 @@ fn wide_cluster_linearize_is_bounded_and_valid() {
     assert_eq!(seen.len(), n);
     let total = chunks.iter().fold(FeeFrac::default(), |acc, c| acc + c.feefrac);
     assert_eq!(total, g.set_feefrac(&(0..n).collect()));
+}
+
+/// A wide cluster -- one parent and 15 children -- has 2^15 + 1 ancestor-closed
+/// subsets, and after the parent's chunk the 15 children are an antichain, so
+/// the closed-set search visits 2^16 + 2^15 + ... subsets in all: more than
+/// Core's 75,000 cost figure. It must still finish (a search cut short keeps
+/// an index-order-dependent set) and return the exhaustive scan's answer,
+/// within the shape's worst-case bound.
+#[test]
+fn wide_cluster_linearize_is_bounded_and_valid() {
+    // The parent pays the highest feerate, so it is a chunk by itself and the
+    // 15 children are left as an antichain for the next rounds.
+    let child_fees: Vec<i64> = (1..16).map(|i| 100 * i as i64).collect();
+    let g = star_graph(100_000, &child_fees, 0, 0x57a2);
+
+    let (chunks, allocs, visits) = cost_of(|| g.linearize());
+    eprintln!("wide-cluster linearize: {allocs} allocations, {visits} search visits");
+    assert!(allocs <= ALLOC_BUDGET, "wide-cluster linearize cost {allocs} allocations (budget {ALLOC_BUDGET})");
+    assert!(visits > 75_000, "this shape must need more than a 75,000-visit budget; got {visits}");
+    assert!(visits <= WIDE_VISIT_BOUND, "wide-cluster linearize cost {visits} visits (bound {WIDE_VISIT_BOUND})");
+    assert_topological(&g, &chunks);
+    let got = sorted_chunks(chunks.into_iter().map(|c| (c.txids, c.feefrac)).collect());
+    assert_eq!(got, sorted_chunks(reference_linearize(&g)));
+}
+
+/// Warden's example on rustoshi#68: one parent (fee 1) and 15 children (fees
+/// 10_000, 10_100, ..., 11_400), all size 100. The exact best chunk is the
+/// parent plus every child except the 10_000-sat one: fee 150_501, size
+/// 1_500. A search that stops early returns that only for some index orders
+/// (with the parent last it finished; with the parent first and the children
+/// in increasing-fee order it kept fee 149_201). The chunk must not depend on
+/// where the parent sits.
+#[test]
+fn star_cluster_best_chunk_is_independent_of_index_order() {
+    let child_fees: Vec<i64> = (0..15).map(|k| 10_000 + 100 * k).collect();
+    let mut rng = Rng(0x0dd5_eed5_1234_5678);
+    let mut orders: Vec<(usize, Vec<i64>)> = vec![(15, child_fees.clone()), (0, child_fees.clone())];
+    // Decreasing-fee children, and shuffled ones, at every parent position.
+    let mut rev = child_fees.clone();
+    rev.reverse();
+    orders.push((0, rev));
+    for parent_at in 0..16 {
+        let mut f = child_fees.clone();
+        for i in (1..f.len()).rev() {
+            f.swap(i, (rng.next() % (i as u64 + 1)) as usize);
+        }
+        orders.push((parent_at, f));
+    }
+    for (case, (parent_at, fees)) in orders.into_iter().enumerate() {
+        let g = star_graph(1, &fees, parent_at, 0xbe57 + case as u64);
+        let (chunks, _, visits) = cost_of(|| g.linearize());
+        assert_topological(&g, &chunks);
+        assert_eq!(
+            chunks[0].feefrac,
+            FeeFrac { fee: 150_501, size: 1_500 },
+            "case {case} (parent at index {parent_at}, {visits} visits): first chunk is not the exact best chunk"
+        );
+        assert_eq!(chunks[0].txids.len(), 15, "case {case}: first chunk is parent + 14 children");
+        let got = sorted_chunks(chunks.into_iter().map(|c| (c.txids, c.feefrac)).collect());
+        assert_eq!(got, sorted_chunks(reference_linearize(&g)), "case {case}: linearization differs from the exhaustive scan");
+    }
+}
+
+/// `DepGraph::from_cluster` must number a cluster's transactions the same way
+/// every time. It used to take `HashSet` iteration order, which differs
+/// between two sets holding the same txids (each draws its own hasher seed),
+/// so two processes, or two builds in one process, searched the same cluster
+/// in different index orders. Indices now follow txid order.
+#[test]
+fn from_cluster_assigns_indices_in_txid_order() {
+    let txids: Vec<Hash256> = (0..16).map(|i| h(i, 0xf20c)).collect();
+    let mut want = txids.clone();
+    want.sort();
+    let entries = HashMap::new();
+    let parents = HashMap::new();
+    for round in 0..8 {
+        let set: HashSet<Hash256> = txids.iter().copied().collect();
+        let g = DepGraph::from_cluster(&set, &entries, &parents);
+        assert_eq!(g.idx_to_txid, want, "round {round}: indices not in txid order");
+        for (i, t) in want.iter().enumerate() {
+            assert_eq!(g.txid_to_idx[t], i);
+        }
+    }
 }
