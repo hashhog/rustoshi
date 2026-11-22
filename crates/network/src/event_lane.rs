@@ -64,6 +64,10 @@
 //! back-pressure and makes the sender wait ([`PRIORITY_LANE_BYTE_BUDGET`]).
 //! A single event's charge is clamped to the budget, so one oversized event
 //! still passes alone and a lane can never wedge.
+//! The budget is a FIFO semaphore: a large priority event waiting for its
+//! charge also holds back smaller priority events queued after it, until the
+//! main loop has drained enough. That delay is bounded by one drain of the
+//! lane, the same wait a full slot count already imposes.
 //!
 //! A plain `mpsc::Sender<PeerEvent>` converts into an [`EventSender`] whose two
 //! lanes are the same channel (tests and single-channel callers keep their
@@ -130,7 +134,35 @@ pub fn event_cost(ev: &PeerEvent) -> usize {
             | NetworkMessage::ReqRecon(v)
             | NetworkMessage::Sketch(v)
             | NetworkMessage::ReconcilDiff(v) => v.capacity(),
-            _ => 0,
+            // An unrecognised command keeps its whole payload (up to
+            // MAX_MESSAGE_SIZE) and rides the priority lane.
+            NetworkMessage::Unknown { command, payload } => command.capacity() + payload.capacity(),
+            NetworkMessage::Reject(r) => {
+                r.message.capacity() + r.reason.capacity() + r.data.capacity()
+            }
+            NetworkMessage::Version(v) => v.user_agent.capacity(),
+            NetworkMessage::GetHeaders(g) => g.locator_hashes.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            NetworkMessage::GetBlocks(g) => g.locator_hashes.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            NetworkMessage::CFilter(c) => c.filter_bytes.capacity(),
+            NetworkMessage::CFHeaders(c) => c.filter_hashes.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            NetworkMessage::CFCheckpt(c) => c.filter_headers.capacity() * size_of::<rustoshi_primitives::Hash256>(),
+            // Fixed-size messages own no heap. Listed instead of a wildcard
+            // so a new heap-owning variant cannot silently ride for free.
+            NetworkMessage::Verack
+            | NetworkMessage::Ping(_)
+            | NetworkMessage::Pong(_)
+            | NetworkMessage::GetAddr
+            | NetworkMessage::FeeFilter(_)
+            | NetworkMessage::SendHeaders
+            | NetworkMessage::SendCmpct(_)
+            | NetworkMessage::MemPool
+            | NetworkMessage::WtxidRelay
+            | NetworkMessage::SendAddrV2
+            | NetworkMessage::SendTxRcncl(_)
+            | NetworkMessage::FilterClear
+            | NetworkMessage::GetCFilters(_)
+            | NetworkMessage::GetCFHeaders(_)
+            | NetworkMessage::GetCFCheckpt(_) => 0,
         },
         _ => 0,
     };

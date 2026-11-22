@@ -155,3 +155,36 @@ async fn draining_releases_the_budget() {
             .expect("small event fits");
     }
 }
+
+/// An unrecognised command keeps its whole payload and rides the priority
+/// lane, so it must be charged for that payload like any other message (a
+/// wildcard `0` let 1024 x 4 MB unknown frames through on slot count alone).
+/// Capacity-only payloads keep the test cheap. Asserted bound: at most 1 GiB.
+#[tokio::test]
+async fn priority_lane_charges_unknown_command_payload() {
+    const EACH: usize = 128 << 20;
+    let (tx, rx) = event_channel(EVENT_LANE_CAPACITY);
+    let mut accepted = 0usize;
+    for _ in 0..12 {
+        let ev = PeerEvent::Message(
+            PeerId(4),
+            NetworkMessage::Unknown {
+                command: "madeup".to_string(),
+                payload: Vec::with_capacity(EACH),
+            },
+        );
+        if tx.try_send(ev).is_ok() {
+            accepted += 1;
+        }
+    }
+    eprintln!(
+        "MEASURE priority lane unknown: accepted {}/12 x 128 MiB",
+        accepted
+    );
+    assert!(
+        accepted * EACH <= 1 << 30,
+        "stalled priority lane retained {} x 128 MiB unknown-command payloads",
+        accepted
+    );
+    drop(rx);
+}
