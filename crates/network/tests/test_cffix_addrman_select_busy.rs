@@ -23,6 +23,34 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 const NKEY: [u8; 32] = [0x42; 32];
 
+/// Compile shim so this file builds on a base commit that lacks
+/// `AddressManager::next_addr_to_try_excluding` (added by rustoshi#71).
+/// Where the inherent method exists it takes precedence over this trait
+/// method, so the shim is never called on the fix. On a base commit the
+/// tests run against plain `next_addr_to_try`, which ignores the busy sets,
+/// and fail on their assertions rather than on compilation.
+#[allow(dead_code)]
+trait NextAddrExcludingShim {
+    fn next_addr_to_try_excluding(
+        &mut self,
+        ng: &NetGroupManager,
+        busy_addrs: &HashSet<SocketAddr>,
+        busy_groups: &HashSet<Vec<u8>>,
+    ) -> Option<SocketAddr>;
+}
+
+#[allow(dead_code)]
+impl NextAddrExcludingShim for AddressManager {
+    fn next_addr_to_try_excluding(
+        &mut self,
+        ng: &NetGroupManager,
+        _busy_addrs: &HashSet<SocketAddr>,
+        _busy_groups: &HashSet<Vec<u8>>,
+    ) -> Option<SocketAddr> {
+        self.next_addr_to_try(ng)
+    }
+}
+
 fn addr(a: u8, b: u8) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, 0, 1)), 8333)
 }
