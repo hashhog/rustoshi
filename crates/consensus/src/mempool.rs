@@ -440,6 +440,68 @@ impl Cluster {
     }
 }
 
+thread_local! {
+    static CHUNK_SEARCH_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Depth-first walk over the ancestor-closed subsets of one `remaining` set,
+/// see [`DepGraph::find_best_chunk`]. Bit `p` of a mask is `idxs[p]`.
+struct ClosedSetSearch<'a> {
+    graph: &'a DepGraph,
+    idxs: &'a [usize],
+    anc_mask: &'a [u32],
+    desc_mask: &'a [u32],
+    best_chunk: HashSet<usize>,
+    best_feefrac: FeeFrac,
+}
+
+impl ClosedSetSearch<'_> {
+    /// Decide positions `pos-1` down to 0. `inc` is ancestor-closed, `exc`
+    /// descendant-closed, and they are disjoint.
+    fn visit(&mut self, pos: usize, inc: u32, exc: u32) {
+        CHUNK_SEARCH_VISITS.with(|c| c.set(c.get() + 1));
+        if pos == 0 {
+            if inc != 0 {
+                self.consider(inc);
+            }
+            return;
+        }
+        let p = pos - 1;
+        let bit = 1u32 << p;
+        if (inc | exc) & bit != 0 {
+            self.visit(p, inc, exc);
+        } else {
+            self.visit(p, inc, exc | self.desc_mask[p]);
+            self.visit(p, inc | self.anc_mask[p], exc);
+        }
+    }
+
+    /// Keep `mask` if it beats the best chunk by `DepGraph::is_better_chunk`'s
+    /// order (feerate, then smaller size, then lower largest txid). The fee
+    /// sum and the txid tie-break are read off the mask; a `HashSet` is only
+    /// built for a winner.
+    fn consider(&mut self, mask: u32) {
+        let members = || (0..self.idxs.len()).filter(move |&p| mask & (1u32 << p) != 0).map(|p| self.idxs[p]);
+        let mut feefrac = FeeFrac::default();
+        for i in members() {
+            feefrac += self.graph.feerates[i];
+        }
+        let best = &self.best_feefrac;
+        let order = ((feefrac.fee as i128) * (best.size as i128))
+            .cmp(&((best.fee as i128) * (feefrac.size as i128)))
+            .then_with(|| best.size.cmp(&feefrac.size))
+            .then_with(|| {
+                let cand_max = members().map(|i| self.graph.idx_to_txid[i]).max();
+                self.graph.max_txid(&self.best_chunk).cmp(&cand_max)
+            });
+        if order.is_gt() {
+            let chunk: HashSet<usize> = members().collect();
+            self.best_feefrac = feefrac;
+            self.best_chunk = chunk;
+        }
+    }
+}
+
 /// Dependency graph for cluster linearization.
 /// Maps transaction indices to their fee/size and ancestor/descendant relationships.
 #[derive(Clone, Debug)]
@@ -457,6 +519,14 @@ pub struct DepGraph {
 }
 
 impl DepGraph {
+    /// Subsets the chunk search has visited on this thread, summed over every
+    /// [`DepGraph::linearize`] call. Monotone; take a difference around the
+    /// call being measured. It is how tests bound the search's work without
+    /// timing it.
+    pub fn search_visits() -> u64 {
+        CHUNK_SEARCH_VISITS.with(|c| c.get())
+    }
+
     /// Create a new dependency graph from mempool entries.
     pub fn from_cluster(
         txids: &HashSet<Hash256>,
@@ -468,8 +538,13 @@ impl DepGraph {
         let mut idx_to_txid = Vec::with_capacity(n);
         let mut feerates = Vec::with_capacity(n);
 
-        // Assign indices
-        for (i, txid) in txids.iter().enumerate() {
+        // Assign indices in txid order, not `HashSet` order: the chunk search
+        // walks indices in a fixed order and keeps the first of equally good
+        // sets, so the index order must not depend on the set's hasher seed
+        // or two builds of the same cluster could pick different chunks.
+        let mut sorted: Vec<Hash256> = txids.iter().copied().collect();
+        sorted.sort_unstable();
+        for (i, txid) in sorted.iter().enumerate() {
             txid_to_idx.insert(*txid, i);
             idx_to_txid.push(*txid);
             if let Some(entry) = entries.get(txid) {
@@ -639,33 +714,53 @@ impl DepGraph {
     ///
     /// Core's chunk is that subset (txgraph `FindBestChunk`), not only the
     /// ancestor set of one transaction. Clusters of at most 16 transactions
-    /// are searched exactly. Larger clusters keep the ancestor-set heuristic.
+    /// are searched exactly, with no early stop: a search cut short keeps
+    /// whichever set it happened to reach first, so its diagram would depend
+    /// on index order and could disagree with Core. Larger clusters keep the
+    /// ancestor-set heuristic.
+    ///
+    /// The search visits only ancestor-closed subsets: deciding positions
+    /// from the highest down, excluding a transaction also excludes its
+    /// descendants and including one also includes its ancestors, so no
+    /// branch dead-ends. Exclude is tried first, so complete sets come out
+    /// in increasing mask order -- the order of the exhaustive 2^n scan this
+    /// replaced -- and the result is identical to that scan. The cost is
+    /// bounded without a counter: a round with m <= 16 remaining walks a
+    /// binary tree of depth m, at most 2^(m+1) - 1 visits, rounds with more
+    /// than 16 remaining make none, and every round removes at least one
+    /// transaction. So one linearization makes at most
+    /// sum_{m=1..16} (2^(m+1) - 1) = 262,124 visits, each a few word
+    /// operations with no allocation. A parent whose feerate beats its 16+
+    /// children reaches that (the heuristic peels the parent, leaving a
+    /// 16-wide antichain); a chain of 16 has only 17 closed sets. The 2^n
+    /// scan this replaced built a `HashSet` for every one of 2^16 + 2^15 + ...
+    /// masks.
     fn find_best_chunk(&self, remaining: &HashSet<usize>) -> HashSet<usize> {
-        let mut best_chunk = self.find_best_ancestor_chunk(remaining);
+        let best_chunk = self.find_best_ancestor_chunk(remaining);
         if remaining.len() > 16 || best_chunk.is_empty() {
             return best_chunk;
         }
-        let mut best_feefrac = self.set_feefrac(&best_chunk);
         let mut idxs: Vec<usize> = remaining.iter().copied().collect();
         idxs.sort_unstable();
-        let n = idxs.len();
-        for mask in 1u32..(1u32 << n) {
-            let mut chunk = HashSet::with_capacity(n);
-            for bit in 0..n {
-                if mask & (1u32 << bit) != 0 {
-                    chunk.insert(idxs[bit]);
-                }
-            }
-            if !self.is_ancestor_closed(&chunk, remaining) {
-                continue;
-            }
-            let feefrac = self.set_feefrac(&chunk);
-            if self.is_better_chunk(&chunk, &feefrac, &best_chunk, &best_feefrac) {
-                best_feefrac = feefrac;
-                best_chunk = chunk;
-            }
-        }
-        best_chunk
+        let pos: HashMap<usize, usize> = idxs.iter().enumerate().map(|(p, &i)| (i, p)).collect();
+        let to_mask = |set: &HashSet<usize>| {
+            set.iter()
+                .filter_map(|i| pos.get(i))
+                .fold(0u32, |m, &p| m | (1u32 << p))
+        };
+        let anc_mask: Vec<u32> = idxs.iter().map(|&i| to_mask(&self.ancestors[i])).collect();
+        let desc_mask: Vec<u32> = idxs.iter().map(|&i| to_mask(&self.descendants[i])).collect();
+        let best_feefrac = self.set_feefrac(&best_chunk);
+        let mut search = ClosedSetSearch {
+            graph: self,
+            idxs: &idxs,
+            anc_mask: &anc_mask,
+            desc_mask: &desc_mask,
+            best_chunk,
+            best_feefrac,
+        };
+        search.visit(idxs.len(), 0, 0);
+        search.best_chunk
     }
 
     /// Ancestor set of each remaining transaction; the previous chunk picker.
@@ -722,18 +817,6 @@ impl DepGraph {
     /// Largest txid in `set`, in Core's `uint256` (memcmp) order.
     fn max_txid(&self, set: &HashSet<usize>) -> Option<Hash256> {
         set.iter().map(|&idx| self.idx_to_txid[idx]).max()
-    }
-
-    /// Every in-`remaining` ancestor of every member is itself a member.
-    fn is_ancestor_closed(&self, chunk: &HashSet<usize>, remaining: &HashSet<usize>) -> bool {
-        for &idx in chunk {
-            for &anc in &self.ancestors[idx] {
-                if remaining.contains(&anc) && !chunk.contains(&anc) {
-                    return false;
-                }
-            }
-        }
-        true
     }
 
     /// Topologically sort a set of transaction indices.
