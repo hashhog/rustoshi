@@ -1,13 +1,12 @@
 //! `--prune=1` is Core's MANUAL prune mode: the node never deletes block data
 //! on its own; only the `pruneblockchain` RPC does.
 //!
-//! Core (`bitcoin-core/src/init.cpp`, `-prune` help text and
-//! `node/blockmanager_args.cpp`): "-prune=1 allows manual pruning via RPC";
-//! with `nPruneTarget == BlockManager::PRUNE_TARGET_MANUAL` the automatic
-//! `FindFilesToPrune` path never runs (`validation.cpp::FlushStateToDisk`
-//! only prunes automatically when `!m_blockman.m_check_for_pruning` is set
-//! by a size target, and `PruneBlockFilesManual` is reached only from
-//! `pruneblockchain`).
+//! Core (`bitcoin-core/src/init.cpp`, `-prune` help text: "-prune=1 allows
+//! manual pruning via RPC"): `node/blockmanager_args.cpp` maps `-prune=1` to
+//! `BlockManager::PRUNE_TARGET_MANUAL` (`UINT64_MAX`, `blockstorage.h`), so
+//! the automatic `FindFilesToPrune` pass can never find usage above the
+//! target and deletes nothing. Data goes only through `PruneBlockFilesManual`,
+//! which only `pruneblockchain` reaches.
 //!
 //! rustoshi gated the reorg-retention sweep in the P2P connect loop on
 //! "any prune mode" (`PruneCoordConfig::is_prune_mode`), so a `--prune=1`
@@ -355,6 +354,12 @@ fn prune_manual_mode_pruneblockchain_prunes_to_requested_height() {
 /// Control: the size-target mode (`--prune=550`) still prunes on its own, so
 /// the fix gates the sweep on the mode and does not switch it off. Also shows
 /// the harness can see an automatic prune. Passes before and after the fix.
+///
+/// This pins rustoshi's CURRENT size-mode behaviour, not Core's: rustoshi's
+/// retention sweep ignores the byte target and keeps only the last 288
+/// blocks, while Core would delete nothing on ~1,140 tiny regtest blocks
+/// (far below 550 MiB). If size mode is made to honour the target, update
+/// this control to build a chain above the target instead.
 #[test]
 fn prune_size_mode_still_prunes_automatically() {
     let tmp = tempfile::tempdir().unwrap();
