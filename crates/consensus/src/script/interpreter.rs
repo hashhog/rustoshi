@@ -721,15 +721,44 @@ fn is_low_s_signature(sig: &[u8]) -> bool {
         0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
     ];
 
-    // S must be <= half_order
-    // Pad S to 32 bytes for comparison
-    if s_data.len() > 32 {
-        return false;
+    // Core's CPubKey::CheckLowS (pubkey.cpp:424-430) parses with
+    // ecdsa_signature_parse_der_lax, which REPLACES the signature with (0, 0)
+    // when R or S does not fit below the curve order N (pubkey.cpp:155-181).
+    // secp256k1_ecdsa_signature_normalize then reports (0, 0) as already
+    // low, so an overflowing R or S passes LOW_S (the signature can never
+    // verify). Mirror that before comparing S with N/2.
+    let r_data = &sig[4..4 + len_r];
+    if scalar_overflows_order(r_data) || scalar_overflows_order(s_data) {
+        return true;
     }
+    let s_stripped = strip_leading_zeros(s_data);
     let mut s_padded = [0u8; 32];
-    s_padded[32 - s_data.len()..].copy_from_slice(s_data);
+    s_padded[32 - s_stripped.len()..].copy_from_slice(s_stripped);
 
     s_padded <= half_order
+}
+
+fn strip_leading_zeros(v: &[u8]) -> &[u8] {
+    let first = v.iter().position(|&b| b != 0).unwrap_or(v.len());
+    &v[first..]
+}
+
+/// True if the big-endian integer `v` (any length) is >= the secp256k1
+/// order N, i.e. it would not parse as a compact signature scalar.
+fn scalar_overflows_order(v: &[u8]) -> bool {
+    const ORDER: [u8; 32] = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+        0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+    ];
+    let v = strip_leading_zeros(v);
+    if v.len() > 32 {
+        return true;
+    }
+    let mut padded = [0u8; 32];
+    padded[32 - v.len()..].copy_from_slice(v);
+    padded >= ORDER
 }
 
 /// Check if a pubkey is compressed or uncompressed (but NOT hybrid).
@@ -2022,11 +2051,12 @@ fn eval_script_internal(
                     // Check signature encoding (only when we actually try to use it)
                     check_signature_encoding(sig, ctx.flags)?;
 
-                    if sig.is_empty() {
-                        // Empty signature always fails
-                        success = false;
-                        break;
-                    }
+                    // An empty signature is NOT a shortcut out of the loop. Core
+                    // (interpreter.cpp:1153-1180) keeps pairing it with the next
+                    // pubkey and runs CheckPubKeyEncoding (STRICTENC,
+                    // WITNESS_PUBKEYTYPE) on every key it reaches; the signature
+                    // check itself simply fails (check_sig returns false for an
+                    // empty sig). Breaking out here skipped those pubkey checks.
 
                     let mut found = false;
 
@@ -2162,10 +2192,8 @@ fn eval_script_internal(
                     // Check signature encoding
                     check_signature_encoding(sig, ctx.flags)?;
 
-                    if sig.is_empty() {
-                        success = false;
-                        break;
-                    }
+                    // No empty-sig shortcut: see OP_CHECKMULTISIG above (Core
+                    // still runs CheckPubKeyEncoding on each key it reaches).
 
                     let mut found = false;
 
@@ -2227,10 +2255,9 @@ fn eval_script_internal(
             }
             Opcode::OP_CHECKLOCKTIMEVERIFY => {
                 if !ctx.flags.verify_checklocktimeverify {
-                    // Pre-BIP-65: treat as NOP
-                    if ctx.flags.verify_discourage_upgradable_nops {
-                        return Err(ScriptError::DiscourageUpgradableNops);
-                    }
+                    // Not enabled: a plain NOP2. Core (interpreter.cpp:522-526)
+                    // just breaks here; DISCOURAGE_UPGRADABLE_NOPS applies only
+                    // to OP_NOP1 and OP_NOP4..OP_NOP10.
                 } else {
                     // BIP-65: verify locktime
                     let locktime_data = ctx.top()?;
@@ -2245,10 +2272,8 @@ fn eval_script_internal(
             }
             Opcode::OP_CHECKSEQUENCEVERIFY => {
                 if !ctx.flags.verify_checksequenceverify {
-                    // Pre-BIP-112: treat as NOP
-                    if ctx.flags.verify_discourage_upgradable_nops {
-                        return Err(ScriptError::DiscourageUpgradableNops);
-                    }
+                    // Not enabled: a plain NOP3 (Core interpreter.cpp:561-565),
+                    // not a discouraged upgradable NOP.
                 } else {
                     // BIP-112: verify sequence
                     let seq_data = ctx.top()?;
@@ -2936,6 +2961,22 @@ pub fn verify_script(
         // Start with the remaining stack (everything except the redeem script)
         let mut p2sh_stack: Stack = stack_copy[..stack_copy.len() - 1].to_vec();
 
+        // Core VerifyScript (interpreter.cpp:2070-2076) evaluates the
+        // redeemScript and requires a true top element BEFORE it looks for a
+        // P2SH witness program. A witness program evaluates as two pushes
+        // (OP_n, then the program bytes), so the top element is the program:
+        // an all-zero (or negative-zero) program casts to false and Core
+        // refuses with EVAL_FALSE even though the witness branch would treat
+        // the program as an upgradable, anyone-can-spend version.
+        // Running the witness branch first (as this function used to) made
+        // e.g. redeemScript `OP_1 <0x0000>` with an empty witness spendable
+        // under block flags: a consensus split (Core rejects the block).
+        eval_script(&mut p2sh_stack, redeem_script, flags, checker, SigVersion::Base)?;
+
+        if p2sh_stack.is_empty() || !stack_bool(p2sh_stack.last().unwrap()) {
+            return Err(ScriptError::VerifyFailed);
+        }
+
         // Check for P2SH-wrapped SegWit.
         //
         // CRITICAL: BIP-341 forbids Taproot inside P2SH — Core
@@ -2970,13 +3011,6 @@ pub fn verify_script(
                 // After successful witness execution, we're done
                 return Ok(());
             }
-        }
-
-        // Regular P2SH: evaluate the redeem script
-        eval_script(&mut p2sh_stack, redeem_script, flags, checker, SigVersion::Base)?;
-
-        if p2sh_stack.is_empty() || !stack_bool(p2sh_stack.last().unwrap()) {
-            return Err(ScriptError::VerifyFailed);
         }
 
         // Clean stack check for P2SH
