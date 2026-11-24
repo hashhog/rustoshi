@@ -97,8 +97,8 @@ impl Node {
     /// One JSON-RPC call over a fresh HTTP/1.1 connection. Returns the
     /// `result` on success and the `error` object as `Err`.
     fn call(&self, method: &str, params: Value) -> Result<Value, Value> {
-        let body = json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params})
-            .to_string();
+        let body =
+            json!({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).to_string();
         let mut s = TcpStream::connect(("127.0.0.1", self.rpc_port))
             .map_err(|e| json!({"transport": e.to_string()}))?;
         s.set_read_timeout(Some(Duration::from_secs(300))).unwrap();
@@ -253,7 +253,11 @@ fn miner_and_pruned(tmp: &Path, prune_arg: &str) -> (Node, Node) {
         .unwrap_or(0)
         == 0
     {
-        assert!(Instant::now() < deadline, "pruned node never connected; log:\n{}", pruned.log_tail());
+        assert!(
+            Instant::now() < deadline,
+            "pruned node never connected; log:\n{}",
+            pruned.log_tail()
+        );
         std::thread::sleep(Duration::from_millis(250));
     }
 
@@ -277,7 +281,11 @@ fn prune_manual_mode_never_prunes_automatically() {
     let (_miner, pruned) = miner_and_manual_pruned(tmp.path());
 
     let info = pruned.call("getblockchaininfo", json!([])).unwrap();
-    assert_eq!(info["pruned"], json!(true), "--prune=1 is a prune mode: {info}");
+    assert_eq!(
+        info["pruned"],
+        json!(true),
+        "--prune=1 is a prune mode: {info}"
+    );
 
     let missing = pruned.missing_blocks();
     assert!(
@@ -313,7 +321,11 @@ fn prune_manual_mode_pruneblockchain_prunes_to_requested_height() {
     let got = pruned
         .call("pruneblockchain", json!([target]))
         .unwrap_or_else(|e| panic!("pruneblockchain: {e}"));
-    assert_eq!(got, json!(target), "pruneblockchain returns the last pruned height");
+    assert_eq!(
+        got,
+        json!(target),
+        "pruneblockchain returns the last pruned height"
+    );
 
     let missing = pruned.missing_blocks();
     let expected: Vec<u32> = (1..=target).collect();
