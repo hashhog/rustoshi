@@ -6956,16 +6956,23 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                         // We use StubChainContext (MTP=0) so gate 1 is a
                                         // no-op here; the REAL MTP enforcement stays inline
                                         // below where we have block_store access to walk
-                                        // ancestors via compute_mtp_via_store. prev_entry
-                                        // fields are placeholders — only `timestamp` is
-                                        // read by gate 2, and only at BIP-94 retarget
-                                        // boundaries (mainnet-disabled; on testnet4/regtest
-                                        // the 0 placeholder can't spuriously fire since
-                                        // block_time < (0 - MAX_TIMEWARP=600) is always
-                                        // false for any real block).
+                                        // ancestors via compute_mtp_via_store. Of prev_entry
+                                        // only `timestamp` is read, by gate 2 (BIP-94
+                                        // timewarp, testnet4): it MUST be the parent's real
+                                        // time (Core pindexPrev->GetBlockTime()). The old 0
+                                        // placeholder made `block_time < 0 - 600` always
+                                        // false, so the timewarp gate never fired on P2P
+                                        // headers. The parent header is stored before its
+                                        // child is processed (store_validated_header). A
+                                        // header whose parent is unknown reads 0 here, and the
+                                        // fail-closed diffbits gate below refuses it anyway.
+                                        let parent_timestamp = parent_timestamp_for_connect(
+                                            &block_store,
+                                            &header.prev_block_hash,
+                                        )?;
                                         let prev_entry = rustoshi_consensus::BlockIndexEntry {
                                             height: 0,
-                                            timestamp: 0,
+                                            timestamp: parent_timestamp,
                                             bits: 0,
                                             prev_hash: rustoshi_primitives::Hash256::ZERO,
                                             chain_work: [0u8; 32],

@@ -5897,6 +5897,48 @@ pub fn activate_best_chain_after_reconsider(
     activate_best_chain(state, "reconsiderblock", BestChainCandidateSet::Cleared(cleared))
 }
 
+/// Chain context that answers only the parent's median-time-past, so
+/// `contextual_check_block_header` runs Core's time-too-old gate (BIP-113)
+/// in Core's position: before the BIP-94 timewarp and time-too-new gates.
+struct ParentMtpContext(u32);
+
+impl rustoshi_consensus::ChainContext for ParentMtpContext {
+    fn get_block_index(&self, _hash: &Hash256) -> Option<rustoshi_consensus::BlockIndexEntry> {
+        None
+    }
+    fn get_utxo(
+        &self,
+        _outpoint: &rustoshi_primitives::OutPoint,
+    ) -> Option<rustoshi_consensus::CoinEntry> {
+        None
+    }
+    fn get_median_time_past(&self, _hash: &Hash256) -> u32 {
+        self.0
+    }
+    fn get_hash_at_height(&self, _height: u32) -> Option<Hash256> {
+        None
+    }
+    fn tip_height(&self) -> u32 {
+        0
+    }
+}
+
+/// Timestamp of the stored parent header (Core `pindexPrev->GetBlockTime()`),
+/// for the BIP-94 timewarp gate. A read error is a system fault, not a
+/// verdict. A missing header yields 0 (the gate cannot fire); the callers
+/// have already required the parent to be known.
+fn parent_header_timestamp(store: &BlockStore, parent: &Hash256) -> Result<u32, String> {
+    match store.get_header(parent) {
+        Ok(h) => Ok(h.map(|h| h.timestamp).unwrap_or(0)),
+        Err(e) => Err(format!(
+            "{}: parent header read {} failed: {}",
+            rustoshi_consensus::fatal::SYSTEM_FAULT_TAG,
+            parent,
+            e
+        )),
+    }
+}
+
 /// [`try_attach_and_reorg`] with the invalid-branch outcome surfaced.
 pub fn try_attach_and_reorg_detailed(
     state: &mut RpcState,
@@ -6030,21 +6072,27 @@ pub fn try_attach_and_reorg_detailed(
                 return Err(AttachReorgError::from("bad-diffbits".to_string()));
             }
         };
-        // prev_entry placeholder: contextual_check_block_header reads only
-        // `timestamp` from it, and only at BIP-94 retarget boundaries
-        // (mainnet-disabled). Matches the submitheader / header-sync convention.
+        // contextual_check_block_header reads `timestamp` from prev_entry for
+        // the BIP-94 timewarp gate (Core: pindexPrev->GetBlockTime()). It
+        // must be the REAL parent time: with the old 0 placeholder the gate
+        // could never fire, so a testnet4 timewarp side-branch block was
+        // stored and could be reorged onto.
         let prev_entry = rustoshi_consensus::BlockIndexEntry {
             height: parent_entry.height,
-            timestamp: 0,
+            timestamp: parent_entry.timestamp,
             bits: 0,
             prev_hash: block.header.prev_block_hash,
             chain_work: [0u8; 32],
         };
+        // Gate 6: a read error is a non-verdict refusal (no sentinel, no
+        // `invalid`), never MTP 0 (which skipped this check).
+        let mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash)
+            .map_err(AttachReorgError::from)?;
         if let Err(e) = rustoshi_consensus::contextual_check_block_header(
             &block.header,
             new_height,
             &prev_entry,
-            &rustoshi_consensus::StubChainContext,
+            &ParentMtpContext(mtp),
             &state.params,
             now_secs,
             expected_bits,
@@ -6061,13 +6109,8 @@ pub fn try_attach_and_reorg_detailed(
             return Err(AttachReorgError::from(e.bip22_string()));
         }
 
-        // BIP-113 MTP gate (time-too-old): the real check; StubChainContext
-        // returns MTP=0. Walks the parent's 11 ancestors via the store, exactly
-        // like submitheader / the header-sync path.
-        // Gate 6: a read error is a non-verdict refusal (no sentinel, no
-        // `invalid`), never MTP 0 (which skipped this check).
-        let mtp = compute_prev_block_mtp(&store, &block.header.prev_block_hash)
-            .map_err(AttachReorgError::from)?;
+        // BIP-113 MTP gate (time-too-old). ParentMtpContext already made
+        // contextual_check_block_header enforce it; kept as a backstop.
         if mtp > 0 && block.header.timestamp <= mtp {
             tracing::warn!(
                 "try_attach_and_reorg: side-branch block {} rejected at store: time-too-old (ts {} <= parent MTP {})",
@@ -6075,6 +6118,90 @@ pub fn try_attach_and_reorg_detailed(
             );
             return Err(AttachReorgError::from("time-too-old".to_string()));
         }
+    }
+
+    // Core ProcessNewBlock runs CheckBlock BEFORE AcceptBlock stores
+    // anything (validation.cpp ProcessNewBlock -> CheckBlock, then
+    // AcceptBlock -> CheckBlock/ContextualCheckBlock before WriteBlock).
+    // A P2P side-branch body used to reach this function unchecked and was
+    // persisted with HAVE_DATA even with a bad merkle root, a mutated
+    // (CVE-2012-2459 / stripped-witness) transaction list, or an oversized
+    // body. Refuse it before the first write (after the header gates, so a
+    // bad header keeps its header-gate reason; submitblock already runs
+    // CheckBlock before calling here). Like Core's first CheckBlock, this
+    // marks nothing (a mutated body says nothing about the header).
+    if let Err(e) = validation::check_block(block, &state.params) {
+        tracing::warn!(
+            "try_attach_and_reorg: side-branch block {} rejected at store (CheckBlock): {}",
+            block_hash,
+            e.bip22_string()
+        );
+        return Err(AttachReorgError::from(e.bip22_string().to_string()));
+    }
+
+    // Core AcceptBlock -> ContextualCheckBlock (validation.cpp:4172-4220),
+    // also before the body is written: IsFinalTx against the parent's MTP
+    // once CSV is active (the block time before), then the BIP-34 coinbase
+    // height, then witness malleation. A failure goes to InvalidBlockFound,
+    // which marks the block BLOCK_FAILED_VALID unless the result is
+    // BLOCK_MUTATED (the witness-commitment / unexpected-witness failures):
+    // `is_invalid_block_verdict` draws exactly that line.
+    let lock_time_cutoff = if new_height >= state.params.csv_height {
+        compute_prev_block_mtp(&store, &block.header.prev_block_hash)
+            .map_err(AttachReorgError::from)?
+    } else {
+        block.header.timestamp
+    };
+    let contextual = if block
+        .transactions
+        .iter()
+        .all(|tx| validation::is_final_tx(tx, new_height, lock_time_cutoff))
+    {
+        validation::contextual_check_block(
+            block,
+            new_height,
+            &rustoshi_consensus::StubChainContext,
+            &state.params,
+        )
+    } else {
+        Err(rustoshi_consensus::ValidationError::NonFinalTx)
+    };
+    if let Err(e) = contextual {
+        tracing::warn!(
+            "try_attach_and_reorg: side-branch block {} rejected at store (ContextualCheckBlock): {}",
+            block_hash,
+            e.bip22_string()
+        );
+        if !e.is_invalid_block_verdict() {
+            return Err(AttachReorgError::from(e.bip22_string().to_string()));
+        }
+        // Verdict: record the header as failed (no body, no HAVE_DATA), as
+        // Core's AcceptBlockHeader + InvalidBlockFound leave it.
+        let mut entry = match store.get_block_index(block_hash) {
+            Ok(Some(existing)) => existing,
+            _ => StorageBlockIndexEntry {
+                height: new_height,
+                status: BlockStatus::new(),
+                n_tx: block.transactions.len() as u32,
+                timestamp: block.header.timestamp,
+                bits: block.header.bits,
+                nonce: block.header.nonce,
+                version: block.header.version,
+                prev_hash: block.header.prev_block_hash,
+                chain_work: this_work.0,
+            },
+        };
+        entry.status.set(BlockStatus::FAILED_VALIDITY);
+        if let Err(err) = store.put_header(block_hash, &block.header) {
+            tracing::error!("failed side-branch block {}: header not stored: {}", block_hash, err);
+        }
+        if let Err(err) = store.put_block_index(block_hash, &entry) {
+            tracing::error!("failed side-branch block {}: failure flag not stored: {}", block_hash, err);
+        }
+        return Err(AttachReorgError {
+            reason: format!("{}{}", REORG_CONSENSUS_REJECT_SENTINEL, e.bip22_string()),
+            invalid: Some(InvalidBranch { failed: *block_hash, invalidated: vec![*block_hash] }),
+        });
     }
 
     // Persist header, block, and a placeholder block-index entry so the
@@ -11601,22 +11728,29 @@ impl RustoshiRpcServer for RpcServerImpl {
             }
         };
 
-        // prev_entry placeholder: only `timestamp` is read by the BIP-94 gate,
-        // and only at retarget boundaries (mainnet-disabled). Matches the
-        // header-sync path's StubChainContext convention.
+        // BIP-94 timewarp (Core ContextualCheckBlockHeader reads
+        // pindexPrev->GetBlockTime()): the gate needs the REAL parent
+        // timestamp. A 0 placeholder made `block_time < 0 - 600` always
+        // false, so testnet4 accepted timewarp headers here.
+        let parent_timestamp = parent_header_timestamp(&store, &header.prev_block_hash)
+            .map_err(|e| submit_system_fault_error(&e))?;
         let prev_entry = rustoshi_consensus::BlockIndexEntry {
             height: new_height.saturating_sub(1),
-            timestamp: 0,
+            timestamp: parent_timestamp,
             bits: 0,
             prev_hash: header.prev_block_hash,
             chain_work: [0u8; 32],
         };
+        // Real parent MTP, so time-too-old is reported before the timewarp
+        // gate as in Core (validation.cpp ContextualCheckBlockHeader order).
+        let parent_mtp = compute_prev_block_mtp(&store, &header.prev_block_hash)
+            .map_err(|e| submit_system_fault_error(&e))?;
 
         if let Err(e) = rustoshi_consensus::contextual_check_block_header(
             &header,
             new_height,
             &prev_entry,
-            &rustoshi_consensus::StubChainContext,
+            &ParentMtpContext(parent_mtp),
             &state.params,
             now_secs,
             expected_bits,
@@ -26682,7 +26816,6 @@ mod tests {
     /// Core's "store but do not activate" branch.
     #[tokio::test]
     async fn try_attach_and_reorg_keeps_tip_when_side_branch_lighter() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -26692,8 +26825,10 @@ mod tests {
         // checks become no-ops. Regtest activates both at height 1, which
         // would force every test block to encode BIP-34 height + emit a
         // valid witness commitment — orthogonal to the reorg wiring this
-        // test exercises.
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        // test exercises. The synthetic blocks are mined at regtest
+        // difficulty, so the params need the regtest powLimit: the
+        // side-branch store runs CheckBlock (PoW included) before storing.
+        let mut rpc_state = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
 
         // G -> A1 -> A2 (active, height 2). Hand a B1 (height 1) — has
         // strictly less work than A2.
@@ -26888,12 +27023,13 @@ mod tests {
     /// work" outcome the handler logs at debug and otherwise ignores).
     #[tokio::test]
     async fn unit_c_p2p_arm_lighter_fork_stores_without_activating() {
-        use rustoshi_consensus::ChainParams;
         use rustoshi_storage::ChainDb;
 
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(ChainDb::open(tmp.path()).unwrap());
-        let mut rpc_state = RpcState::new(db.clone(), ChainParams::mainnet());
+        // Regtest-difficulty synthetic blocks: the side-branch store runs
+        // CheckBlock (PoW included), so use the regtest powLimit.
+        let mut rpc_state = RpcState::new(db.clone(), mainnet_params_for_synth_blocks());
 
         // Active chain G -> A1 -> A2 (height 2).
         let (hash_g, _, work_g) = {
