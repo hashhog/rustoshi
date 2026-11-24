@@ -1,0 +1,8 @@
+# rustoshi head 0d922544 vs Core v31.1
+core      control block 101 (OP_1 <0x0001>): null
+core      case    block 102 (OP_1 <0x0000>): "block-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)"
+core      getblockcount: 101
+rustoshi  control block 101 (OP_1 <0x0001>): null
+rustoshi  case    block 102 (OP_1 <0x0000>): "block-script-verify-flag-failed"
+rustoshi  getblockcount: 101
+RESULT: AGREE core=101 rustoshi=101
