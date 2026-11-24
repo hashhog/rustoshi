@@ -1590,11 +1590,15 @@ mod tests {
         let params = ChainParams::mainnet();
         let hash = [0u8; 32]; // all-zeros hash (hardest possible to beat)
 
-        // exponent > 32 → overflow → DeriveTarget returns None → rejected
-        // Core pow.cpp:154 fOverflow check
-        let overflow_bits = 0x2100_0001u32; // exponent=33
+        // exponent=33 with a 3-byte mantissa → SetCompact overflow →
+        // DeriveTarget returns None → rejected (Core pow.cpp fOverflow).
+        // (0x21000001 is NOT an overflow — it is 1 << 240, which mainnet
+        // refuses only because it is above powLimit.)
+        let overflow_bits = 0x2101_0000u32; // exponent=33
         assert!(!check_proof_of_work(&hash, overflow_bits, &params),
             "overflow compact encoding must be rejected (Core pow.cpp:154)");
+        assert!(!check_proof_of_work(&hash, 0x2100_0001, &params),
+            "1 << 240 is above the mainnet powLimit");
 
         let overflow_bits2 = 0xff00_0001u32; // exponent=255
         assert!(!check_proof_of_work(&hash, overflow_bits2, &params),

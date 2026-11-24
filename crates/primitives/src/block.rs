@@ -468,12 +468,19 @@ mod tests {
     /// Exponent > 32 would overflow the 256-bit target array.
     /// Before W83 this caused usize underflow (panic in debug, wrap in release).
     /// After the fix, target() returns [0u8;32] and validate_pow_against_declared_target() returns false.
+    /// Only a real SetCompact overflow is refused: exponent 33 with a mantissa
+    /// <= 0xffff still fits (Core arith_uint256.cpp:178-183), so 0x21000001
+    /// is the valid target 1 << 240 and 0x21010000 is the overflow case.
     #[test]
     fn target_overflow_exponent_rejected() {
-        // exponent = 33 (0x21) — exceeds 32-byte array
-        let header = BlockHeader { bits: 0x2100_0001, ..Default::default() };
+        // exponent = 33 (0x21) with a 3-byte mantissa: does not fit 256 bits
+        let header = BlockHeader { bits: 0x2101_0000, ..Default::default() };
         assert_eq!(header.target(), [0u8; 32]);
         assert!(!header.validate_pow_against_declared_target());
+        // exponent = 33 with a 1-byte mantissa: 1 << 240, not an overflow
+        let mut one_shl_240 = [0u8; 32];
+        one_shl_240[1] = 0x01;
+        assert_eq!(BlockHeader { bits: 0x2100_0001, ..Default::default() }.target(), one_shl_240);
 
         // exponent = 0xff (max) — should also be safely rejected
         let header2 = BlockHeader { bits: 0xff00_0001, ..Default::default() };
