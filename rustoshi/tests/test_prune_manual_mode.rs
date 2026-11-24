@@ -233,11 +233,15 @@ impl Drop for Node {
 /// joins after RPC mining would see height 0 and never pick it as a sync
 /// peer. That is unrelated to pruning and not what these tests pin.
 fn miner_and_manual_pruned(tmp: &Path) -> (Node, Node) {
+    miner_and_pruned(tmp, "--prune=1")
+}
+
+fn miner_and_pruned(tmp: &Path, prune_arg: &str) -> (Node, Node) {
     let miner = Node::start(&tmp.join("miner"), &[]);
     let pruned = Node::start(
         &tmp.join("pruned"),
         &[
-            "--prune=1".to_string(),
+            prune_arg.to_string(),
             format!("--connect=127.0.0.1:{}", miner.p2p_port),
         ],
     );
@@ -334,4 +338,24 @@ fn prune_manual_mode_pruneblockchain_prunes_to_requested_height() {
     miner.mine(EXTRA);
     pruned.wait_height(miner.height());
     assert_eq!(pruned.missing_blocks(), expected);
+}
+
+/// Control: the size-target mode (`--prune=550`) still prunes on its own, so
+/// the fix gates the sweep on the mode and does not switch it off. Also shows
+/// the harness can see an automatic prune. Passes before and after the fix.
+#[test]
+fn prune_size_mode_still_prunes_automatically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_miner, pruned) = miner_and_pruned(tmp.path(), "--prune=550");
+    let missing = pruned.missing_blocks();
+    let tip = pruned.height();
+    assert!(
+        !missing.is_empty(),
+        "--prune=550 must prune below tip - 288 on its own"
+    );
+    assert!(
+        missing.iter().all(|&h| h < tip - 288),
+        "size mode must keep the last 288 blocks (missing up to {:?}, tip {tip})",
+        missing.last()
+    );
 }
