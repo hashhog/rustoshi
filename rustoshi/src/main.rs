@@ -6545,7 +6545,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             // prunes. This is what makes gating off the
                             // `MAX_REORG_DEPTH` cap in archive mode (server.rs)
                             // safe: the undo the deep disconnect needs is there.
-                            let prune_plan = if prune_cfg.is_prune_mode() {
+                            //
+                            // Gated on the SIZE-TARGET mode (`--prune>=550`),
+                            // not on any prune mode: `--prune=1` is Core's
+                            // manual mode, which never prunes on its own and
+                            // only drops data through `pruneblockchain`.
+                            let prune_plan = if prune_cfg.auto_prune_enabled() {
                                 reorg_retention_prune_targets(
                                     &block_store,
                                     height,
@@ -8224,7 +8229,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                             // mode retains the full body+undo
                                             // history so a deep (>288) reorg has
                                             // its undo (see server.rs cap gate).
-                                            let prune_plan = if prune_cfg.is_prune_mode() {
+                                            // Size-target mode only: `--prune=1`
+                                            // (Core manual mode) never prunes
+                                            // on its own, only via
+                                            // `pruneblockchain`.
+                                            let prune_plan = if prune_cfg.auto_prune_enabled() {
                                                 reorg_retention_prune_targets(
                                                     &block_store,
                                                     height,
