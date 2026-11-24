@@ -56,10 +56,16 @@ impl BlockHeader {
         let negative = (self.bits & 0x0080_0000) != 0;
 
         // Invalid targets: negative, zero mantissa, zero exponent (Core pow.cpp DeriveTarget).
-        // Overflow: exponent > 32 means the value would exceed 256 bits. Guard here to
-        // prevent usize underflow on the `32 - exponent` index below (panics in debug,
-        // wraps in release). Core rejects these via fOverflow in SetCompact.
-        if negative || mantissa == 0 || exponent == 0 || exponent > 32 {
+        // Overflow is Core's SetCompact fOverflow (arith_uint256.cpp:178-183):
+        // exponent 33/34 still fits 256 bits when the mantissa's high bytes are
+        // zero (0x21007fff = 0x7fff << 240), so it is NOT an overflow.
+        if negative || mantissa == 0 || exponent == 0 {
+            return [0u8; 32];
+        }
+        if exponent > 34
+            || (mantissa > 0xff && exponent > 33)
+            || (mantissa > 0xffff && exponent > 32)
+        {
             return [0u8; 32];
         }
 
@@ -78,19 +84,19 @@ impl BlockHeader {
                 target[29] = ((m >> 16) & 0xFF) as u8;
             }
         } else {
-            // Position where mantissa starts (big-endian, so from the left)
-            // exponent tells us the total byte length from the right
-            // so start position = 32 - exponent.
-            // exponent <= 32 is guaranteed by the guard above, so start >= 0.
-            let start = 32 - exponent;
-            if start < 32 {
-                target[start] = ((mantissa >> 16) & 0xFF) as u8;
-            }
-            if start + 1 < 32 {
-                target[start + 1] = ((mantissa >> 8) & 0xFF) as u8;
-            }
-            if start + 2 < 32 {
-                target[start + 2] = (mantissa & 0xFF) as u8;
+            // Mantissa byte k (0 = most significant) lands at index
+            // 32 - exponent + k. For exponent 33/34 the leading bytes fall
+            // off the top; the overflow guard above proves they are zero.
+            let mbytes = [
+                ((mantissa >> 16) & 0xFF) as u8,
+                ((mantissa >> 8) & 0xFF) as u8,
+                (mantissa & 0xFF) as u8,
+            ];
+            for (k, b) in mbytes.iter().enumerate() {
+                let pos = 32 + k;
+                if pos >= exponent && pos - exponent < 32 {
+                    target[pos - exponent] = *b;
+                }
             }
         }
 
