@@ -1,0 +1,7 @@
+# rustoshi head 7e9bd9c3 vs Core v31.1
+core      case    nBits 0x21007fff: submitheader -> error: bad-diffbits
+core      control nBits 0x2100ffff: submitheader -> error: high-hash
+rustoshi  case    nBits 0x21007fff: submitheader -> error: bad-diffbits
+rustoshi  control nBits 0x2100ffff: submitheader -> error: high-hash
+RESULT: case    nBits 0x21007fff AGREE
+RESULT: control nBits 0x2100ffff AGREE

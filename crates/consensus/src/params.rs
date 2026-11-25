@@ -1393,16 +1393,16 @@ fn testnet_pow_limit() -> [u8; 32] {
     mainnet_pow_limit()
 }
 
-/// Signet PoW limit: 00000377aeffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+/// Signet PoW limit: 00000377ae000000000000000000000000000000000000000000000000000000
+/// (Core kernel/chainparams.cpp SigNetParams, compact 0x1e0377ae). This used
+/// to be 00000377ffff...ff: one byte short and padded with 0xff, so headers
+/// with nBits 0x1e0377af..=0x1e0377ff passed the PoW limit and a retarget
+/// clamped to the limit produced 0x1e0377ff instead of Core's 0x1e0377ae.
 fn signet_pow_limit() -> [u8; 32] {
     let mut limit = [0u8; 32];
-    limit[0] = 0x00;
-    limit[1] = 0x00;
     limit[2] = 0x03;
     limit[3] = 0x77;
-    for byte in limit.iter_mut().skip(4) {
-        *byte = 0xff;
-    }
+    limit[4] = 0xae;
     limit
 }
 
@@ -1517,16 +1517,23 @@ fn genesis_block_testnet3() -> Block {
 /// Bits: 0x1d00ffff
 /// Genesis hash: 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043
 fn genesis_block_testnet4() -> Block {
-    // Same coinbase script as mainnet
+    // BIP-94 / Core kernel/chainparams.cpp CTestNet4Params: its own coinbase,
+    // NOT mainnet's. scriptSig = <486604799> <4> <testnet4_genesis_msg>, with
+    // testnet4_genesis_msg = "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+    // (76 bytes, so pushed with OP_PUSHDATA1), and the output script
+    // <33 zero bytes> OP_CHECKSIG. Merkle root
+    // 7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e.
+    // This used to copy mainnet's "The Times 03/Jan/2009" coinbase and
+    // pubkey, so the block stored and served under the testnet4 genesis hash
+    // (and fed to the BIP-158 filter index) was not the testnet4 genesis.
     let coinbase_script = hex_decode(
-        "04ffff001d0104455468652054696d65732030332f4a616e2f\
-         32303039204368616e63656c6c6f72206f6e206272696e6b20\
-         6f66207365636f6e64206261696c6f757420666f722062616e6b73",
+        "04ffff001d01044c4c30332f4d61792f32303234203030303030303030303030\
+         3030303030303030303165626435386332343439373062336161396437383362\
+         623030313031316662653865613865393865303065",
     );
 
     let script_pubkey = hex_decode(
-        "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909\
-         a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac",
+        "21000000000000000000000000000000000000000000000000000000000000000000ac",
     );
 
     let coinbase_tx = Transaction {
@@ -1721,22 +1728,33 @@ pub fn compact_to_target(bits: u32) -> [u8; 32] {
             target[29] = ((m >> 16) & 0xFF) as u8;
         }
     } else {
-        // Position where mantissa starts (big-endian, so from the left)
-        // exponent tells us the total byte length from the right
-        // so start position = 32 - exponent
-        if exponent > 32 {
-            // Target would overflow 256 bits
+        // Core arith_uint256::SetCompact (arith_uint256.cpp:178-183):
+        //   fOverflow = nWord != 0 && ((nSize > 34) ||
+        //               (nWord > 0xff && nSize > 33) ||
+        //               (nWord > 0xffff && nSize > 32));
+        // nSize 33/34 is NOT an overflow when the mantissa's high bytes are
+        // zero: 0x21007fff is 0x7fff << 240, which fits (and is below the
+        // regtest powLimit). An overflowing value is returned as all-0xff,
+        // which every caller rejects (above any pow_limit; zero work).
+        if exponent > 34
+            || (mantissa > 0xff && exponent > 33)
+            || (mantissa > 0xffff && exponent > 32)
+        {
             return [0xffu8; 32];
         }
-        let start = 32 - exponent;
-        if start < 32 {
-            target[start] = ((mantissa >> 16) & 0xFF) as u8;
-        }
-        if start + 1 < 32 {
-            target[start + 1] = ((mantissa >> 8) & 0xFF) as u8;
-        }
-        if start + 2 < 32 {
-            target[start + 2] = (mantissa & 0xFF) as u8;
+        // Mantissa byte k (0 = most significant) lands at index
+        // 32 - exponent + k; for exponent 33/34 the leading bytes fall off
+        // the top, and the overflow test above guarantees they are zero.
+        let mbytes = [
+            ((mantissa >> 16) & 0xFF) as u8,
+            ((mantissa >> 8) & 0xFF) as u8,
+            (mantissa & 0xFF) as u8,
+        ];
+        for (k, b) in mbytes.iter().enumerate() {
+            let pos = 32 + k;
+            if pos >= exponent && pos - exponent < 32 {
+                target[pos - exponent] = *b;
+            }
         }
     }
 
@@ -1763,12 +1781,15 @@ pub fn target_to_compact(target: &[u8; 32]) -> u32 {
     // Calculate exponent (number of bytes from the right)
     let exponent = 32 - first_nonzero;
 
-    // Extract mantissa (3 most significant bytes)
+    // Extract mantissa (3 most significant bytes). Core arith_uint256::
+    // GetCompact (arith_uint256.cpp:197-203): when the value has fewer than
+    // 3 bytes it is shifted LEFT (`GetLow64() << 8 * (3 - nSize)`), i.e. the
+    // missing low bytes are zero. Skipping them (as this loop used to)
+    // encoded target 1 as 0x01000001 (decodes to 0) instead of 0x01010000.
     let mut mantissa: u32 = 0;
     for i in 0..3 {
-        if first_nonzero + i < 32 {
-            mantissa = (mantissa << 8) | (target[first_nonzero + i] as u32);
-        }
+        let b = if first_nonzero + i < 32 { target[first_nonzero + i] } else { 0 };
+        mantissa = (mantissa << 8) | (b as u32);
     }
 
     // If the high bit of the mantissa is set, we need to shift right to avoid

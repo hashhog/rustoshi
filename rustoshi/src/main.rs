@@ -3404,7 +3404,16 @@ fn run_import_from_blk_files(
         // Validate and process (f_requested=true: import-from-Core-datadir is
         // a requested/trusted path — no fTooFarAhead guard needed).
         let seq_ctx = rustoshi_storage::StoreSeqLockCtx::new(&block_store);
-        let undo = match chain_state.process_block_with_seq_ctx(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, skip_scripts, prev_timestamp) {
+        // bad-diffbits (Core ContextualCheckBlockHeader, validation.cpp:4088;
+        // Core's -loadblock import goes through the same AcceptBlock path).
+        // process_block passes expected_bits = None, so without this an
+        // imported block's nBits was never compared with GetNextWorkRequired.
+        let gate = diffbits_gate_to_validation(
+            check_connect_diffbits(block_store, &block.header, params),
+            &hash,
+            height,
+        );
+        let undo = match gate.and_then(|()| chain_state.process_block_with_seq_ctx(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, skip_scripts, prev_timestamp)) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", height, e);
@@ -3631,7 +3640,13 @@ fn run_import_from_stdin(
         // Validate and process (f_requested=true: snapshot-import is a
         // requested/trusted path — no fTooFarAhead guard needed).
         let seq_ctx = rustoshi_storage::StoreSeqLockCtx::new(&block_store);
-        let undo = match chain_state.process_block_with_seq_ctx(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, skip_scripts, prev_timestamp) {
+        // bad-diffbits: same backstop as the blk-file import above.
+        let gate = diffbits_gate_to_validation(
+            check_connect_diffbits(block_store, &block.header, params),
+            &hash,
+            frame_height,
+        );
+        let undo = match gate.and_then(|()| chain_state.process_block_with_seq_ctx(&block, utxo_view, prev_block_mtp, true, rustoshi_consensus::current_time_secs(), &seq_ctx, skip_scripts, prev_timestamp)) {
             Ok((u, _fees)) => u,
             Err(e) => {
                 tracing::error!("Block validation failed at height {}: {}", frame_height, e);

@@ -92,7 +92,10 @@ pub fn get_next_work_required<I: BlockIndex>(
         if params.pow_allow_min_difficulty_blocks {
             // If the new block's timestamp is more than 2 * TARGET_BLOCK_TIME (20 minutes)
             // after the previous block, allow min-difficulty
-            if new_block_time > last.timestamp() + TARGET_BLOCK_TIME * 2 {
+            // Core pow.cpp compares in int64 (GetBlockTime() is int64_t).
+            // In u32 this addition overflows for a parent timestamp
+            // >= 0xfffffb50: a panic with overflow-checks, a wrap without.
+            if new_block_time as u64 > last.timestamp() as u64 + TARGET_BLOCK_TIME as u64 * 2 {
                 return Ok(pow_limit_compact);
             }
 
@@ -1590,11 +1593,15 @@ mod tests {
         let params = ChainParams::mainnet();
         let hash = [0u8; 32]; // all-zeros hash (hardest possible to beat)
 
-        // exponent > 32 → overflow → DeriveTarget returns None → rejected
-        // Core pow.cpp:154 fOverflow check
-        let overflow_bits = 0x2100_0001u32; // exponent=33
+        // exponent=33 with a 3-byte mantissa → SetCompact overflow →
+        // DeriveTarget returns None → rejected (Core pow.cpp fOverflow).
+        // (0x21000001 is NOT an overflow — it is 1 << 240, which mainnet
+        // refuses only because it is above powLimit.)
+        let overflow_bits = 0x2101_0000u32; // exponent=33
         assert!(!check_proof_of_work(&hash, overflow_bits, &params),
             "overflow compact encoding must be rejected (Core pow.cpp:154)");
+        assert!(!check_proof_of_work(&hash, 0x2100_0001, &params),
+            "1 << 240 is above the mainnet powLimit");
 
         let overflow_bits2 = 0xff00_0001u32; // exponent=255
         assert!(!check_proof_of_work(&hash, overflow_bits2, &params),

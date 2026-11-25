@@ -56,10 +56,16 @@ impl BlockHeader {
         let negative = (self.bits & 0x0080_0000) != 0;
 
         // Invalid targets: negative, zero mantissa, zero exponent (Core pow.cpp DeriveTarget).
-        // Overflow: exponent > 32 means the value would exceed 256 bits. Guard here to
-        // prevent usize underflow on the `32 - exponent` index below (panics in debug,
-        // wraps in release). Core rejects these via fOverflow in SetCompact.
-        if negative || mantissa == 0 || exponent == 0 || exponent > 32 {
+        // Overflow is Core's SetCompact fOverflow (arith_uint256.cpp:178-183):
+        // exponent 33/34 still fits 256 bits when the mantissa's high bytes are
+        // zero (0x21007fff = 0x7fff << 240), so it is NOT an overflow.
+        if negative || mantissa == 0 || exponent == 0 {
+            return [0u8; 32];
+        }
+        if exponent > 34
+            || (mantissa > 0xff && exponent > 33)
+            || (mantissa > 0xffff && exponent > 32)
+        {
             return [0u8; 32];
         }
 
@@ -78,19 +84,19 @@ impl BlockHeader {
                 target[29] = ((m >> 16) & 0xFF) as u8;
             }
         } else {
-            // Position where mantissa starts (big-endian, so from the left)
-            // exponent tells us the total byte length from the right
-            // so start position = 32 - exponent.
-            // exponent <= 32 is guaranteed by the guard above, so start >= 0.
-            let start = 32 - exponent;
-            if start < 32 {
-                target[start] = ((mantissa >> 16) & 0xFF) as u8;
-            }
-            if start + 1 < 32 {
-                target[start + 1] = ((mantissa >> 8) & 0xFF) as u8;
-            }
-            if start + 2 < 32 {
-                target[start + 2] = (mantissa & 0xFF) as u8;
+            // Mantissa byte k (0 = most significant) lands at index
+            // 32 - exponent + k. For exponent 33/34 the leading bytes fall
+            // off the top; the overflow guard above proves they are zero.
+            let mbytes = [
+                ((mantissa >> 16) & 0xFF) as u8,
+                ((mantissa >> 8) & 0xFF) as u8,
+                (mantissa & 0xFF) as u8,
+            ];
+            for (k, b) in mbytes.iter().enumerate() {
+                let pos = 32 + k;
+                if pos >= exponent && pos - exponent < 32 {
+                    target[pos - exponent] = *b;
+                }
             }
         }
 
@@ -468,12 +474,19 @@ mod tests {
     /// Exponent > 32 would overflow the 256-bit target array.
     /// Before W83 this caused usize underflow (panic in debug, wrap in release).
     /// After the fix, target() returns [0u8;32] and validate_pow_against_declared_target() returns false.
+    /// Only a real SetCompact overflow is refused: exponent 33 with a mantissa
+    /// <= 0xffff still fits (Core arith_uint256.cpp:178-183), so 0x21000001
+    /// is the valid target 1 << 240 and 0x21010000 is the overflow case.
     #[test]
     fn target_overflow_exponent_rejected() {
-        // exponent = 33 (0x21) — exceeds 32-byte array
-        let header = BlockHeader { bits: 0x2100_0001, ..Default::default() };
+        // exponent = 33 (0x21) with a 3-byte mantissa: does not fit 256 bits
+        let header = BlockHeader { bits: 0x2101_0000, ..Default::default() };
         assert_eq!(header.target(), [0u8; 32]);
         assert!(!header.validate_pow_against_declared_target());
+        // exponent = 33 with a 1-byte mantissa: 1 << 240, not an overflow
+        let mut one_shl_240 = [0u8; 32];
+        one_shl_240[1] = 0x01;
+        assert_eq!(BlockHeader { bits: 0x2100_0001, ..Default::default() }.target(), one_shl_240);
 
         // exponent = 0xff (max) — should also be safely rejected
         let header2 = BlockHeader { bits: 0xff00_0001, ..Default::default() };
