@@ -747,9 +747,9 @@ impl HistoricalBackfill {
 
     /// Context-free and height-contextual body checks before a historical
     /// body is stored: Core's `CheckBlock` (merkle root incl. CVE-2012-2459
-    /// mutation, coinbase rules, per-tx checks, weight, legacy sigops) and
-    /// `ContextualCheckBlock` (BIP-34 coinbase height, BIP-141 witness
-    /// commitment / unexpected witness). Core runs both in `AcceptBlock`
+    /// mutation, coinbase rules, per-tx checks, stripped size, legacy sigops)
+    /// and `ContextualCheckBlock` (BIP-34 coinbase height, BIP-141 witness
+    /// commitment / unexpected witness, then block weight). Core runs both in `AcceptBlock`
     /// before `WriteBlock`, for background-chainstate blocks too. The header
     /// itself was already checked (PoW, nBits, MTP) when it was stored, and
     /// the body's hash is the stored header's hash, so this binds the

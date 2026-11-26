@@ -11404,8 +11404,9 @@ impl RustoshiRpcServer for RpcServerImpl {
                 // bad-txnmrklroot, the CVE-2012-2459 duplicate-tx merkle mutation,
                 // bad-blk-length/weight, bad-blk-sigops — as a stored
                 // `inconclusive`. Run the SAME EXISTING context-free `check_block`
-                // here (PoW, merkle+mutation, size/weight, legacy sigops, per-tx
-                // checks) so a body/PoW-invalid sibling is rejected with Core's
+                // here (PoW, merkle+mutation, stripped size, legacy sigops, per-tx
+                // checks; weight runs below in contextual_check_block, after the
+                // witness commitment) so a body/PoW-invalid sibling is rejected with Core's
                 // reason string instead of stored. This is on the submitblock RPC
                 // path ONLY — the P2P/connect path (rustoshi/src/main.rs) already
                 // context-free-validates before routing forks into

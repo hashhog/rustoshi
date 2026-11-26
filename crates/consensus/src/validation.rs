@@ -768,9 +768,12 @@ pub fn check_transaction(tx: &Transaction) -> Result<(), TxValidationError> {
 /// - All transactions pass context-free validation
 /// - Proof of work is valid
 /// - Merkle root matches computed value
-/// - Block weight is within limits
+/// - Stripped (non-witness) size is within limits (bad-blk-length)
 /// - Sigops don't exceed limit
 /// - No duplicate transactions
+///
+/// The witness-inclusive block weight is NOT checked here: it is checked in
+/// `contextual_check_block`, after the witness commitment, as in Core.
 pub fn check_block(block: &Block, params: &ChainParams) -> Result<(), ValidationError> {
     // Default: enforce PoW, exactly as every IBD/accept caller requires.
     // Core's CheckBlock signature is
@@ -906,11 +909,16 @@ pub fn check_block_with_pow(
         return Err(ValidationError::BadMerkleRoot);
     }
 
-    // Check block weight
-    let weight = compute_block_weight(block);
-    if weight > MAX_BLOCK_WEIGHT {
-        return Err(ValidationError::WeightExceeded(weight));
-    }
+    // No witness-inclusive weight check here. Witness bytes are not covered
+    // by the txids, the merkle root or the block hash, so a peer can pad the
+    // witness of an honest block without changing its hash. Core's
+    // CheckBlock checks only the stripped size (the bad-blk-length gate
+    // above, validation.cpp:3940-3948: "witness malleability is checked in
+    // ContextualCheckBlock, so no checks that use witness data may be
+    // performed here"). The weight check runs in `contextual_check_block`,
+    // after `check_witness_commitment`, as in Core (validation.cpp:4169-4181).
+    // Run here, it refused a padded copy as a WeightExceeded VERDICT and the
+    // connect loop marked the honest block's hash FAILED_VALIDITY.
 
     // Check sigops
     let sigops = count_block_sigops(block);
@@ -1542,6 +1550,7 @@ pub fn is_final_tx(tx: &Transaction, block_height: u32, lock_time_cutoff: u32) -
 /// Checks:
 /// - BIP-34: Coinbase height encoding (if active).
 /// - SegWit witness commitment (if SegWit active).
+/// - Block weight (bad-blk-weight), after the witness commitment.
 ///
 /// The `_context` parameter is reserved for future contextual checks
 /// (e.g. BIP-30 duplicate-coinbase detection). It is currently unused.
@@ -1569,6 +1578,22 @@ pub fn contextual_check_block(
     // witness data before segwit activation are correctly rejected.
     let segwit_active = height >= params.segwit_height;
     check_witness_commitment(block, segwit_active)?;
+
+    // Block weight, only after the witness data is known to be the data the
+    // block commits to (Core ContextualCheckBlock, validation.cpp:4173-4181):
+    // "before we've checked the coinbase witness, it would be possible for
+    // the weight to be too large by filling up the coinbase witness, which
+    // doesn't change the block hash, so we couldn't mark the block as
+    // permanently failed". A padded copy of an honest block fails the
+    // malleation check above (BLOCK_MUTATED, never marked); a block that
+    // commits to its witness and is still too heavy is bad-blk-weight
+    // (BLOCK_CONSENSUS, a verdict). Every caller of `check_block` that stores
+    // or connects a body also calls this function, so the set of blocks
+    // rejected is unchanged; only the order and the verdict class move.
+    let weight = compute_block_weight(block);
+    if weight > MAX_BLOCK_WEIGHT {
+        return Err(ValidationError::WeightExceeded(weight));
+    }
 
     Ok(())
 }
