@@ -2602,7 +2602,7 @@ impl Mempool {
                 // Non-standard prevout types: WitnessUnknown (future witness
                 // versions reserved for future soft forks) and NonStandard
                 // (unrecognised script shape).  All other standard types
-                // (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A, BareMultisig,
+                // (P2PK, P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A, BareMultisig,
                 // NullData) are spendable from a policy perspective.
                 if matches!(
                     kind,
@@ -8559,6 +8559,8 @@ fn mempool_script_is_push_only_after_op_return(script: &[u8]) -> bool {
 /// Mirrors Bitcoin Core's TxoutType as returned by Solver() + IsStandard().
 #[derive(Debug, PartialEq, Eq)]
 enum StandardScriptType {
+    /// P2PK (pay-to-pubkey): <33 or 65-byte key> OP_CHECKSIG (Core TxoutType::PUBKEY)
+    P2PK,
     /// P2PKH (pay-to-pubkey-hash): OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
     P2PKH,
     /// P2SH (pay-to-script-hash): OP_HASH160 <20> OP_EQUAL
@@ -8592,6 +8594,13 @@ fn classify_standard_script(script: &[u8]) -> StandardScriptType {
             return StandardScriptType::NullData;
         }
         return StandardScriptType::NonStandard;
+    }
+
+    // P2PK: <33 or 65-byte key> OP_CHECKSIG. Mirrors Core `MatchPayToPubkey`
+    // (script/solver.cpp): the push must be the direct 33/65-byte opcode and the
+    // key must pass `CPubKey::ValidSize`, so 0x06/0x07 hybrid keys match too.
+    if is_pay_to_pubkey(script) {
+        return StandardScriptType::P2PK;
     }
 
     // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG (25 bytes)
@@ -8660,6 +8669,30 @@ fn classify_standard_script(script: &[u8]) -> StandardScriptType {
     }
 
     StandardScriptType::NonStandard
+}
+
+/// Core `CPubKey::GetLen` (pubkey.h): the key length a header byte implies,
+/// or 0 for an invalid header.
+fn pubkey_len_for_header(header: u8) -> usize {
+    match header {
+        0x02 | 0x03 => 33,
+        0x04 | 0x06 | 0x07 => 65,
+        _ => 0,
+    }
+}
+
+/// Core `MatchPayToPubkey` (script/solver.cpp): `script[0]` is the 33- or
+/// 65-byte push opcode, the last byte is OP_CHECKSIG, and the key passes
+/// `CPubKey::ValidSize` (`GetLen(key[0]) == key.size()`).
+fn is_pay_to_pubkey(script: &[u8]) -> bool {
+    let key_len = match script.len() {
+        35 => 33,
+        67 => 65,
+        _ => return false,
+    };
+    script[0] as usize == key_len
+        && script[script.len() - 1] == 0xac
+        && pubkey_len_for_header(script[1]) == key_len
 }
 
 /// Try to classify a script ending in OP_CHECKMULTISIG as bare multisig.
