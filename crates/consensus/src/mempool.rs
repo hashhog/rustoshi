@@ -36,7 +36,10 @@ use crate::params::{
     TAPROOT_LEAF_MASK, TAPROOT_LEAF_TAPSCRIPT, WITNESS_SCALE_FACTOR,
 };
 use crate::params::MAX_MONEY;
-use crate::script::{is_p2a, is_p2sh, parse_witness_program, verify_script, ScriptError, ScriptFlags};
+use crate::script::{
+    eval_script, is_p2a, is_p2sh, parse_witness_program, verify_script, DummyChecker, ScriptError,
+    ScriptFlags, SigVersion, Stack,
+};
 use crate::validation::{
     check_sequence_locks, check_transaction, CoinEntry,
     count_script_sigops, get_transaction_sigop_cost, SequenceLockContext,
@@ -2621,16 +2624,19 @@ impl Mempool {
                 // sigop-bomb.
                 if kind == StandardScriptType::P2SH {
                     let input = &tx.inputs[i];
-                    let redeem_opt = parse_p2sh_redeem_script_from_scriptsig(&input.script_sig);
-                    if let Some(redeem) = redeem_opt {
-                        let sigop_count = count_script_sigops(&redeem, true);
-                        if sigop_count > MAX_P2SH_SIGOPS {
-                            return Err(MempoolError::InputsNonStandard(i));
-                        }
+                    // Core policy.cpp AreInputsStandard: EvalScript(scriptSig,
+                    // SCRIPT_VERIFY_NONE) failing, or leaving an empty stack,
+                    // makes the input nonstandard. Not "unenforced": a None here
+                    // used to skip the sigop gate, so `OP_1 <16-sigop redeem>`
+                    // was accepted.
+                    let Some(redeem) = p2sh_redeem_script_from_scriptsig(&input.script_sig)
+                    else {
+                        return Err(MempoolError::InputsNonStandard(i));
+                    };
+                    let sigop_count = count_script_sigops(&redeem, true);
+                    if sigop_count > MAX_P2SH_SIGOPS {
+                        return Err(MempoolError::InputsNonStandard(i));
                     }
-                    // If the scriptSig is empty/malformed we cannot extract the
-                    // redeemScript; leave the sigops check unenforced for now
-                    // (script verification will catch it later in PolicyScriptChecks).
                 }
             }
         }
@@ -8900,12 +8906,10 @@ fn is_witness_standard(
         let effective_script: Vec<u8>;
         let p2sh: bool;
         if is_p2sh(prev_script) {
-            // Parse the P2SH redeemScript from the scriptSig.
-            // The scriptSig for P2SH-wrapped segwit is a single push of the redeemScript.
-            // We do a minimal parse: walk push-only opcodes and take the last pushed data.
-            // Core uses EvalScript with SCRIPT_VERIFY_NONE; we replicate the result
-            // (last stack element after executing the scriptSig as push-only).
-            let redeem = parse_p2sh_redeem_script_from_scriptsig(&input.script_sig);
+            // The redeemScript is the top of the stack EvalScript(scriptSig,
+            // SCRIPT_VERIFY_NONE) leaves; IsPushOnly and the hash are checked
+            // later by the script check, as in Core.
+            let redeem = p2sh_redeem_script_from_scriptsig(&input.script_sig);
             match redeem {
                 None => {
                     // EvalScript failed or stack empty → reject.
@@ -9039,79 +9043,27 @@ fn is_witness_standard(
     Ok(())
 }
 
-/// Extract the redeemScript from a P2SH scriptSig by simulating a push-only evaluation.
+/// The P2SH redeemScript a scriptSig yields, the way Core's policy code reads it:
+/// `stack.back()` after `EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE,
+/// BaseSignatureChecker(), SigVersion::BASE)` (policy/policy.cpp
+/// `AreInputsStandard` and `IsWitnessStandard`).
 ///
-/// P2SH scriptSig is a sequence of push operations; the last pushed value is the redeemScript.
-/// This mirrors Core's `EvalScript(stack, scriptSig, SCRIPT_VERIFY_NONE, ...)` which simply
-/// executes pushes and returns the final stack, from which `stack.back()` is taken.
+/// Running the real interpreter, not a push walker, is what makes this match
+/// Core: OP_1NEGATE and OP_1..OP_16 push numbers, a push over 520 bytes fails
+/// PUSH_SIZE, and the script-size, op-count and stack-size limits apply.
 ///
-/// Returns `None` if the scriptSig is empty or contains any non-push opcode.
-fn parse_p2sh_redeem_script_from_scriptsig(script_sig: &[u8]) -> Option<Vec<u8>> {
-    let mut last: Option<Vec<u8>> = None;
-    let mut i = 0;
-    while i < script_sig.len() {
-        let op = script_sig[i];
-        i += 1;
-        if op == 0x00 {
-            // OP_0 pushes an empty vector.
-            last = Some(Vec::new());
-        } else if op <= 0x4b {
-            // Direct push: next `op` bytes.
-            let len = op as usize;
-            if i + len > script_sig.len() {
-                return None;
-            }
-            last = Some(script_sig[i..i + len].to_vec());
-            i += len;
-        } else if op == 0x4c {
-            // OP_PUSHDATA1
-            if i >= script_sig.len() {
-                return None;
-            }
-            let len = script_sig[i] as usize;
-            i += 1;
-            if i + len > script_sig.len() {
-                return None;
-            }
-            last = Some(script_sig[i..i + len].to_vec());
-            i += len;
-        } else if op == 0x4d {
-            // OP_PUSHDATA2
-            if i + 2 > script_sig.len() {
-                return None;
-            }
-            let len = u16::from_le_bytes([script_sig[i], script_sig[i + 1]]) as usize;
-            i += 2;
-            if i + len > script_sig.len() {
-                return None;
-            }
-            last = Some(script_sig[i..i + len].to_vec());
-            i += len;
-        } else if op == 0x4e {
-            // OP_PUSHDATA4
-            if i + 4 > script_sig.len() {
-                return None;
-            }
-            let len = u32::from_le_bytes([
-                script_sig[i],
-                script_sig[i + 1],
-                script_sig[i + 2],
-                script_sig[i + 3],
-            ]) as usize;
-            i += 4;
-            if i + len > script_sig.len() {
-                return None;
-            }
-            last = Some(script_sig[i..i + len].to_vec());
-            i += len;
-        } else {
-            // Non-push opcode: Core's EvalScript with SCRIPT_VERIFY_NONE would fail
-            // on any actual execution opcode. Treat as failure.
-            return None;
-        }
-    }
-    // Stack must be non-empty (Core: if (stack.empty()) return false).
-    last
+/// Returns `None` if evaluation fails or leaves an empty stack.
+fn p2sh_redeem_script_from_scriptsig(script_sig: &[u8]) -> Option<Vec<u8>> {
+    let mut stack = Stack::new();
+    eval_script(
+        &mut stack,
+        script_sig,
+        &ScriptFlags::default(),
+        &DummyChecker,
+        SigVersion::Base,
+    )
+    .ok()?;
+    stack.pop()
 }
 
 /// Check if a scriptPubKey is a standard type.
