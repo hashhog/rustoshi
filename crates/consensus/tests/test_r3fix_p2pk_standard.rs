@@ -86,7 +86,10 @@ const R29_TX: &str = "0200000001977a612b8f69f25bc97da39964cc6ef5ff2f69220ea0af44
 #[test]
 fn r3_r29_minimised_bare_p2pk_spend_is_accepted() {
     let res = submit(decode_tx(R29_TX), p2pk(G_COMPRESSED));
-    assert!(res.is_ok(), "Core v31.1 accepts this spend; rustoshi said {res:?}");
+    assert!(
+        res.is_ok(),
+        "Core v31.1 accepts this spend; rustoshi said {res:?}"
+    );
 }
 
 /// R9 `mempool/reason/script-policy/SIG_DER|nonstandard`: scriptSig `OP_1`.
@@ -221,14 +224,22 @@ fn p2pk_spend(s: &Signer, prevout_spk: &[u8], outputs: Vec<TxOut>, corrupt: bool
 }
 
 fn pay(script_pubkey: Vec<u8>, value: u64) -> TxOut {
-    TxOut { value, script_pubkey }
+    TxOut {
+        value,
+        script_pubkey,
+    }
 }
 
 #[test]
 fn compressed_p2pk_spend_is_accepted() {
     let s = signer(0x31);
     let spk = p2pk_bytes(&s.compressed);
-    let tx = p2pk_spend(&s, &spk, vec![pay(p2wpkh_dest(), FUND_VALUE - 2_000)], false);
+    let tx = p2pk_spend(
+        &s,
+        &spk,
+        vec![pay(p2wpkh_dest(), FUND_VALUE - 2_000)],
+        false,
+    );
     let res = submit(tx, spk);
     assert!(res.is_ok(), "compressed P2PK spend: {res:?}");
 }
@@ -237,7 +248,12 @@ fn compressed_p2pk_spend_is_accepted() {
 fn uncompressed_p2pk_spend_is_accepted() {
     let s = signer(0x32);
     let spk = p2pk_bytes(&s.uncompressed);
-    let tx = p2pk_spend(&s, &spk, vec![pay(p2wpkh_dest(), FUND_VALUE - 2_000)], false);
+    let tx = p2pk_spend(
+        &s,
+        &spk,
+        vec![pay(p2wpkh_dest(), FUND_VALUE - 2_000)],
+        false,
+    );
     let res = submit(tx, spk);
     assert!(res.is_ok(), "uncompressed P2PK spend: {res:?}");
 }
@@ -346,6 +362,12 @@ fn p2pk_output_with_bad_key_header_is_nonstandard_scriptpubkey() {
 #[test]
 fn p2pk_dust_thresholds_match_core() {
     let s = signer(0x37);
-    assert_eq!(dust_threshold(&pay(p2pk_bytes(&s.compressed), 0), 3_000), 576);
-    assert_eq!(dust_threshold(&pay(p2pk_bytes(&s.uncompressed), 0), 3_000), 672);
+    assert_eq!(
+        dust_threshold(&pay(p2pk_bytes(&s.compressed), 0), 3_000),
+        576
+    );
+    assert_eq!(
+        dust_threshold(&pay(p2pk_bytes(&s.uncompressed), 0), 3_000),
+        672
+    );
 }
