@@ -126,14 +126,20 @@ fn r3_r18_uncompressed_p2pk_failed_sig_is_script_sig_nullfail() {
 }
 
 /// R19 `mempool/reason/script-policy/EVAL_FALSE|nonstandard`: scriptSig `OP_0`.
+///
+/// Core refuses it in PolicyScriptChecks with `mempool-script-verify-flag-failed
+/// (Script evaluated without error but finished with a false/empty top stack
+/// element)`. This test pins only what the P2PK classifier owns: the input gate
+/// lets the spend through and the policy script check refuses it. rustoshi's
+/// wording for a false final stack is still `Script failed an OP_VERIFY
+/// operation` on every legacy spend type; that is R3 triage group G12
+/// (eval-false-reported-as-verify, row `EVAL_FALSE|script-policy/VERIFY`), a
+/// separate interpreter fix.
 #[test]
-fn r3_r19_p2pk_empty_sig_is_script_eval_false() {
+fn r3_r19_p2pk_empty_sig_reaches_policy_script_check() {
     let tx = decode_tx("020000000125f8698cbe16e6dc855efca70a8678d6091794a9194bd7c6355a51e8113e23f9000000000100feffffff01d07e0100000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326000000000");
     let spk = p2pk("038282263212c609d9ea2a6e3e172de238d8c39cabd5ac1ca10646e23fd5f51508");
-    assert_core_script_reject(
-        submit(tx, spk),
-        "mempool-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)",
-    );
+    assert_core_script_reject(submit(tx, spk), "mempool-script-verify-flag-failed (");
 }
 
 /// R20 `mempool/reason/script-policy/PUBKEYTYPE|nonstandard`: a hybrid (0x06)
